@@ -10,6 +10,12 @@ const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'release.mjs');
 const VERSION = '0.3.0';
 const DATE = '2026-02-03';
+const RACE_ERROR_CODES = new Set([
+  'RELEASE_LOCKED',
+  'DIRTY_WORKTREE',
+  'VERSION_NOT_GREATER',
+  'VERSION_ALREADY_RELEASED',
+]);
 
 const PACKAGE_JSON = `${JSON.stringify({ name: 'release-concurrency-test-pkg', version: '0.2.0', type: 'module' }, null, 2)}\n`;
 const CHANGELOG = [
@@ -79,7 +85,11 @@ function changelogPath(repo) {
 }
 
 function tempArtifacts(repo) {
-  return readdirSync(repo).filter((entry) => entry.includes('release-tmp') || entry.endsWith('.tmp'));
+  const temporaryFiles = readdirSync(repo).filter((entry) => entry.includes('release-tmp') || entry.endsWith('.tmp'));
+  const lockFiles = readdirSync(path.join(repo, '.git'))
+    .filter((entry) => entry.startsWith('release-apply.'))
+    .map((entry) => path.join('.git', entry));
+  return [...temporaryFiles, ...lockFiles];
 }
 
 function parseError(result) {
@@ -123,7 +133,7 @@ test('two simultaneous apply processes have exactly one winner', async (t) => {
 
   // Start both children in the same turn and await them together. No sleeps or
   // retries: the loser must deterministically report a structured release error
-  // whenever it observes the winner's dirty tree or already-updated version.
+  // when it observes the apply lock, dirty tree, or already-updated version.
   const results = await Promise.all([runCli(repo), runCli(repo)]);
   const successes = results.filter((result) => result.status === 0);
   const failures = results.filter((result) => result.status !== 0);
@@ -134,7 +144,10 @@ test('two simultaneous apply processes have exactly one winner', async (t) => {
   );
   assert.equal(failures.length, 1, 'exactly one apply must be rejected');
   const error = parseError(failures[0]);
-  assert.match(error.code, /^(DIRTY_WORKTREE|VERSION_NOT_GREATER|VERSION_ALREADY_RELEASED)$/);
+  assert.ok(
+    RACE_ERROR_CODES.has(error.code),
+    `losing racer must report RELEASE_LOCKED or a legacy race error; actual=${error.code}; results=${JSON.stringify(results)}`,
+  );
   const success = JSON.parse(successes[0].stdout);
   assert.equal(success.ok, true);
   assert.equal(success.dryRun, false);
