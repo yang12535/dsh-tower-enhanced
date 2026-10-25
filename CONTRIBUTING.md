@@ -7,7 +7,7 @@ missions, and the expectations for every contribution.
 ## Prerequisites
 
 - Node.js >= 22.5
-- pnpm 12.15.0 (matches `packageManager` in `package.json` and the CI pin)
+- pnpm 12.15.0 (matches the pin in `.github/workflows/ci.yml`)
 - Git
 
 ## Local setup
