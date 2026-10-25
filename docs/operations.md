@@ -347,6 +347,68 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
   3. 重新运行 doctor，确认相关 finding 消失后，再恢复 git/Tower 操作。doctor 的消息会建议命令，但**绝不会执行 `chown`、`chmod`、git 写操作或 state 修改**：递归改属主需要提权、可能破坏有意的多用户/CI 权限布局，而且脚本无法推断每个路径的正确属主，因此自动修复不符合其只读契约。
 - 何时不应重试：不要靠反复 `rebase`/`merge`/`spawn` 来验证权限是否“碰巧恢复”，这可能留下半写对象或中间态。worker/reviewer 仍持有并使用 worktree 时，不要同时 `chown`、清理或 teardown；先暂停新写入，让 worker 提交并干净收尾（必要时 `interrupt` 并确认进程已停），mission 到达终态且 worktree 干净后再按 3.9 `teardown`。仍看到活跃 git 进程、处于 rebase/merge 中间态、备份未完成，或 `truncated:true` 却尚未用 `find` 补查影响范围时，都不要直接重试写操作。
 
+### 3.13 发布与锁
+
+本地发布脚本是 [scripts/release.mjs](../scripts/release.mjs)：默认 dry-run 只计算并打印 diff，**不写文件也不取锁**；`--apply` 会在真实 gitdir 中取得跨进程锁，再完成校验、脏工作区检查与写入。锁覆盖整个 apply 过程，避免并发进程基于旧状态发布。脚本**从不执行 commit、tag、push，也不访问网络**。
+
+- 症状：
+
+  | 错误码 | 典型原因 | 首要动作 |
+  |---|---|---|
+  | `RELEASE_LOCKED` | 另一个 `--apply` 或陈旧锁接管过程持有主锁 / reclaim 锁，或获取期间锁已被其它进程替换 | 不要立即或循环重试；先查锁路径、持有 pid 与锁龄，按下方顺序处理 |
+  | `DIRTY_WORKTREE` | `git status --porcelain` 非空，脚本拒绝 `--apply` | 保留并确认改动归属，提交或 stash 后使工作区干净；不要直接重跑 |
+  | `VERSION_NOT_GREATER` | 目标版本不大于 [package.json](../package.json) 当前版本；相等时也属于此错误 | 检查是否已发布/已写入目标版本；选择严格更高的版本前先核对实际状态 |
+  | `VERSION_ALREADY_RELEASED` | [CHANGELOG.md](../CHANGELOG.md) 已存在目标版本标题 `## [<version>]` | 核对 package 与 CHANGELOG 是否已经完成本次发布，不要重复提升或删除历史段落来强行重跑 |
+  | `GIT_CHECK_FAILED` | `git rev-parse --absolute-git-dir` 或 `git status --porcelain` 执行失败 | 按 stderr 修正仓库路径、Git 元数据或权限问题，再决定是否重跑 |
+
+  `RELEASE_LOCKED` 的人类可读输出样例（pid、路径与时间随现场变化）：
+
+  ```text
+  release: error: RELEASE_LOCKED: another release apply or stale-lock recovery is in progress (pid 12345); lock: /srv/repo/.git/release-apply.lock (modified 2026-10-26T02:00:00.000Z). Wait for that process to finish before retrying; never wait or retry automatically. Do not remove a live lock; if the holder is gone and automatic stale-lock takeover did not resolve it, inspect the process and remove this lock manually.
+  ```
+
+  使用 `--json` 时，同一错误在 stderr 中是 `{ "ok": false, "code": "RELEASE_LOCKED", "message": "..." }` 形态，排障字段以 `message` 为准。
+
+- 诊断（先进入实际发布仓库 `<repo>`，不要用假定的 `.git` 路径代替真实 gitdir；linked worktree 的 gitdir 通常是独立管理目录）：
+
+  ```bash
+  cd <repo>
+  git rev-parse --absolute-git-dir             # 取得 <gitdir>
+  gitdir="$(git rev-parse --absolute-git-dir)"
+  ls -l -- "$gitdir/release-apply.lock" "$gitdir/release-apply.reclaim.lock"
+  cat -- "$gitdir/release-apply.lock" "$gitdir/release-apply.reclaim.lock"
+  git status --porcelain                       # 空输出才允许 --apply
+
+  # 将 <pid> 换成锁 JSON 或 RELEASE_LOCKED 输出中的持有者 pid
+  ps -p <pid> -o pid=,stat=,etime=,args=
+  kill -0 <pid>; echo "$?"
+  date -u                                      # 与锁时间 / mtime 对照
+  ```
+
+  主锁为 `<gitdir>/release-apply.lock`，用于串行化整个 apply；`<gitdir>/release-apply.reclaim.lock` 只串行化陈旧锁恢复。锁 JSON 通常含 `pid`、数值 `timestamp`（Unix 毫秒）与 `token`。脚本按锁内有效 `timestamp`（必要时回退到 `acquiredAt`，再回退到文件 mtime）计算锁龄，**达到 10 分钟即视为陈旧**；持有 pid 仅在探测得到 `ESRCH` 时视为不存在。`kill -0` 返回 `0` 表示进程存在；返回非零不能只凭这一点删锁，因为 `EPERM` 表示进程存在但当前用户无权向其发信号，应结合 `ps` 与错误文本确认。格式损坏或未知 pid 的锁也不会被立即视为失效，只能等其达到陈旧阈值。
+
+- 安全处理：
+  1. **优先等待，或让持有者正常退出。** 用 `ps` 核对 pid 对应的确实是发布/锁恢复进程。进程仍存活时不要为了方便而删锁，也不要用自动重试循环争抢；长时间运行时先确认它是否仍在写入。
+  2. **让脚本自动接管陈旧锁。** 确认持有 pid 已不存在，或锁已达到 10 分钟阈值后，正常重跑一次 `node scripts/release.mjs --version <semver> --apply`。脚本会通过 reclaim 锁与原子 rename 隔离并核验陈旧锁，再取得新主锁；接管成功时会打印 `Taking over stale release lock ...`。手动删除不是常规恢复步骤。
+  3. **手动删除只是自动接管仍未解决时的最后手段。** 最低前提是已确认目标锁的持有 pid 不存在，或该目标锁已达到 10 分钟阈值；若 pid 仍存活，先按上一步核实并停止不再应继续写入的持有者。只删除已逐一确认陈旧的锁，不要因为主锁陈旧就顺手删除仍存活的 reclaim 锁，反之亦然：
+
+     ```bash
+     cd <repo>
+     gitdir="$(git rev-parse --absolute-git-dir)"
+     rm -f -- "$gitdir/release-apply.lock"          # 仅在主锁已确认陈旧时执行
+     rm -f -- "$gitdir/release-apply.reclaim.lock"  # 仅在 reclaim 锁已确认陈旧时执行
+     node scripts/release.mjs --version <semver> --apply
+     ```
+
+     删除后必须重跑 `--apply` 才会继续发布；dry-run 不会重建锁或写入文件。若删除前锁内容/持有者已变化，停止操作并重新诊断，不要删除新一代锁。
+  4. 成功 apply 后，[package.json](../package.json) 与 [CHANGELOG.md](../CHANGELOG.md) 会有意保持未提交状态。先审查 diff，再由人工 commit/tag；脚本不会替你做这些操作，也不会 push。
+
+- 何时不要重试：
+  - **工作区脏**：未提交或未跟踪文件未妥善处理前，重复 `--apply` 只会再次得到 `DIRTY_WORKTREE`。先逐项确认 `git status --porcelain`，提交或 stash，并确认输出为空。
+  - **package 版本已提升**：`VERSION_NOT_GREATER` 可能意味着上一次 apply 已成功。先比较 package、CHANGELOG 与 git diff；若目标版本已经正确写入，直接审查并人工完成后续发布步骤，不要再次 apply。
+  - **CHANGELOG 已有目标版本段**：`VERSION_ALREADY_RELEASED` 是重复发布保护。先核对目标段与 package 版本是否一致、是否属于历史发布；不一致时先人工修正状态，不要靠重跑覆盖。
+  - **Git 检查失败或锁仍有效**：先修复 `GIT_CHECK_FAILED` 的根因，或等待有效锁释放。未改变根因的重试没有意义。
+
 ## 4. Merge gate block code 速查表
 
 block 由 [lib/core.js](../lib/core.js) `TowerCore.evaluateMergeGate` 产生；`message`/`entries`/`files` 字段给出细节。按「先修 base 环境，再修 mission 工件，再修审查绑定」的顺序排查通常最快。
@@ -451,3 +513,15 @@ node scripts/tower-doctor.mjs --help              # 用法
 | `RUNNING_RECORD_MISSING`（error）/ `RUNNING_RECORD_FINISHED`（warning） | running 状态但记录缺失 / 记录已结束 | 后者按提示执行 `tower action=recover`（3.8） |
 | `GIT_METADATA_FOREIGN_OWNER`（warning） | 扫描发现由其它 uid 拥有的 repo/git 元数据；`sample` 最多 10 条，`truncated:true` 表示达到扫描预算 | 3.12；先停止写入、诊断与备份，再由人工确认并修复属主 |
 | `GIT_METADATA_NOT_WRITABLE`（error） | 现存的对象库 / refs / index / Tower state 目录对当前用户不可写 | 3.12；先备份并处理活跃 worker，再人工修复属主或目标权限 |
+
+### `scripts/release.mjs` 错误码映射
+
+以下是发布脚本自身的错误，不是 doctor finding；完整诊断与安全顺序见 3.13。
+
+| code | 含义 | 处置 |
+|---|---|---|
+| `RELEASE_LOCKED` | 主锁 / reclaim 锁由其它进程持有，或获取期间发生锁代际变化 | 查真实 gitdir、锁内容、pid 与锁龄；优先等待，陈旧锁交由脚本自动接管，手动删除仅为最后手段 |
+| `DIRTY_WORKTREE` | `--apply` 前工作区不干净 | 提交或 stash 改动，确认 `git status --porcelain` 为空后再运行 |
+| `VERSION_NOT_GREATER` | 目标版本不大于 package 当前版本 | 先确认是否已成功 apply；需要新版本时使用严格更高的 semver，不要对相同状态反复重试 |
+| `VERSION_ALREADY_RELEASED` | CHANGELOG 已有目标版本段 | 核对 package、CHANGELOG 与历史发布状态，先修正不一致，不要重复 apply |
+| `GIT_CHECK_FAILED` | gitdir 探测或工作区状态检查失败 | 根据 stderr 修复仓库、Git 元数据或权限问题后再运行 |
