@@ -113,7 +113,7 @@ config:
 
 ## 工具流程
 
-可用的 action：`init`、`add`、`spawn`、`recover`、`send`、`interrupt`、`status`、`gate`、`merge`、`rebase`、`abandon`、`teardown`、`models`。
+可用的 action：`init`、`add`、`edit`、`spawn`、`recover`、`send`、`interrupt`、`status`、`summary`、`gate`、`merge`、`rebase`、`abandon`、`teardown`、`models`。
 
 1. 把 Session 的工作目录切换到目标仓库（`working_directory` 支持 `cd`），检出本地 base 分支，并确保主 worktree 干净。
 2. `tower({action:"init"})`。
