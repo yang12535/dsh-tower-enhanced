@@ -10,7 +10,7 @@
 // commits, tags, pushes, or touches the network.
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -291,6 +291,138 @@ export function applyPlan(plan) {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-process apply lock
+// ---------------------------------------------------------------------------
+
+const RELEASE_LOCK_MAX_AGE_MS = 10 * 60 * 1000;
+
+function resolveGitDirectory(repo) {
+  const result = spawnSync('git', ['-C', repo, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf8' });
+  if (result.error) {
+    throw new ReleaseError('GIT_UNAVAILABLE', `cannot run git to locate the Git directory: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const detail = String(result.stderr).trim() || `exit code ${result.status}`;
+    throw new ReleaseError('GIT_CHECK_FAILED', `git rev-parse failed in ${repo}: ${detail}`);
+  }
+  return result.stdout.trim();
+}
+
+function lockedError(lockPath, raw, modifiedAt) {
+  let holder = null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Number.isInteger(parsed.pid) && parsed.pid > 0) holder = parsed.pid;
+  } catch {
+    // A malformed lock is still respected until it is old enough to be stale.
+  }
+  const owner = holder === null ? 'an unknown pid' : `pid ${holder}`;
+  return new ReleaseError(
+    'RELEASE_LOCKED',
+    `RELEASE_LOCKED: another release apply is in progress (${owner}); lock: ${lockPath} (modified ${new Date(modifiedAt).toISOString()}). Wait for that process to finish before retrying. Do not remove a live lock; if the holder is gone and automatic stale-lock takeover did not resolve it, inspect the process and remove this lock manually.`,
+  );
+}
+
+function inspectStaleLock(lockPath) {
+  // Stat before reading so the contents can be compared again before unlinking.
+  const lockStat = statSync(lockPath);
+  const raw = readFileSync(lockPath, 'utf8');
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    // Fall back to the file mtime for malformed or partially written locks.
+  }
+  const timestamp = typeof data?.timestamp === 'number'
+    ? data.timestamp
+    : typeof data?.timestamp === 'string'
+      ? Date.parse(data.timestamp)
+      : typeof data?.acquiredAt === 'string'
+        ? Date.parse(data.acquiredAt)
+        : Number.NaN;
+  const createdAt = Number.isFinite(timestamp) ? timestamp : lockStat.mtimeMs;
+  const pid = Number.isInteger(data?.pid) && data.pid > 0 ? data.pid : null;
+  let processGone = false;
+  if (pid !== null) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      // EPERM means the process exists but belongs to another user.
+      processGone = error.code === 'ESRCH';
+    }
+  }
+  const expired = Date.now() - createdAt >= RELEASE_LOCK_MAX_AGE_MS;
+  if (!processGone && !expired) throw lockedError(lockPath, raw, lockStat.mtimeMs);
+  const reason = processGone ? `holder pid ${pid} no longer exists` : `lock is at least 10 minutes old`;
+  return { raw, notice: `Taking over stale release lock ${lockPath}: ${reason}.` };
+}
+
+export function acquireReleaseLock(repo) {
+  // Keep the lock in the actual Git directory (which also handles linked
+  // worktrees), never in the work tree: it must not dirty `git status`, which
+  // --apply checks, and no .gitignore change is needed.
+  const lockPath = path.join(resolveGitDirectory(repo), 'release-apply.lock');
+  let notice = null;
+
+  // These are immediate race/stale-lock retries, never waiting for a live lock.
+  for (let attempt = 0; attempt < 4; attempt++) {
+    let handle;
+    try {
+      handle = openSync(lockPath, 'wx', 0o600);
+    } catch (error) {
+      if (error.code !== 'EEXIST') {
+        throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot create release lock ${lockPath}: ${error.message}`, { cause: error });
+      }
+      let stale;
+      try {
+        stale = inspectStaleLock(lockPath);
+        // Never unlink a lock whose contents changed after inspection: a new
+        // holder may have replaced the stale lock in the meantime.
+        if (readFileSync(lockPath, 'utf8') !== stale.raw) continue;
+        rmSync(lockPath);
+        notice = stale.notice;
+        continue;
+      } catch (lockError) {
+        if (lockError.code === 'ENOENT') continue;
+        if (lockError instanceof ReleaseError) throw lockError;
+        throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot inspect or replace release lock ${lockPath}: ${lockError.message}`, { cause: lockError });
+      }
+    }
+
+    const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    try {
+      writeFileSync(handle, `${JSON.stringify({ pid: process.pid, timestamp: Date.now(), token })}\n`, 'utf8');
+    } catch (error) {
+      try {
+        rmSync(lockPath, { force: true });
+      } catch {
+        // Preserve the original write error.
+      }
+      throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot initialize release lock ${lockPath}: ${error.message}`, { cause: error });
+    } finally {
+      closeSync(handle);
+    }
+
+    return {
+      notice,
+      release() {
+        try {
+          const current = JSON.parse(readFileSync(lockPath, 'utf8'));
+          // If somebody manually replaced our lock, never delete the new one.
+          if (current.token === token) rmSync(lockPath);
+        } catch (error) {
+          if (error.code !== 'ENOENT') {
+            throw new ReleaseError('RELEASE_UNLOCK_FAILED', `cannot release lock ${lockPath}: ${error.message}`, { cause: error });
+          }
+        }
+      },
+    };
+  }
+
+  throw new ReleaseError('RELEASE_LOCKED', `RELEASE_LOCKED: release lock ${lockPath} kept changing during acquisition. Retry after the other release process finishes; inspect the lock and its pid before considering manual cleanup.`);
+}
+
+// ---------------------------------------------------------------------------
 // Clean work tree check (read-only; used before --apply writes anything)
 // ---------------------------------------------------------------------------
 
@@ -311,16 +443,23 @@ export function dirtyWorktreeEntries(repo) {
 // ---------------------------------------------------------------------------
 
 export function runRelease(options = {}) {
-  const plan = computePlan(options);
-  if (!options.apply) return { plan, applied: false };
-  const dirty = dirtyWorktreeEntries(plan.repo);
-  if (dirty.length > 0) {
-    const shown = dirty.slice(0, 10).join('\n  ');
-    const more = dirty.length > 10 ? `\n  ... and ${dirty.length - 10} more` : '';
-    throw new ReleaseError('DIRTY_WORKTREE', `refusing --apply: the work tree is not clean (git status --porcelain is not empty)\n  ${shown}${more}\ncommit or stash your changes first`);
+  if (!options.apply) return { plan: computePlan(options), applied: false };
+  // Serialize the entire apply operation, including validation, so a competing
+  // process cannot act on a plan computed before the current holder's writes.
+  const lock = acquireReleaseLock(path.resolve(options.repo ?? process.cwd()));
+  try {
+    const plan = computePlan(options);
+    const dirty = dirtyWorktreeEntries(plan.repo);
+    if (dirty.length > 0) {
+      const shown = dirty.slice(0, 10).join('\n  ');
+      const more = dirty.length > 10 ? `\n  ... and ${dirty.length - 10} more` : '';
+      throw new ReleaseError('DIRTY_WORKTREE', `refusing --apply: the work tree is not clean (git status --porcelain is not empty)\n  ${shown}${more}\ncommit or stash your changes first`);
+    }
+    applyPlan(plan);
+    return { plan, applied: true, lockNotice: lock.notice };
+  } finally {
+    lock.release();
   }
-  applyPlan(plan);
-  return { plan, applied: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -423,11 +562,12 @@ function renderFileDiff(file) {
 }
 
 function renderHuman(result) {
-  const { plan, applied } = result;
+  const { plan, applied, lockNotice } = result;
   const lines = [
     `${applied ? 'Applying' : 'Planning'} release of ${plan.packageName}: ${plan.currentVersion} -> ${plan.nextVersion} (${plan.date})`,
     `Repository: ${plan.repo}`,
   ];
+  if (lockNotice) lines.push(lockNotice);
   for (const file of plan.files) lines.push(renderFileDiff(file));
   if (applied) {
     lines.push(
@@ -441,10 +581,11 @@ function renderHuman(result) {
   return `${lines.join('\n')}\n`;
 }
 
-function jsonSummary({ plan, applied }) {
+function jsonSummary({ plan, applied, lockNotice }) {
   return {
     ok: true,
     dryRun: !applied,
+    ...(lockNotice ? { lockNotice } : {}),
     repo: plan.repo,
     packageName: plan.packageName,
     currentVersion: plan.currentVersion,
@@ -489,7 +630,10 @@ Options:
   --help               Show this help.
 
 Safety:
-  - Dry run never writes any file.
+  - Dry run never writes any file or acquires the apply lock.
+  - --apply is serialized with <git-dir>/release-apply.lock; a live concurrent
+    apply fails with RELEASE_LOCKED instead of waiting, while stale locks are
+    taken over when their holder is gone or they are at least 10 minutes old.
   - --apply refuses a dirty work tree (git status --porcelain must be empty).
   - Every validation runs before the first file is written; files are written
     atomically (temporary file + rename) and the first file is rolled back
