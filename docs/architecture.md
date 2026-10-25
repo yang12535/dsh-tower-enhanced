@@ -27,7 +27,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 | [../lib/client.js](../lib/client.js) | Web UI：会话头 popover + 右侧 Sidebar Tower 标签页，missions / agents 两个视图 | `apply`（client）、`missionNextStep`、`missionDependencyState`（后两者供测试） |
 | [../lib/errors.js](../lib/errors.js) | 统一错误类型 | `TowerError`、`assertTower`、`errorMessage`、`errorDetails` |
 | [../scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs) | 独立只读诊断 CLI：state 结构、Git/Worktree 事实与元数据健康对账（§8.1） | `collectFindings`、`runDoctor`、`validateStateStructure` |
-| [../scripts/release.mjs](../scripts/release.mjs) | 独立本地发布 CLI：plan/apply 分离、跨进程互斥、原子写与回滚（§8.2） | `computePlan`、`runRelease`、`applyPlan`、`atomicWrite` |
+| [../scripts/release.mjs](../scripts/release.mjs) | 独立本地发布 CLI：plan/apply 分离、双层跨进程锁、原子写与回滚（§8.2） | `computePlan`、`runRelease`、`applyPlan`、`atomicWrite` |
 
 依赖方向：`index.js` → `runtime.js` → `core.js` → (`store.js`, `git.js`, `errors.js`)；`projection.js` 被 `index.js` 注册、被 `runtime.js` 写入、被 `client.js` 消费；`client.js` 仅读取 projection，不直接触碰 Git 或状态文件。
 
@@ -111,6 +111,8 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 - `WORKER_RESTARTABLE = { pending, worker_completed, worker_failed, review_failed, changes_requested, approved, rebase_blocked, merge_blocked }` —— 可启动（或重启）worker 的状态。
 - `REVIEW_RESTARTABLE = { worker_completed, review_failed, approved, changes_requested }` —— 可启动（或重试）reviewer 的状态。
 
+状态集合的不变量与「状态 × 动作」全集结局由 [../test/state-machine.test.js](../test/state-machine.test.js) 固定：它用真实 Git 仓库跑满 **12 个状态 × 7 个动作**（spawnWorker、spawnReviewer、merge、rebase、teardown、editMission、addDependent）矩阵，并断言 `ACTIVE ∪ TERMINAL ∪ WORKER_RESTARTABLE` 恰好覆盖全部合法状态、三者两两不相交、`REVIEW_RESTARTABLE ⊆ WORKER_RESTARTABLE`、每个合法状态都有矩阵行；所有拒绝/拒绝式结果还要求 mission、revision 与 events 逐项不变。
+
 ### 3.1 合法迁移
 
 | 迁移 | 触发（函数） | 前置条件 / 说明 |
@@ -144,7 +146,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 ### 3.3 `send` / `interrupt` 的归属与返回
 
-`agentAddress` 先从持久化状态解析目标：对应 worker/review 记录必须有 `childId`，且 mission status 必须分别为 `worker_running` / `review_running`。runtime 的 `controlAddress` 再核对本进程 `active` 中的激活，要求 core、runId、missionId、role、childId **全部一致**。因此，已完成的 agent、未 attach 的 running 记录、错误 role、重启后遗留或由另一 runtime 拥有的 run 都抛 `AGENT_NOT_RUNNING`，且不会调用 subagents 的发送/取消接口；这避免把消息或中断投递给同名的另一轮运行。
+`send` 与 `interrupt` 共用 `TowerRuntime.controlAddress`（[../lib/runtime.js](../lib/runtime.js)）的三步校验：`role` 参数先过白名单，只接受 `worker` / `reviewer`，其余值立即抛 `ARGUMENT_INVALID`；core 的 `agentAddress`（[../lib/core.js](../lib/core.js)）再按 role 取对应 worker/review 记录，要求该记录已有 `childId`，且 mission status 分别为 `worker_running` / `review_running`；最后核对本进程 `active` 中的激活，要求 core、runId、missionId、role、childId **全部一致**。因此，已完成的 agent、未 attach 的 running 记录、指向另一角色的地址、重启后遗留或由另一 runtime 拥有的 run 都抛 `AGENT_NOT_RUNNING`，且不会调用 subagents 的发送/取消接口；这避免把消息或中断投递给同名的另一轮运行。
 
 成功返回均带完整地址 `{ mission, role, runId, childId }`：`send` 另含 `sent:true` 与宿主返回的 `messageId`，消息文本经 trim 后转发；`interrupt` 另含 `interrupted:true`，以 `{ kind:'ancestor', agent }` 请求取消。两个动作本身不写 Tower state，成功路径也不 publish；实际落定状态仍由 §6.3 的 `track` 统一结算。覆盖测试见 [../test/control-actions.test.js](../test/control-actions.test.js)。
 
@@ -158,7 +160,10 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 - 终态（`merged` / `abandoned`）不能再 `spawn`（`MISSION_TERMINAL`）或 `rebase`；`merged` 不能 `abandon`。
 - 活跃状态（`worker_running` / `review_running`）不能再 `spawn`（`AGENT_BUSY`）、`rebase`、`abandon`；`send` / `interrupt` 只寻址活跃子代理（§3.3）。
+- 非 `REVIEW_RESTARTABLE` 状态（如 `pending`、`worker_failed`、`rebase_blocked`、`merge_blocked`）不能 `spawn` reviewer（`REVIEW_START_BLOCKED`）——审查必须先有一轮可审查的 worker 产出。
+- `teardown` 对非终态 mission 不抛异常，而是逐条返回结构化拒绝（`removed:false` + `reason:'status-<status>'`）。
 - 活跃状态下不会出现 `worker_failed` / `changes_requested` 等落定状态（它们是活跃态的结算结果）；`rebase_blocked` / `merge_blocked` 也只在非活跃的 Git 操作失败时产生。
+- 上述拒绝与结构化拒绝都**不改 state**：mission、revision 与 events 逐项不变（[../test/state-machine.test.js](../test/state-machine.test.js) 对每个矩阵单元格断言）。
 
 ## 4. 关键不变量
 
@@ -260,7 +265,8 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 │       └── <mission-id 小写>/       # 每 mission 一个 Git worktree（如 m1/）
 ├── .git/
 │   ├── info/exclude                # 追加 "<stateDirectory>/" 条目（本地排除，不提交）
-│   └── release-apply.lock          # release --apply 的瞬时跨进程锁，非 Tower state（§8.2）
+│   ├── release-apply.lock          # release --apply 主锁（§8.2，瞬时跨进程锁，非 Tower state）
+│   └── release-apply.reclaim.lock  # 陈旧主锁回收的串行化锁（§8.2）
 └── ...
 ```
 
@@ -301,20 +307,22 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 异属主 finding 的 `sample` 最多 **10 条**，`count` 只表示本次实际扫描发现的数量。扫描默认最多执行 **5000 次 `lstat`**，达到预算即停止并置 `truncated:true`，所以结果不是完整仓库属主审计；`node_modules` 与 Tower worktrees 目录始终跳过，符号链接不跟随。无 `process.getuid()` 的平台跳过异属主扫描，可写性检查仍执行。
 
-[../test/doctor-json-schema.test.js](../test/doctor-json-schema.test.js) 是输出与退出码的可执行契约，并验证重复运行输出逐字节稳定、state 不变；[../test/doctor.test.js](../test/doctor.test.js) 固定 10 条样例上限、扫描预算和 `truncated` 行为。
+[../test/doctor-json-schema.test.js](../test/doctor-json-schema.test.js) 是输出与退出码的可执行契约，并验证重复运行输出逐字节稳定、state 不变；[../test/doctor.test.js](../test/doctor.test.js) 固定 10 条样例上限、扫描预算和 `truncated` 行为；[../test/doctor-tower.test.js](../test/doctor-tower.test.js) 另以真实 `TowerCore` 生命周期（真实 worktree / commit / merge / teardown，Git 不 mock）产出的 state 做集成对账，仅人为改写 state.json 模拟健康生命周期不会自行产生的崩溃/伪造场景。
 
-### 8.2 `release`：plan/apply 分离、互斥与回滚
+### 8.2 `release`：plan/apply 分离、双层锁与回滚
 
-[../scripts/release.mjs](../scripts/release.mjs) 只准备本地版本变更，不 commit、tag、push 或访问网络。`computePlan` 读取并校验 semver、日期、`package.json` 与 `CHANGELOG.md`，生成包含每份文件 `before/after` 的计划；默认 dry-run 只渲染计划 diff，不取锁、不写文件。`--apply` 先取得下述锁，再在临界区内重新执行 `computePlan`、要求 `git status --porcelain` 为空并写入，避免使用竞争者写入前的旧计划；缺失 CHANGELOG 只有显式 `--create-changelog` 才允许创建。成功输出后文件保持 dirty，交由人工复核与提交。
+[../scripts/release.mjs](../scripts/release.mjs) 只准备本地版本变更，不 commit、tag、push 或访问网络。`computePlan` 读取并校验 semver、日期、`package.json` 与 `CHANGELOG.md`，生成包含每份文件 `before/after` 的计划；默认 dry-run 只渲染计划 diff，**不取锁、不写文件**。`--apply` 把整个操作——重新执行 `computePlan`、要求 `git status --porcelain` 为空、写入——都放进锁的临界区内，竞争者不可能使用持锁者写入前算出的旧计划；缺失 CHANGELOG 只有显式 `--create-changelog` 才允许创建。成功输出后文件保持 dirty，交由人工复核与提交；若本次接管了陈旧锁，输出附 `lockNotice` 说明接管原因。
 
-为避免两个进程同时依据同一旧版本完成计划并互相覆盖，`--apply` 使用**跨进程锁**，而不是复用 §6 的 Tower 单进程机制：
+为避免两个进程同时依据同一旧版本完成计划并互相覆盖，`--apply` 使用**双层跨进程锁**（下称主锁 L 与回收锁 R），而不是复用 §6 的 Tower 单进程机制：
 
-- 锁路径由 Git 的实际 git-dir 定位，普通仓库为 `<repo>/.git/release-apply.lock`，不落在工作区，因此锁本身不会破坏 clean-worktree 前置条件，也不需要修改 `.gitignore`。
-- 通过排他创建（`wx`）原子抢锁，锁内容记录持有者 pid 与时间戳。有效锁被占用时立即抛 `RELEASE_LOCKED` 并给出持有者/处理提示，**不静默等待或重试到成功**。
-- 只有持有进程已不存在（`process.kill(pid, 0)` 报 `ESRCH`）或锁已至少存在 **10 分钟**时才允许接管陈旧锁；接管必须确认仍是同一把旧锁，不能把竞争者刚换上的新锁一并删除。正常与异常退出都在 `finally` 中释放自己持有的锁，强杀留下的文件由后续陈旧锁判定处理。
+- 两把锁都由 `git rev-parse --absolute-git-dir` 定位到 Git 实际 git-dir（linked worktree 各有各的 git-dir）：L 为 `<gitdir>/release-apply.lock`，R 为 `<gitdir>/release-apply.reclaim.lock`。锁不落在工作区，因此不会破坏 clean-worktree 前置条件，也不需要修改 `.gitignore`。
+- **快路径**：以排他创建（`open 'wx'`，权限 0o600）原子抢 L；锁内容为 JSON `{ pid, timestamp, token }`，`token` 是本次持有的唯一凭据。
+- L 已存在时先做陈旧判定：仅当持有 pid 已不存在（`process.kill(pid, 0)` 报 `ESRCH`）或锁龄至少 **10 分钟**（优先读锁内 timestamp，坏锁回退文件 mtime）才允许回收；否则立即抛 `RELEASE_LOCKED`，消息点名持有者 pid（无法解析时称 unknown pid）并明确**不等待、不自动重试**。
+- **回收先取 R**（获取协议与 L 相同，陈旧的 R 本身也要先被回收）：R 把「陈旧 L 的回收」串行化。持有 R 后重读 L，内容必须与陈旧判定时逐字节一致，否则视为被竞争者替换（`RELEASE_LOCKED`）；随后把 L 以 `rename` 原子移入唯一隔离路径，并核验移入的字节仍是判定时那把旧锁——若发现移动的其实是竞争者刚换上的新锁，用硬链接恢复原位并中止，绝不误删；确认无误才删除隔离文件并以 `wx` 创建新 L（此时 `EEXIST` 说明有更快者，同样 `RELEASE_LOCKED`）。
+- **释放只删自身 token**：释放同样先 `rename` 到唯一隔离路径、核验 token 仍属于自己才删除；若锁已被换成别人的则原样保留。L 与 R 都在 `finally` 中按此协议释放。文件系统层面的失败以 `RELEASE_LOCK_FAILED` / `RELEASE_UNLOCK_FAILED` 显式暴露。
 - dry-run 不经过上述锁协议；该锁只序列化发布脚本的目标文件写入，不授权两个 Host 同时控制 Tower state（§6.4）。
 
-写入仍逐文件采用同目录临时文件 + `rename` 原子替换，失败时清理本次临时文件。`applyPlan` 记录已成功写入的文件；后续文件失败时按逆序 best-effort 回滚：update 恢复原始字节，create 删除新文件，然后抛 `WRITE_FAILED`，消息区分「尚未写入」「已回滚」与「回滚失败」。因此原子替换降低单文件半写风险，回滚降低两份文件跨文件不一致风险，但后者不是事务保证，回滚错误会明确暴露。相关回归见 [../test/release.test.js](../test/release.test.js)。
+写入仍逐文件采用同目录临时文件 + `rename` 原子替换，失败时清理本次临时文件。`applyPlan` 记录已成功写入的文件；后续文件失败时按逆序 best-effort 回滚：update 恢复原始字节，create 删除新文件，然后抛 `WRITE_FAILED`，消息区分「尚未写入」「已回滚」与「回滚失败」。因此原子替换降低单文件半写风险，回滚降低两份文件跨文件不一致风险，但后者不是事务保证，回滚错误会明确暴露。回归见 [../test/release.test.js](../test/release.test.js) 与 [../test/release-concurrency.test.js](../test/release-concurrency.test.js)（真进程并发：两个同时 `--apply` 恰有一个成功，落败方报结构化错误且仓库无临时/锁残留；dry-run 与 apply 并发时只有 apply 写文件）。
 
 ## 9. 失败恢复语义（汇总）
 
