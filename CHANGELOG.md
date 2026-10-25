@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Invalidate stale review bindings after a base change even when rebase leaves the mission tip unchanged, and return `reviewRequired: true` consistently with the merge gate.
 - Recognize `review_failed` in the read-only doctor and continue checking its required Git artifacts instead of reporting valid state as corrupt.
 - Locate restart-recovery warnings from the current working directory and Git root rather than only the session's creation-time directory.
+- Show failed reviews, stale-review retry guidance, and bounded plain-text errors in Tower cards; failed launches without a child Session no longer appear to be starting indefinitely.
 
 ## [0.2.0] - 2026-10-25
 
