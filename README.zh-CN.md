@@ -138,6 +138,7 @@ config:
 - 当被干净审查过的精确 SHA 已经包含在 base 中、且仍是任务 tip 时，`gate` 会报告 `alreadyMerged`；随后的 `merge` 只做账目调和，不会再次合并。
 - `merge` 区分 Git 完成与状态记账，当后续观察或持久化需要关注时返回 `postMerge`/`recoveryRequired`。观察失败时返回 `mergeAttempted: true`、`merged: false`、`verified: false`；只有精确 SHA 验证或后续调和才会产生 `merged: true`。
 - 重试 `teardown` 会在记录的路径既不在磁盘上、也不在 Git 已注册 worktree 中时，调和一个已终结的任务。已存在的意外路径永远不会被移除。
+- 状态先写入同目录临时文件，成功后才替换目标。写入或重命名失败时，只尝试清理本次写入的临时文件并原样抛出原错误，不删除无关临时文件或现有目标。文件系统或权限异常可能导致清理也失败；这项清理不会回滚此前已经执行的 Git 操作。
 
 ## 刻意限制
 

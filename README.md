@@ -133,6 +133,7 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 - `gate` reports `alreadyMerged` when the exact clean-reviewed SHA is already contained in the base and still matches the mission tip. `merge` then performs accounting-only reconciliation instead of merging again.
 - `merge` distinguishes Git completion from state accounting and returns `postMerge`/`recoveryRequired` when later observation or persistence needs attention. Inspection failure is `mergeAttempted: true`, `merged: false`, `verified: false`; only exact-SHA verification or later reconciliation produces `merged: true`.
 - Retrying `teardown` reconciles a terminal mission when its recorded path is both absent on disk and absent from Git's registered worktrees. An existing unexpected path is never removed.
+- State is replaced only after writing a temporary sibling file. If writing or renaming fails, the store attempts to remove only that write's temporary file and rethrows the original error; unrelated temporary files and the existing target are not removed. Cleanup can itself fail under filesystem or permission errors, and does not roll back earlier Git operations.
 
 ## Deliberate limits
 

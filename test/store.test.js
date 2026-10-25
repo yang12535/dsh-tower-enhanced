@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { readFile, rename, rm } from 'node:fs/promises';
 import test from 'node:test';
+import { promisify } from 'node:util';
 import { TowerStore } from '../lib/store.js';
 import { makeRepo } from './helpers.js';
 import { chmod, mkdir, readdir, stat, writeFile } from 'node:fs/promises';
@@ -9,6 +11,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { TowerError } from '../lib/errors.js';
 import { ensureLocalExclude, validateState } from '../lib/store.js';
+
+const runCommand = promisify(execFile);
+const RENAME_OS_ERRORS = ['EISDIR', 'ENOTEMPTY', 'EEXIST'];
 
 test('state writes are durable JSON and reads validate the version', async (t) => {
   const repo = makeRepo(t);
@@ -189,6 +194,112 @@ test('write failures keep the previous state readable and leave no partial files
   assert.deepEqual((await store.read()).missions.map((entry) => entry.id), ['M1']);
   assert.deepEqual(await tmpResidue(store.directory), []);
   // the queue survives the failures and keeps serving later updates
+  await store.update((state) => {
+    state.missions.push(mission('M2'));
+  });
+  assert.deepEqual((await store.read()).missions.map((entry) => entry.id), ['M1', 'M2']);
+});
+
+test('rename onto a non-empty directory rethrows the raw OS error and leaves no temp file', async (t) => {
+  const repo = tempDir(t);
+  const store = new TowerStore(repo);
+  await store.write(baseState(repo, [mission('M1')]));
+  await rm(store.statePath);
+  await mkdir(store.statePath);
+  const blocker = path.join(store.statePath, 'blocker');
+  await writeFile(blocker, 'target-content');
+  await assert.rejects(store.write(baseState(repo, [mission('M1'), mission('M2')])), (error) => {
+    assert.ok(!(error instanceof TowerError), 'rename error must not be wrapped in TowerError');
+    assert.ok(RENAME_OS_ERRORS.includes(error.code), `unexpected error code ${error.code}`);
+    assert.equal(error.syscall, 'rename');
+    return true;
+  });
+  assert.equal(await readFile(blocker, 'utf8'), 'target-content');
+  assert.deepEqual(await tmpResidue(store.directory), []);
+});
+
+test('update rename failures keep the saved original state and spare unrelated temp files', async (t) => {
+  const repo = tempDir(t);
+  const store = new TowerStore(repo);
+  await store.write(baseState(repo, [mission('M1')]));
+  const before = await readFile(store.statePath, 'utf8');
+  const unrelated = path.join(store.directory, 'unrelated.tmp');
+  await writeFile(unrelated, 'another-process-temp');
+  const saved = path.join(store.directory, 'state.json.saved');
+  let failure;
+  try {
+    await store.update(async (state) => {
+      await rename(store.statePath, saved);
+      await mkdir(store.statePath);
+      await writeFile(path.join(store.statePath, 'blocker'), 'occupied');
+      state.missions.push(mission('M2'));
+    });
+    assert.fail('update should reject when the rename target is a non-empty directory');
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(!(failure instanceof TowerError), 'rename error must not be wrapped in TowerError');
+  assert.ok(RENAME_OS_ERRORS.includes(failure.code), `unexpected error code ${failure.code}`);
+  assert.equal(failure.syscall, 'rename');
+  assert.equal(await readFile(saved, 'utf8'), before);
+  assert.equal(await readFile(path.join(store.statePath, 'blocker'), 'utf8'), 'occupied');
+  assert.deepEqual(await tmpResidue(store.directory), ['unrelated.tmp']);
+  await rm(store.statePath, { recursive: true, force: true });
+  await rename(saved, store.statePath);
+  await store.update((state) => {
+    state.missions.push(mission('M3'));
+  });
+  assert.deepEqual((await store.read()).missions.map((entry) => entry.id), ['M1', 'M3']);
+  assert.equal(await readFile(unrelated, 'utf8'), 'another-process-temp');
+  assert.deepEqual(await tmpResidue(store.directory), ['unrelated.tmp']);
+});
+
+test('a real EFBIG mid-write failure keeps state.json byte-identical and cleans its temp file', async (t) => {
+  if (process.platform !== 'linux') {
+    t.skip('RLIMIT_FSIZE via bash ulimit is exercised on Linux only');
+    return;
+  }
+  const repo = tempDir(t);
+  const store = new TowerStore(repo);
+  await store.write(baseState(repo, [mission('M1')]));
+  const before = await readFile(store.statePath, 'utf8');
+  const libUrl = new URL('../lib/store.js', import.meta.url).href;
+  const child = `
+import { readFile, readdir } from 'node:fs/promises';
+import { TowerStore } from ${JSON.stringify(libUrl)};
+const store = new TowerStore(${JSON.stringify(repo)});
+let errorCode = null;
+let errorName = null;
+try {
+  await store.update((state) => {
+    state.events.push({ type: 'padding', payload: 'x'.repeat(8192) });
+  });
+} catch (error) {
+  errorCode = error.code ?? null;
+  errorName = error.constructor?.name ?? null;
+}
+process.stdout.write(JSON.stringify({
+  errorCode,
+  errorName,
+  raw: await readFile(store.statePath, 'utf8'),
+  tmp: (await readdir(${JSON.stringify(store.directory)})).filter((name) => name.endsWith('.tmp')),
+}));
+`;
+  // ulimit -f 2 caps this child at 2 KiB per file; SIGXFSZ is ignored so
+  // writeFile returns EFBIG after a partial write instead of being killed.
+  const { stdout, stderr } = await runCommand(
+    'bash',
+    ['-c', 'trap "" XFSZ && ulimit -f 2 && exec "$0" --input-type=module -e "$1"', process.execPath, child],
+    { encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024 },
+  );
+  assert.equal(stderr, '');
+  const result = JSON.parse(stdout);
+  assert.notEqual(result.errorName, 'TowerError');
+  assert.equal(result.errorCode, 'EFBIG');
+  assert.equal(result.raw, before);
+  assert.deepEqual(result.tmp, []);
+  assert.equal(await readFile(store.statePath, 'utf8'), before);
+  assert.deepEqual(await tmpResidue(store.directory), []);
   await store.update((state) => {
     state.missions.push(mission('M2'));
   });
