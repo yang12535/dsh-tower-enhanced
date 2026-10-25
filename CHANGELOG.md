@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Cross-process `release --apply` serialization in `scripts/release.mjs`, using paired locks in the Git directory, fail-fast `RELEASE_LOCKED` contention errors, and guarded stale-lock recovery; concurrent and repeated apply behavior is covered by `test/release-concurrency.test.js`.
+- Node 22.5 and 24 CI matrix coverage in `.github/workflows/ci.yml`, with independent test and check runs for the minimum supported and current Node versions.
+- Mission worker/reviewer elapsed-time displays and localized `stopReason` badges in `lib/client.js`, including running-duration updates and terminal-state styling, with boundary and lifecycle coverage in `test/client.test.js`.
+- A machine-readable `tower-doctor --json` contract test in `test/doctor-json-schema.test.js`, pinning top-level and summary keys, finding shapes and codes, severity counts, exit codes, and stdout/stderr behavior.
+- Regression coverage in `test/control-actions.test.js`, `test/readonly-actions.test.js`, `test/quickstart.test.js`, and `test/scale-smoke.test.js` for `send`/`interrupt` semantics, read-only action consistency across mission states, the executable README quick start, and responsive 100-mission state operations.
+
+### Changed
+
+- Expanded `README.md` and `README.zh-CN.md` with the 0.3 action inventory, failure and recovery semantics, review invalidation behavior, and diagnostics/release command documentation.
+
+### Fixed
+
+- Prevent concurrent `release --apply` processes from validating and writing the same release simultaneously (P1 double-write race) by holding the cross-process lock across planning, clean-worktree validation, and file updates in `scripts/release.mjs`.
+- Close stale release-lock takeover and release TOCTOU races in `scripts/release.mjs`: a separate reclaim lock serializes recovery, atomic rename quarantines the exact observed lock generation, content/token checks restore newer locks, and only the owner's lock is removed.
+- Validate active-run ownership for `send` and `interrupt` in `lib/runtime.js` before steering or cancelling a child, reject invalid roles consistently, and return the validated mission, role, run, and child addressing fields; regression coverage is in `test/control-actions.test.js`.
+
 ## [0.3.0] - 2026-10-26
 
 ### Added
