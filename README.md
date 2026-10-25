@@ -24,11 +24,15 @@ This is an independently maintained prototype, not Kimi Tower and not an officia
 
 The bundle has no build step and requires Node 22.5+ and DSH 0.2.1-rc.2.
 
+Replace the path below with the absolute path to your checkout:
+
 ```bash
-dsh plugin --profile web add file:/home/yangtim/dsh-tower-enhanced
+dsh plugin --profile web add file:/absolute/path/to/dsh-tower-enhanced
 ```
 
 Or install the local directory through **Plugins** in the DSH Web/Desktop UI. Activation may require a restart or a new session depending on the host's HMR state. The bundle includes a Web client; after installing or upgrading, refresh the existing GUI. In a conversation that has run the controller, open either the **Tower** button in the conversation header or the **Tower** entry on the right Sidebar's start page. Both views are read-only and show model routes only after the controller publishes its first state. Click an agent to load its conversation in the Sidebar; `全部展开` / `全部收起` manage the role groups. Switch to **Workspace** to inspect agents created by earlier controllers.
+
+A `file:` installation may contain a snapshot rather than a live link to the checkout. Merging source changes does not prove that the installed bundle changed. Before accepting an upgrade, finish active runs, refresh the installed package through the host's plugin workflow, and compare its `lib/core.js`, `lib/runtime.js`, and `lib/store.js` with the intended checkout. Then restart/reload the host, refresh the GUI, and exercise the changed behavior in a disposable repository. Restarting alone cannot update an outdated on-disk package.
 
 The bundle composes `subagents`, `workingDirectory`, `llm`, and `tools`; the normal DSH base already supplies them.
 
@@ -121,7 +125,8 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 
 - Failure always reaches the controller: every settled worker/reviewer steers the controller Session a notice shaped `Tower <role> for <mission> <outcome>: mission status <status>`, and failure/interrupted/stale outcomes add a bounded `reason` (≤500 characters from the recorded error or diagnostic) plus the next action — even when state recording or projection publishing fails, the notice still goes out (at worst as a fallback naming role, mission, run, and error).
 - A failed review is explicit: a reviewer that errors out, returns no structured verdict, or never starts moves the mission to `review_failed` (recorded with `error`, `stopReason`, and `completedAt`, and a `spawn-failed` event) instead of collapsing back into `worker_completed`. Spawn a fresh reviewer from it, or a worker for direct rework; the merge gate reports `NOT_APPROVED` until a clean review approves the mission.
-- After a host restart, the runtime watches for agents recreated over a tower workspace and proactively steers the controller one stale-run warning per persisted `worker_running`/`review_running` activation (mission/role/start time), suggesting `tower action=recover` — persisted zombies never sit silently as "running".
+- After a host restart, the runtime resolves the agent's current working directory to its Git repository root, including sessions that changed directories or work inside a subdirectory. It proactively steers the controller one stale-run warning per persisted `worker_running`/`review_running` activation (mission/role/start time), suggesting `tower action=recover`. The creation-time session directory is only a fallback when the working-directory service is unavailable.
+- `node scripts/tower-doctor.mjs --repo <path>` performs read-only state and Git diagnostics. A valid `review_failed` mission is not corrupt state; its branch and worktree are still required and checked.
 - `recover` is explicit and never adopts old processes. After confirming the previous controller stopped, it marks persisted running activations interrupted (worker runs become `worker_failed`, reviewer runs `review_failed`) so fresh agents can start.
 - Retrying `add` with the same mission id reconciles only exactly matching branch/worktree artifacts with no unique commits. Conflicting artifacts require manual inspection and are never deleted automatically.
 - `gate` reports `alreadyMerged` when the exact clean-reviewed SHA is already contained in the base and still matches the mission tip. `merge` then performs accounting-only reconciliation instead of merging again.

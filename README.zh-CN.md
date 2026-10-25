@@ -24,11 +24,15 @@
 
 组合包没有构建步骤，需要 Node 22.5+ 与 DSH 0.2.1-rc.2。
 
+请将下面的路径替换为源码仓库的实际绝对路径：
+
 ```bash
-dsh plugin --profile web add file:/home/yangtim/dsh-tower-enhanced
+dsh plugin --profile web add file:/absolute/path/to/dsh-tower-enhanced
 ```
 
 也可以在 DSH Web/Desktop UI 的 **Plugins** 中安装本地目录。根据宿主的 HMR 状态，激活可能需要重启或开启新会话。组合包包含 Web 客户端；安装或升级后请刷新现有 GUI。在已运行过控制器的会话中，打开会话头部的 **Tower** 按钮或右侧边栏起始页的 **Tower** 入口。两个视图均为只读，只有在控制器发布首个状态之后才显示模型路由。点击某个 agent 可在侧边栏加载其会话；`全部展开` / `全部收起` 用于管理角色分组。切换到 **工作区** 可以查看更早控制器创建的 agent。
+
+`file:` 安装可能生成源码快照，而不是指向仓库的实时链接。源码合并不代表已安装的插件同步更新。升级验收前，应先结束活跃任务，通过宿主的插件流程更新安装包，并比对安装副本的 `lib/core.js`、`lib/runtime.js`、`lib/store.js` 与目标源码；然后重启或重载宿主、刷新 GUI，在临时仓库实测变更行为。仅重启无法更新磁盘上过期的安装副本。
 
 组合包会组合 `subagents`、`workingDirectory`、`llm` 与 `tools`；DSH 常规基础包已经提供它们。
 
@@ -126,7 +130,8 @@ config:
 
 - 失败一定会通知控制器：每个结束的 worker/reviewer 都会向控制器 Session steer 一条形如 `Tower <role> for <mission> <outcome>: mission status <status>` 的通知；失败/被中断/过期（stale）的结果会附带截断到 500 字符以内的 `reason`（来自记录的 error 或 diagnostic）以及下一步操作提示 —— 即使状态记录或投影发布失败，通知也仍会发出（最坏情况下退化为一条包含 role、mission、run 与错误文本的兜底通知）。
 - review 失败是显式状态：reviewer 出错、没有返回结构化结论、或根本没有启动成功时，任务进入 `review_failed`（记录 `error`、`stopReason`、`completedAt`，并写入 `spawn-failed` 事件），而不会再退回难以区分的 `worker_completed`。可以从中重新 spawn reviewer，或直接另派 worker 返工；在干净的 review 批准之前，合并门禁会给出 `NOT_APPROVED`。
-- 宿主进程重启后，运行时会监听在 tower 工作区上新创建的 agent，并就持久化的 `worker_running`/`review_running` 激活向控制器主动 steer 一次僵尸告警（列出 mission/role/启动时间），提示执行 `tower action=recover` —— 重启遗留的僵尸不会再无声地停留在「运行中」。
+- 宿主进程重启后，运行时会从 agent 的当前工作目录定位 Git 仓库根，包括会话曾切换目录或停在仓库子目录的情况。对持久化的 `worker_running`/`review_running` 激活，向所属控制器主动 steer 一次僵尸告警（列出 mission/role/启动时间），提示执行 `tower action=recover`。仅在工作目录服务不可用时，才回退到会话创建时的目录。
+- `node scripts/tower-doctor.mjs --repo <路径>` 执行只读的状态与 Git 诊断。合法的 `review_failed` 任务不属于状态损坏；它的分支与工作树仍然必须存在，并继续接受检查。
 - `recover` 是显式的，绝不接管旧进程。确认上一个控制器停止后，它把持久化的运行中激活标记为 interrupted（worker 运行变为 `worker_failed`，reviewer 运行变为 `review_failed`），让新代理可以启动。
 - 用相同的任务 id 重试 `add` 只会对分支/worktree 产物完全匹配且没有独立提交的情况做调和。有冲突的产物需要人工检查，绝不会自动删除。
 - 当被干净审查过的精确 SHA 已经包含在 base 中、且仍是任务 tip 时，`gate` 会报告 `alreadyMerged`；随后的 `merge` 只做账目调和，不会再次合并。
