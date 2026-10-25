@@ -38,5 +38,30 @@ jobs:
       - name: Test
         run: pnpm test
 
+      - name: Smoke test tower-doctor script
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --help must exit 0 (CLI entry + arg parsing intact).
+          node scripts/tower-doctor.mjs --help > /dev/null
+          # A fresh CI checkout has no .dsh-tower/state.json, so the doctor
+          # reports STATE_MISSING and exits 2 — no tower state is expected.
+          # Accept 0 (state found, clean) or 2; exit 1 (warnings) fails.
+          node scripts/tower-doctor.mjs --repo . || [ $? -eq 2 ]
+
+      - name: Smoke test release script
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --help must exit 0 (CLI entry + arg parsing intact).
+          node scripts/release.mjs --help > /dev/null
+          # "<current>-smoke" is a valid semver prerelease of the current
+          # version, so it must be rejected (version not greater). If the
+          # dry run unexpectedly succeeds, the version guard is broken.
+          if node scripts/release.mjs --version "$(node -p "require('./package.json').version")-smoke"; then
+            echo "release.mjs accepted a non-incrementing version" >&2
+            exit 1
+          fi
+
       - name: Check
         run: pnpm run check
