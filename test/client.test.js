@@ -549,7 +549,7 @@ const roleRowOf = (card, role) => findAll(card, has('data-mission-role', role))[
 const errorNodes = (tree) => findAll(tree, (node) => node.props != null && 'data-agent-error' in node.props);
 
 test('mission role elapsed time formats second and minute boundaries and requires startedAt', () => {
-  for (const [seconds, expected] of [[45, '45s'], [60, '1m00s'], [200, '3m20s']]) {
+  for (const [seconds, expected] of [[45, '45s'], [59, '59s'], [60, '1m00s'], [200, '3m20s']]) {
     const tower = sampleTowerState();
     const started = Date.parse('2026-01-01T00:00:00.000Z');
     tower.missions[0].worker = {
