@@ -656,3 +656,94 @@ test('ownership scan caps its budget and reports truncation', async (t) => {
   assert.equal(result.summary.warnings, 1);
   assert.equal(result.summary.errors, 0);
 });
+
+// —— --fail-on-warning exit policy (strict gating) ——
+
+test('parseArgs recognizes --fail-on-warning without changing the default shape', () => {
+  // The default options object stays byte-identical to the pre-flag shape.
+  assert.deepEqual(parseArgs([]), { repo: undefined, state: undefined, json: false, help: false, error: undefined });
+  assert.deepEqual(parseArgs(['--fail-on-warning']), { repo: undefined, state: undefined, json: false, help: false, failOnWarning: true, error: undefined });
+  assert.deepEqual(parseArgs(['--json', '--fail-on-warning']), { repo: undefined, state: undefined, json: true, help: false, failOnWarning: true, error: undefined });
+
+  const help = runCli(['--help']);
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /--fail-on-warning/);
+  assert.match(help.stdout, /exit 2/);
+});
+
+test('--fail-on-warning: clean → 0, warning-only 1 → 2, errors stay 2', async (t) => {
+  // a) No findings + --fail-on-warning → 0.
+  const cleanRepo = makeRepo(t);
+  writeState(cleanRepo, healthyState(cleanRepo));
+  const clean = await runDoctor(['--repo', cleanRepo, '--fail-on-warning']);
+  assert.equal(clean.exitCode, 0);
+  assert.deepEqual(clean.findings, []);
+  assert.equal(clean.summary.exitCode, 0);
+
+  // b) Warning-only + default → 1; c) same fixture + --fail-on-warning → 2.
+  const warnedRepo = makeRepo(t);
+  const warnedState = healthyState(warnedRepo);
+  warnedState.repoRoot = '/somewhere/else';
+  writeState(warnedRepo, warnedState);
+  const defaultRun = await runDoctor(['--repo', warnedRepo]);
+  assert.equal(defaultRun.exitCode, 1);
+  assert.deepEqual(codes(defaultRun.findings), ['REPO_MISMATCH']);
+  assert.equal(defaultRun.findings[0].severity, 'warning');
+
+  const strictRun = await runDoctor(['--repo', warnedRepo, '--fail-on-warning']);
+  assert.equal(strictRun.exitCode, 2);
+  assert.deepEqual(codes(strictRun.findings), ['REPO_MISMATCH']);
+  assert.equal(strictRun.summary.warnings, 1);
+  assert.equal(strictRun.summary.errors, 0);
+  assert.equal(strictRun.summary.exitCode, 2);
+  // The policy only changes the exit code, never the findings themselves.
+  assert.deepEqual(strictRun.findings, defaultRun.findings);
+  // Real CLI process exit codes follow the same policy.
+  assert.equal(runCli(['--repo', warnedRepo]).status, 1);
+  assert.equal(runCli(['--repo', warnedRepo, '--fail-on-warning']).status, 2);
+
+  // d) Error + --fail-on-warning → still 2.
+  const brokenRepo = makeRepo(t);
+  commit(brokenRepo, 'README.md', '# x\n', 'initial'); // no state file at all
+  const errored = await runDoctor(['--repo', brokenRepo, '--fail-on-warning']);
+  assert.equal(errored.exitCode, 2);
+  assert.deepEqual(codes(errored.findings), ['STATE_MISSING']);
+  assert.equal(errored.findings[0].severity, 'error');
+});
+
+test('--json with --fail-on-warning is backward compatible: old fields unchanged, failOnWarning added', async (t) => {
+  const repo = makeRepo(t);
+  const state = healthyState(repo);
+  state.repoRoot = '/somewhere/else';
+  writeState(repo, state);
+
+  // Default --json payload keeps the pinned exact key sets: no new key appears.
+  const plain = await runDoctor(['--repo', repo, '--json']);
+  assert.equal(plain.exitCode, 1);
+  const plainPayload = JSON.parse(plain.output);
+  assert.equal(Object.hasOwn(plainPayload, 'failOnWarning'), false);
+  assert.deepEqual(Object.keys(plainPayload).sort(), ['baseBranch', 'baseTip', 'findings', 'repo', 'statePath', 'summary']);
+  assert.deepEqual(Object.keys(plainPayload.summary).sort(), ['checksPassed', 'errors', 'exitCode', 'warnings']);
+
+  // With the flag the boolean marks the verdict; every pre-existing field
+  // keeps its name and type, and the findings are identical.
+  const strict = await runDoctor(['--repo', repo, '--json', '--fail-on-warning']);
+  assert.equal(strict.exitCode, 2);
+  const strictPayload = JSON.parse(strict.output);
+  assert.equal(strictPayload.failOnWarning, true);
+  assert.equal(strictPayload.repo, plainPayload.repo);
+  assert.equal(strictPayload.statePath, plainPayload.statePath);
+  assert.equal(strictPayload.baseBranch, plainPayload.baseBranch);
+  assert.equal(strictPayload.baseTip, plainPayload.baseTip);
+  assert.deepEqual(strictPayload.findings, plainPayload.findings);
+  assert.equal(strictPayload.summary.checksPassed, plainPayload.summary.checksPassed);
+  assert.equal(strictPayload.summary.warnings, plainPayload.summary.warnings);
+  assert.equal(strictPayload.summary.errors, plainPayload.summary.errors);
+  assert.equal(strictPayload.summary.exitCode, 2);
+
+  // CLI wiring: status follows the policy, diagnostics stay on stdout.
+  const cli = runCli(['--repo', repo, '--json', '--fail-on-warning']);
+  assert.equal(cli.status, 2);
+  assert.equal(cli.stderr, '');
+  assert.deepEqual(JSON.parse(cli.stdout), strictPayload);
+});
