@@ -10,7 +10,7 @@
     "orchestration",
     "subagent"
   ],
-  "version": "0.2.0",
+  "version": "0.3.0",
   "icon": "./icon.svg",
   "type": "module",
   "main": "lib/index.js",

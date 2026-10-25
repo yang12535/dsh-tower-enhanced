@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-26
+
 ### Added
 
 - `edit` and `summary` Tower actions across `lib/index.js`, `lib/runtime.js`, and `lib/core.js`: pending missions can correct their title, description, scope, and dependencies with add-equivalent validation, while `summary` provides a read-only compact overview with global counts, one-line mission entries, and optional `mission_id` filtering.
