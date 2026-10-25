@@ -20,7 +20,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 | --- | --- | --- |
 | [../lib/index.js](../lib/index.js) | 插件入口。创建 `TowerRuntime`，向 `ctx.tools` 注册 `tower` 工具（`defineTool`），向 `ctx.root.sessionProjections` 注册 projection，并在插件卸载时 `dispose` | `apply(ctx, config)` |
 | [../lib/runtime.js](../lib/runtime.js) | 运行时：动作分发、子代理激活与跟踪、per-spawn 模型路由、仓库所有权、状态发布 | `TowerRuntime`：`execute`、`spawn`、`track`、`resolveRoute`、`models`、`publish`、`claimWorkspace` / `workspaceOwner` / `releaseWorkspace`、`dispose`；`REVIEW_OUTPUT_SCHEMA` |
-| [../lib/core.js](../lib/core.js) | 状态机与合并门禁：init/add/edit/spawn 记录维护、gate 评估、merge/rebase/abandon/teardown、失败恢复 | `TowerCore`：`init`、`addMission`、`editMission`、`beginSpawn`、`attachSpawn`、`completeSpawn`、`failSpawn`、`evaluateMergeGate`、`mergeGate`、`merge`、`rebase`、`abandon`、`teardown`、`recover`；`recoverRebaseFailure` / `recoverMergeFailure` |
+| [../lib/core.js](../lib/core.js) | 状态机与合并门禁：init/add/edit/spawn 记录维护、只读查询（`status` / `mission` 完整快照，`summary` 紧凑概览：全局 counts + 每 mission 一行条目）、gate 评估、merge/rebase/abandon/teardown、失败恢复 | `TowerCore`：`init`、`status`、`mission`、`summary`、`addMission`、`editMission`、`beginSpawn`、`attachSpawn`、`completeSpawn`、`failSpawn`、`evaluateMergeGate`、`mergeGate`、`merge`、`rebase`、`abandon`、`teardown`、`recover`；`recoverRebaseFailure` / `recoverMergeFailure` |
 | [../lib/store.js](../lib/store.js) | 原子持久化：`state.json` 读写、串行更新队列、schema 校验、`.git/info/exclude` 维护 | `TowerStore`：`read` / `write` / `update` / `ensureLayout`；`validateState`；`ensureLocalExclude` |
 | [../lib/git.js](../lib/git.js) | Git 操作封装：无 shell 的 `execFile` 调用、rev-parse / status / merge-base / diff 等原语 | `runGit`、`gitOut`、`repoRoot`、`head`、`currentBranch`、`status`、`assertClean`、`isAncestor`、`changedFiles`、`rebaseInProgress`、`localExcludeFile` |
 | [../lib/projection.js](../lib/projection.js) | 把控制器发布的状态变成 session projection 事件（zod 校验） | `TOWER_RECORD_TYPE`、`towerProjectionDefinition`、`towerStateSchema` |
@@ -31,7 +31,9 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 
 ### 2.1 工具注册（lib/index.js）
 
-`apply` 注入 `tools`、`subagents`、`workingDirectory`、`llm`、`sessions`、`sessionProjections` 六个服务，注册名为 `tower` 的工具。工具的 action 枚举为 `init / add / edit / spawn / recover / send / interrupt / status / gate / merge / rebase / abandon / teardown / models`。所有动作都委托给 `TowerRuntime.execute`。
+`apply` 注入 `tools`、`subagents`、`workingDirectory`、`llm`、`sessions`、`sessionProjections` 六个服务，注册名为 `tower` 的工具。工具的 action 枚举为 `init / add / edit / spawn / recover / send / interrupt / status / summary / gate / merge / rebase / abandon / teardown / models`（共 15 个，见 [../lib/index.js](../lib/index.js) 的 `enum`）。所有动作都委托给 `TowerRuntime.execute`。
+
+其中 `summary`（紧凑只读概览）已在工具 schema 中宣告、`TowerCore.summary` 也已实现（见 §2 组件表与 §2.3），但 `TowerRuntime.execute` 的 switch 尚无 `case 'summary'` 分支：当前经 `tower` 工具调用 `summary` 会落入 default 分支并抛出 `unknown Tower action summary`（[../lib/runtime.js](../lib/runtime.js)），runtime 侧的 dispatch 接线由后续变更（tower mission M17）完成。
 
 `edit` 已可用：`execute` 的 `case 'edit'` 分支把 `mission_id / title / description / scope / depends_on` 映射到 `TowerCore.editMission`，且只转发调用方实际提供的字段（未提供的字段保持原值，不会被 `undefined` 覆盖）；仅 `pending` 状态的 mission 可编辑，其余状态抛 `MISSION_NOT_EDITABLE`（依赖校验的不变量见 §4.6；测试见 [../test/core.test.js](../test/core.test.js) 与 [../test/runtime.test.js](../test/runtime.test.js)）。
 
@@ -54,6 +56,8 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 ### 2.3 核心状态机与门禁（lib/core.js）
 
 `TowerCore` 的全部变更都通过 `store.update`（读-改-写 + 校验 + 落盘）完成；状态迁移伴随 `mission.revision += 1` 与事件追加（`appendEvent`，全量保留最近 200 条，`publicState` 对外只暴露最近 20 条）。状态机细节见 §3，门禁细节见 §5。
+
+只读查询不经过 `store.update`：`status` / `mission` 返回完整快照；`summary` 返回紧凑概览——全局 `counts`（missions / workerRunning / reviewRunning / approved / merged / blocked（= `rebase_blocked + merge_blocked`）/ abandoned）加每 mission 一行条目（`summaryMission`：id、标题、状态、依赖、精简的 worker/review 路由信息与 verdict、mergeCommit，不含 description/scope/worktree/历史）。可选 `mission_id` 只收窄条目，counts 始终描述整个 tower；未知 id 抛 `MISSION_NOT_FOUND`，未 init 抛与 `status` 相同的初始化错误。`summary` 不追加事件、不递增 revision、也不改 `updatedAt`，对 §4 不变量与 §5 gate 均无影响（但其 runtime dispatch 尚未接线，见 §2.1）。
 
 ### 2.4 存储（lib/store.js）
 
