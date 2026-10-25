@@ -65,56 +65,86 @@ test('addMission rejects empty, null-byte, absolute, and parent-escaping scope p
   assert.deepEqual((await core.status()).missions, []);
 });
 
-test('addMission deduplicates scope patterns and accepts literal dots and whitespace', async (t) => {
+test('addMission deduplicates exact scope patterns without trimming literal whitespace', async (t) => {
   const repo = makeRepo(t);
   const core = await initializedCore(repo);
-
+  const scope = ['src/**', '...', 'a..b.js', ' ', ' src/**', 'src/file '];
   const deduped = await core.addMission({
-    title: 'Dedup',
-    description: 'Repeated patterns collapse.',
-    scope: ['src/**', '...', 'src/**', 'a..b.js', ' '],
+    title: 'Dedup', description: 'Repeated patterns collapse.', scope: [...scope, 'src/**'],
   });
-  // '...' and 'a..b.js' are literal names, not '..' segments, so they pass.
-  // Whitespace-only items are neither trimmed nor rejected (current behavior:
-  // such a pattern matches only a file literally called " " and therefore
-  // over-restricts rather than widening the scope).
-  assert.deepEqual(deduped.scope, ['src/**', '...', 'a..b.js', ' ']);
-
-  // `null` coalesces to the default empty scope, i.e. unrestricted.
-  const unrestricted = await core.addMission({ title: 'Null scope', description: 'Nullish default.', scope: null });
-  assert.deepEqual(unrestricted.scope, []);
+  assert.deepEqual(deduped.scope, scope);
+  const edited = await core.editMission({ missionId: deduped.id, scope: [...scope, ' src/**'] });
+  assert.deepEqual(edited.scope, scope);
 });
 
-test('addMission splits a string scope into characters where editMission rejects it', async (t) => {
+test('add and edit reject non-array scope without state or Git side effects', async (t) => {
   const repo = makeRepo(t);
   const core = await initializedCore(repo);
-
-  // Current behavior: addMission iterates scope patterns without an
-  // Array.isArray guard, so a plain string is validated character by
-  // character and silently accepted. Reported as a consistency gap;
-  // editMission rejects the very same input.
-  const split = await core.addMission({ title: 'String scope', description: 'String input.', scope: 'ab' });
-  assert.deepEqual(split.scope, ['a', 'b']);
-  await assert.rejects(() => core.editMission({ missionId: split.id, scope: 'ab' }), (error) => {
-    assert.equal(error.code, 'ARGUMENT_INVALID');
-    assert.match(error.message, /scope must be an array/);
-    return true;
-  });
-
-  // A string containing '/' is rejected only because the lone '/' character is
-  // itself an absolute path, which produces a confusing message.
-  await assert.rejects(() => core.addMission({ title: 'Path string', description: 'String path.', scope: 'src/x' }), (error) => {
-    assert.equal(error.code, 'SCOPE_INVALID');
-    assert.match(error.message, /repository-relative: \/$/);
-    return true;
-  });
-
-  // A non-iterable scope leaks a raw TypeError instead of ARGUMENT_INVALID.
-  await assert.rejects(() => core.addMission({ title: 'Not iterable', description: 'Number input.', scope: 42 }), TypeError);
-
-  // The failed updates must not wedge the store.
-  const healthy = await core.addMission({ title: 'Still healthy', description: 'Store recovers.', scope: ['lib/**'] });
+  const mission = await core.addMission({ title: 'Editable', description: 'Target.', scope: ['lib/**'] });
+  const before = await core.status();
+  const branches = git(repo, 'for-each-ref', '--format=%(refname) %(objectname)');
+  const worktrees = git(repo, 'worktree', 'list', '--porcelain');
+  for (const scope of ['ab', 'src/x', '', 42, false, {}, new Set(['lib/**']), null]) {
+    const invalid = (error) => {
+      assert.equal(error.code, 'ARGUMENT_INVALID');
+      assert.match(error.message, /scope must be an array of glob patterns/);
+      return true;
+    };
+    await assert.rejects(core.addMission({ title: 'Invalid', description: 'Bad scope.', scope }), invalid);
+    await assert.rejects(core.editMission({ missionId: mission.id, scope }), invalid);
+    assert.deepEqual(await core.status(), before);
+    assert.equal(git(repo, 'for-each-ref', '--format=%(refname) %(objectname)'), branches);
+    assert.equal(git(repo, 'worktree', 'list', '--porcelain'), worktrees);
+  }
+  const healthy = await core.addMission({ title: 'Healthy', description: 'Store recovers.', scope: ['lib/**'] });
+  assert.equal(healthy.id, 'M2');
   assert.deepEqual(healthy.scope, ['lib/**']);
+});
+
+test('null scope is not an unrestricted default; omitted and empty scope remain supported', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await assert.rejects(core.addMission({ title: 'Null', description: 'Invalid.', scope: null }), (error) => error.code === 'ARGUMENT_INVALID');
+  for (const fields of [{}, { scope: undefined }, { scope: [] }]) {
+    const mission = await core.addMission({ title: 'Unrestricted', description: 'Default or explicit.', ...fields });
+    assert.deepEqual(mission.scope, []);
+  }
+  const mission = await core.addMission({ title: 'Restricted', description: 'Keep scope.', scope: ['lib/**'] });
+  assert.deepEqual((await core.editMission({ missionId: mission.id, title: 'Renamed' })).scope, ['lib/**']);
+  assert.deepEqual((await core.editMission({ missionId: mission.id, scope: undefined })).scope, ['lib/**']);
+  assert.deepEqual((await core.editMission({ missionId: mission.id, scope: [] })).scope, []);
+});
+
+test('invalid scope elements are rejected consistently without persisting edits', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const mission = await core.addMission({ title: 'Restricted', description: 'Keep scope.', scope: ['lib/**'] });
+  const before = await core.status();
+  for (const scope of [[42], [null], [{}], [''], ['lib/**', undefined], new Array(1)]) {
+    const invalid = (error) => {
+      assert.equal(error.code, 'SCOPE_INVALID');
+      assert.match(error.message, /non-empty strings/);
+      return true;
+    };
+    await assert.rejects(core.addMission({ title: 'Invalid', description: 'Bad element.', scope }), invalid);
+    await assert.rejects(core.editMission({ missionId: mission.id, title: 'Must not persist', scope }), invalid);
+    assert.deepEqual(await core.status(), before);
+  }
+});
+
+test('scope gate preserves leading and trailing spaces instead of authorizing trimmed paths', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const gate = await scopedGate(core, { title: 'Literal spaces', scope: [' allowed/**', 'trailing ', ' '] }, (worktree) => writeAll(worktree, {
+    ' allowed/file.txt': 'in scope\n',
+    'allowed/file.txt': 'outside scope\n',
+    'trailing ': 'in scope\n',
+    trailing: 'outside scope\n',
+    ' ': 'in scope\n',
+  }));
+  assert.equal(gate.ready, false);
+  assert.deepEqual(outsideFiles(gate), ['allowed/file.txt', 'trailing']);
+  assert.deepEqual([...gate.observations.changedFiles].sort(), [' ', ' allowed/file.txt', 'allowed/file.txt', 'trailing', 'trailing ']);
 });
 
 test('scope and dependsOn validation stay independent with distinct error codes', async (t) => {

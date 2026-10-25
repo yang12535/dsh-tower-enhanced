@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-25",
+  "status": "fixes_committed_and_verified",
+  "project": "/home/yangtim/dsh-tower-enhanced",
+  "worktree": "/home/yangtim/dsh-tower-enhanced-gpt-6a",
+  "branch": "gpt-6a/review-20261025",
+  "base_sha": "21ea622cd489993432af94cc7b5be350944a5ed1",
+  "code_head": "b78fa5f87e805684ad99fe1cdd6d10302f3d5719",
+  "delivery_head_command": "git -C /home/yangtim/dsh-tower-enhanced-gpt-6a rev-parse HEAD",
+  "delivery_head_note": "This handoff adds a documentation commit after code_head; the final SHA is resolved by Git rather than embedded self-referentially.",
+  "git_identity_label": "gpt-6a <gpt-6a@local.invalid>",
+  "identity_note": "User-requested Git author and committer label, not an assertion of actual model identity.",
+  "report": "docs/review-completion-gpt-6a.md",
+  "fix_commits": [
+    {
+      "sha": "9a80acefe06d49312adfc153f0008763b82dc280",
+      "subject": "fix(core): refresh pending workers and invalidate stale reviews",
+      "areas": [
+        "pending-worktree-base-refresh",
+        "stale-review-invalidation"
+      ]
+    },
+    {
+      "sha": "c3fd1afb6cbd8d0f522100fab468047f6cc52152",
+      "subject": "fix(tower): recognize failed reviews and probe the current workspace",
+      "areas": [
+        "review-failed-doctor",
+        "restart-recovery-workspace"
+      ]
+    },
+    {
+      "sha": "d77d43ff75aa541d2d872791305f78ad73ac7eba",
+      "subject": "fix(ui): surface failed reviews and actionable failure details",
+      "areas": [
+        "failed-review-presentation",
+        "failed-launch-state",
+        "bounded-plain-text-errors"
+      ]
+    },
+    {
+      "sha": "8644cad8233968eb5d1242a23e6ea50d3b29d5d9",
+      "subject": "fix(core): reject invalid scope types without rewriting patterns",
+      "areas": [
+        "scope-type-validation",
+        "explicit-null-rejection",
+        "literal-whitespace-preservation"
+      ]
+    },
+    {
+      "sha": "b78fa5f87e805684ad99fe1cdd6d10302f3d5719",
+      "subject": "fix(store): clean failed atomic writes and verify partial-write recovery",
+      "areas": [
+        "write-and-rename-failure-cleanup",
+        "real-partial-write-recovery",
+        "update-queue-recovery"
+      ]
+    }
+  ],
+  "fix_change_summary": {
+    "files": 15,
+    "insertions": 843,
+    "deletions": 79
+  },
+  "verification": [
+    {
+      "command": "npx -y pnpm@12.15.0 test",
+      "node": "24.19.0",
+      "commit": "b78fa5f87e805684ad99fe1cdd6d10302f3d5719",
+      "tests": 167,
+      "pass": 166,
+      "fail": 0,
+      "skipped": 1,
+      "skip_reason": "A pre-existing chmod permission test cannot restrict root; the same test passes as yangtim.",
+      "log": "/root/dsh-gpt-6a-extra-final.log"
+    },
+    {
+      "command": "runuser -u yangtim -- /usr/local/bin/node --test test/*.test.js",
+      "node": "24.19.0",
+      "commit": "b78fa5f87e805684ad99fe1cdd6d10302f3d5719",
+      "tests": 167,
+      "pass": 167,
+      "fail": 0,
+      "skipped": 0,
+      "log": "/root/dsh-gpt-6a-extra-user-final.log"
+    },
+    {
+      "command": "npx -y --package=node@22.5.0 node --test test/*.test.js",
+      "node": "22.5.0",
+      "commit": "b78fa5f87e805684ad99fe1cdd6d10302f3d5719",
+      "tests": 167,
+      "pass": 166,
+      "fail": 0,
+      "skipped": 1,
+      "skip_reason": "Root-only chmod limitation; independently covered by the zero-skip yangtim run.",
+      "log": "/root/dsh-gpt-6a-extra-node225.log"
+    },
+    {
+      "command": "npx -y pnpm@12.15.0 run check",
+      "node": "24.19.0",
+      "commit": "b78fa5f87e805684ad99fe1cdd6d10302f3d5719",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "commit": "b78fa5f87e805684ad99fe1cdd6d10302f3d5719",
+      "result": "passed"
+    }
+  ],
+  "source_missions": [
+    {
+      "mission": "M24",
+      "reference_commit": "7233020fb5d7ac8960cefa236fb6f1ac71d7469c",
+      "resolution": "Issue fixed independently in 8644cad; automatic pattern trimming intentionally not adopted because it can change glob authorization semantics.",
+      "original_branch_modified": false
+    },
+    {
+      "mission": "M23",
+      "reference_commit": "6b0565a861c0ba6a86dfafe1a35ff2926502589f",
+      "resolution": "Cleanup fixed independently in b78fa5f; actual partial-write and update-queue recovery coverage added.",
+      "original_branch_modified": false
+    }
+  ],
+  "recommended_next_steps": [
+    "Independently review the five fix commits before merging into main, prioritizing store failure paths, scope authorization boundaries, and stale-review semantics.",
+    "Exercise failed reviews, failed launches, and long error details in the real DSH host UI before release.",
+    "Retain documented best-effort cleanup and no-rollback limits for prior Git operations."
+  ],
+  "limitations": [
+    "Real DSH GUI/browser acceptance has not been performed; automated UI tests alone do not establish host integration.",
+    "Installed plugin files were not replaced or restarted; these commits do not imply that the fixes are live.",
+    "Temporary-file cleanup is best effort and does not roll back prior Git operations."
+  ],
+  "not_performed": [
+    "push",
+    "publish",
+    "merge into main",
+    "rewrite existing commits",
+    "modify original Tower state",
+    "modify original M23/M24 branches or other mission worktrees",
+    "real host GUI acceptance"
+  ],
+  "final_documentation_commit": {
+    "includes": [
+      "docs/review-completion-gpt-6a.md",
+      "docs/review-completion-gpt-6a.json"
+    ],
+    "runtime_code_changed": false
+  }
+}

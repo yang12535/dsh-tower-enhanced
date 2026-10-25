@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { collectFindings, parseArgs, parseWorktreeList, runDoctor, validateStateStructure } from '../scripts/tower-doctor.mjs';
+import { TowerCore } from '../lib/core.js';
 
 const SCRIPT = fileURLToPath(new URL('../scripts/tower-doctor.mjs', import.meta.url));
 
@@ -14,6 +15,16 @@ function git(cwd, ...args) {
     encoding: 'utf8',
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' },
   }).trim();
+}
+
+/** Non-throwing Git capture with the same shape collectFindings expects. */
+async function captureGit(cwd, args) {
+  const result = spawnSync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8',
+    maxBuffer: 8 * 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' },
+  });
+  return { code: result.status ?? -1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
 
 function makeRepo(t) {
@@ -501,4 +512,44 @@ test('CLI --help, bad options, and non-repo paths', async (t) => {
   const notARepo = runCli(['--repo', outside]);
   assert.equal(notARepo.status, 2);
   assert.match(notARepo.stdout, /REPO_INVALID/);
+});
+
+test('a real review_failed mission is recognized and fully Git-checked (exit 0)', async (t) => {
+  const repo = makeRepo(t);
+  commit(repo, 'README.md', '# doctor\n', 'initial');
+  const core = new TowerCore({ cwd: repo });
+  await core.init();
+  const mission = await core.addMission({ id: 'M1', title: 'review error', description: 'The reviewer run fails.' });
+  const worker = await core.beginSpawn({ missionId: mission.id, role: 'worker' });
+  commit(worker.mission.worktree, 'work.txt', 'work\n', 'worker work');
+  await core.completeSpawn(worker.runId, { stopReason: 'completed', output: 'done' });
+  const review = await core.beginSpawn({ missionId: mission.id, role: 'reviewer' });
+  const failed = await core.completeSpawn(review.runId, { stopReason: 'error', diagnostic: '429 rate limited' });
+  assert.equal(failed.status, 'review_failed');
+
+  // Structural validation must accept the status and let Git diagnostics run.
+  const commands = [];
+  const report = await collectFindings({
+    repo,
+    execGit: async (cwd, args) => {
+      commands.push(args.join(' '));
+      return await captureGit(cwd, args);
+    },
+  });
+  assert.deepEqual(report.findings, []);
+  assert.ok(commands.some((command) => command.startsWith('worktree list')), 'worktree registration is checked');
+  assert.ok(commands.some((command) => command.startsWith('rev-parse')), 'Git revisions are checked');
+
+  const result = await runDoctor(['--repo', repo]);
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.findings, []);
+  assert.ok(result.summary.checksPassed > 0);
+  assert.equal(result.json.baseTip, git(repo, 'rev-parse', 'HEAD'));
+
+  // review_failed is non-terminal, so its worktree is still required.
+  git(repo, 'worktree', 'remove', failed.worktree);
+  const missing = await runDoctor(['--repo', repo]);
+  assert.equal(missing.exitCode, 2);
+  assert.deepEqual(codes(missing.findings), ['WORKTREE_DIR_MISSING']);
+  assert.equal(missing.findings[0].mission, 'M1');
 });

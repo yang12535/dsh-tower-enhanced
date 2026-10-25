@@ -23,7 +23,7 @@ const cardOf = (tree, id) => missionCards(tree).find((node) => node.props['data-
 const nextOf = (card) => card && findAll(card, (node) => 'data-mission-next' in (node.props ?? {}))[0];
 
 // Preserve hook state across renders to exercise real scope/filter/click transitions.
-function harness(tower = sampleTowerState()) {
+function harness(tower = sampleTowerState(), { language = 'zh' } = {}) {
   let definition, hookIndex, activeHooks;
   const hooks = new Map(), slots = new Map(), opened = [], catalog = new Map(), dictionaries = {};
   const rows = {
@@ -61,7 +61,7 @@ function harness(tower = sampleTowerState()) {
     sidebarRight: { openResource: (address, options) => opened.push({ address, options }) },
     locale: {
       register: (ns, values) => { dictionaries[ns] = values; },
-      bind: (ns) => (key, vars = {}) => (dictionaries[ns].zh[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => vars[name]),
+      bind: (ns) => (key, vars = {}) => ((dictionaries[ns][language] ?? dictionaries[ns].zh)[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => vars[name]),
     },
     sidebarRightTabs: { register: (value) => { services.tabDefinition = value; } },
     slots: { inject: (_, fn) => fn(), register: (meta, component) => slots.set(meta.name, { meta, component }) },
@@ -541,4 +541,225 @@ test('mission cards offer per-role session links only with a recorded controller
   assert.equal(failure.props.role, 'alert');
   assert.match(textOf(failure), /无法确认这个子代理的归属/);
   assert.equal(findAll(cardOf(after, 'M1'), has('data-open-error', 'worker')).length, 0);
+});
+
+const roleRowOf = (card, role) => findAll(card, has('data-mission-role', role))[0];
+const errorNodes = (tree) => findAll(tree, (node) => node.props != null && 'data-agent-error' in node.props);
+
+test('review_failed is a localized error mission with a respawn next step', () => {
+  for (const [language, statusLabel, hint] of [
+    ['zh', '审查失败', /重新派 reviewer 或 worker/],
+    ['en', 'Review failed', /respawn a reviewer or worker/],
+  ]) {
+    const tower = sampleTowerState();
+    tower.missions[0].status = 'review_failed';
+    tower.missions[0].review = {
+      ...tower.missions[0].review, completedAt: '2026-01-01T00:00:30.000Z', error: 'review transport failed',
+    };
+    const tree = missionsView(harness(tower, { language }));
+    const card = cardOf(tree, 'M1');
+    assert.ok(card, language);
+    assert.match(textOf(card), new RegExp(statusLabel));
+    const status = findAll(card, has('data-state', 'review_failed'))[0];
+    assert.equal(findAll(status, (node) => node.type === 'StateDot')[0].props.state, 'error');
+    assert.equal(nextOf(card).props['data-mission-next'], 'next.reviewFailed');
+    assert.match(textOf(nextOf(card)), hint);
+  }
+});
+
+test('stale or failed review hints outrank old verdicts but never override active stages', () => {
+  const { missionNextStep } = harness().module;
+  const mission = (over = {}) => ({ id: 'M9', title: 'task', status: 'pending', dependsOn: [], ...over });
+  const nextKey = (over) => missionNextStep(mission(over), []).key;
+  assert.equal(nextKey({ status: 'worker_completed', review: { stale: true, error: 'binding stale', verdict: 'clean', merge: true } }), 'next.reviewStale');
+  assert.equal(nextKey({ status: 'worker_completed', review: { stale: true, verdict: 'changes_requested', merge: false } }), 'next.reviewStale');
+  assert.equal(nextKey({ status: 'worker_completed', review: { error: 'no structured verdict' } }), 'next.retryReview');
+  assert.equal(nextKey({ status: 'review_failed', review: { error: 'review transport failed' } }), 'next.reviewFailed');
+  assert.equal(nextKey({ status: 'worker_completed', review: { verdict: 'clean', merge: true } }), 'next.canMerge');
+  assert.equal(nextKey({ status: 'worker_completed', review: { verdict: 'changes_requested', merge: false } }), 'next.rework');
+  const history = { stale: true, error: 'old', verdict: 'clean', merge: true };
+  for (const [status, key] of [
+    ['merged', 'next.merged'], ['abandoned', 'next.abandoned'],
+    ['worker_running', 'next.workerRunning'], ['review_running', 'next.reviewRunning'],
+  ]) {
+    assert.equal(nextKey({ status, review: history }), key);
+  }
+});
+
+test('mission failure states mark the matching role failed without failing the healthy worker', () => {
+  const tower = sampleTowerState();
+  const mission = tower.missions[0];
+  mission.status = 'review_failed';
+  mission.worker = { ...mission.worker, completedAt: '2026-01-01T00:00:20.000Z', stopReason: 'completed' };
+  mission.review = { ...mission.review, verdict: 'clean', merge: true, completedAt: '2026-01-01T00:00:30.000Z' };
+  const h = harness(tower);
+  const tree = h.render();
+  const review = findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0];
+  assert.equal(findAll(review, has('data-state', 'failed')).length, 1);
+  assert.match(textOf(review), /失败/);
+  assert.doesNotMatch(textOf(review), /审查通过/);
+  const worker = findAll(tree, has('data-tower-agent', 'M1:worker'))[0];
+  assert.equal(findAll(worker, has('data-state', 'done')).length, 1);
+  assert.doesNotMatch(textOf(worker), /失败|状态未知/);
+  assert.equal(errorNodes(tree).length, 0);
+  findAll(tree, has('data-tower-filter', 'attention'))[0].props.onClick();
+  assert.deepEqual(agents(h.render()), ['M1:reviewer']);
+  findAll(h.render(), has('data-tower-filter', 'running'))[0].props.onClick();
+  assert.deepEqual(agents(h.render()), []);
+});
+
+test('stale reviews keep priority over their old clean verdict and show the reason', () => {
+  const tower = sampleTowerState();
+  const mission = tower.missions[0];
+  mission.status = 'worker_completed';
+  mission.worker = { ...mission.worker, completedAt: '2026-01-01T00:00:20.000Z', stopReason: 'completed' };
+  mission.review = {
+    ...mission.review, completedAt: '2026-01-01T00:00:30.000Z', stale: true,
+    error: 'review binding became stale; spawn a fresh reviewer', verdict: 'clean', merge: true,
+  };
+  const h = harness(tower);
+  const tree = h.render();
+  const review = findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0];
+  assert.equal(findAll(review, has('data-state', 'stale')).length, 1);
+  assert.match(textOf(review), /结果已过期/);
+  assert.doesNotMatch(textOf(review), /审查通过/);
+  assert.match(textOf(findAll(tree, has('data-agent-error', 'reviewer'))[0]), /binding became stale/);
+  findAll(tree, has('data-tower-filter', 'attention'))[0].props.onClick();
+  assert.deepEqual(agents(h.render()), ['M1:reviewer']);
+  findAll(h.render(), has('data-tower-filter', 'running'))[0].props.onClick();
+  assert.deepEqual(agents(h.render()), []);
+  const card = cardOf(missionsView(h), 'M1');
+  assert.equal(nextOf(card).props['data-mission-next'], 'next.reviewStale');
+  assert.match(textOf(findAll(roleRowOf(card, 'reviewer'), has('data-agent-error', 'reviewer'))[0]), /binding became stale/);
+});
+
+test('records without a child session are only starting during a real launch', () => {
+  const tower = sampleTowerState();
+  const template = tower.missions[0];
+  tower.missions = [{
+    ...template, status: 'worker_running', worker: { runId: 'launch', model: 'launch-model' },
+    review: undefined, merge: undefined,
+  }];
+  const roles = () => {
+    const tree = missionsView(harness(tower));
+    const card = cardOf(tree, 'M1');
+    return { tree, card, worker: roleRowOf(card, 'worker'), reviewer: roleRowOf(card, 'reviewer') };
+  };
+  let view = roles();
+  assert.equal(view.worker.props['data-spawned'], false);
+  assert.match(textOf(view.worker), /正在创建子代理会话/);
+  assert.match(textOf(view.reviewer), /尚未派生/);
+  assert.deepEqual(agents(view.tree), []);
+  assert.equal(findAll(view.card, (node) => node.props != null && 'data-open-agent' in node.props).length, 0);
+
+  tower.missions[0].status = 'review_failed';
+  tower.missions[0].review = { runId: 'failed', model: 'review-model', error: 'spawn failed', completedAt: '2026-01-01T00:00:30.000Z' };
+  view = roles();
+  assert.doesNotMatch(textOf(view.reviewer), /正在创建子代理会话/);
+  assert.match(textOf(view.reviewer), /失败/);
+  assert.match(textOf(findAll(view.reviewer, has('data-agent-error', 'reviewer'))[0]), /spawn failed/);
+
+  tower.missions[0].status = 'review_running';
+  tower.missions[0].review = { runId: 'aborted', model: 'review-model', stopReason: 'aborted' };
+  view = roles();
+  assert.match(textOf(view.reviewer), /已中断/);
+  assert.doesNotMatch(textOf(view.reviewer), /正在创建子代理会话/);
+
+  tower.missions[0].status = 'worker_completed';
+  tower.missions[0].worker = { runId: 'done', model: 'worker-model', completedAt: '2026-01-01T00:00:20.000Z', stopReason: 'completed' };
+  tower.missions[0].review = undefined;
+  view = roles();
+  assert.match(textOf(view.worker), /执行完成/);
+  assert.doesNotMatch(textOf(view.worker), /正在创建子代理会话/);
+
+  tower.missions[0].status = 'review_failed';
+  tower.missions[0].review = { runId: 'bare', model: 'review-model' };
+  view = roles();
+  assert.match(textOf(view.reviewer), /失败/);
+  assert.doesNotMatch(textOf(view.reviewer), /正在创建子代理会话/);
+
+  tower.missions[0].review = undefined;
+  view = roles();
+  assert.match(textOf(view.reviewer), /尚未派生/);
+  assert.doesNotMatch(textOf(view.card), /正在创建子代理会话/);
+});
+
+test('agent failure reasons are bounded plain text in both views', () => {
+  const cases = [
+    { field: 'error', reason: 'a'.repeat(600), truncated: true, length: 500 },
+    { field: 'error', reason: '😀'.repeat(500), truncated: false, length: 500 },
+    { field: 'error', reason: '😀'.repeat(501), truncated: true, length: 500 },
+    { field: 'error', reason: '<script>alert(1)</script>', truncated: false, length: 25 },
+    { field: 'diagnostic', reason: 'diagnostic only', truncated: false, length: 15 },
+  ];
+  for (const { field, reason, truncated, length } of cases) {
+    const tower = sampleTowerState();
+    tower.missions[0].status = 'review_failed';
+    tower.missions[0].review = {
+      ...tower.missions[0].review, completedAt: '2026-01-01T00:00:30.000Z', [field]: reason,
+    };
+    const h = harness(tower);
+    const agentsTree = h.render();
+    const leafReason = findAll(agentsTree, has('data-agent-error', 'reviewer'))[0];
+    assert.ok(leafReason);
+    assert.equal(leafReason.props['data-error-truncated'], truncated);
+    assert.equal(leafReason.props.title, undefined);
+    assert.equal(leafReason.props['aria-label'], undefined);
+    const leafText = textOf(leafReason);
+    assert.equal(Array.from(leafText).length, length);
+    assert.equal(leafText.isWellFormed(), true);
+    if (truncated) assert.ok(leafText.endsWith('…'));
+    else assert.equal(leafText, reason);
+    assert.equal(findAll(agentsTree, (node) => node.type === 'script' || node.props?.dangerouslySetInnerHTML != null).length, 0);
+
+    const missionsTree = missionsView(h);
+    const row = roleRowOf(cardOf(missionsTree, 'M1'), 'reviewer');
+    const rowReason = findAll(row, has('data-agent-error', 'reviewer'))[0];
+    assert.ok(rowReason);
+    assert.equal(textOf(rowReason), leafText);
+    assert.equal(rowReason.props['data-error-truncated'], truncated);
+    assert.equal(rowReason.props.title, undefined);
+    assert.equal(rowReason.props['aria-label'], undefined);
+    assert.equal(findAll(missionsTree, (node) => node.type === 'script' || node.props?.dangerouslySetInnerHTML != null).length, 0);
+  }
+});
+
+test('successful agents show no error reason and stay out of attention and running', () => {
+  const tower = sampleTowerState();
+  tower.missions[0].status = 'merged';
+  tower.missions[0].worker = {
+    ...tower.missions[0].worker, completedAt: '2026-01-01T00:00:20.000Z', stopReason: 'completed',
+    summary: 'worker summary is not an error',
+  };
+  tower.missions[0].review = { ...tower.missions[0].review, completedAt: '2026-01-01T00:00:30.000Z', stopReason: 'completed' };
+  const h = harness(tower);
+  const tree = h.render();
+  assert.deepEqual(agents(tree), ['M1:worker', 'M1:reviewer']);
+  assert.equal(errorNodes(tree).length, 0);
+  findAll(tree, has('data-tower-filter', 'attention'))[0].props.onClick();
+  assert.deepEqual(agents(h.render()), []);
+  findAll(h.render(), has('data-tower-filter', 'running'))[0].props.onClick();
+  assert.deepEqual(agents(h.render()), []);
+});
+
+test('stale and retry review hints are localized', () => {
+  for (const [language, staleHint, retryHint] of [
+    ['zh', /核对同步基线后重新审查/, /请重试审查/],
+    ['en', /check the synced baseline/, /retry the review/],
+  ]) {
+    const tower = sampleTowerState();
+    tower.missions[0].status = 'worker_completed';
+    tower.missions[0].review = {
+      ...tower.missions[0].review, stale: true, error: 'binding stale', verdict: 'clean', merge: true,
+    };
+    let card = cardOf(missionsView(harness(tower, { language })), 'M1');
+    assert.equal(nextOf(card).props['data-mission-next'], 'next.reviewStale');
+    assert.match(textOf(nextOf(card)), staleHint);
+    tower.missions[0].review = {
+      ...tower.missions[0].review, stale: false, error: 'no structured verdict', verdict: undefined, merge: undefined,
+    };
+    card = cardOf(missionsView(harness(tower, { language })), 'M1');
+    assert.equal(nextOf(card).props['data-mission-next'], 'next.retryReview');
+    assert.match(textOf(nextOf(card)), retryHint);
+  }
 });

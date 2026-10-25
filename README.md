@@ -24,11 +24,15 @@ This is an independently maintained prototype, not Kimi Tower and not an officia
 
 The bundle has no build step and requires Node 22.5+ and DSH 0.2.1-rc.2.
 
+Replace the path below with the absolute path to your checkout:
+
 ```bash
-dsh plugin --profile web add file:/home/yangtim/dsh-tower-enhanced
+dsh plugin --profile web add file:/absolute/path/to/dsh-tower-enhanced
 ```
 
 Or install the local directory through **Plugins** in the DSH Web/Desktop UI. Activation may require a restart or a new session depending on the host's HMR state. The bundle includes a Web client; after installing or upgrading, refresh the existing GUI. In a conversation that has run the controller, open either the **Tower** button in the conversation header or the **Tower** entry on the right Sidebar's start page. Both views are read-only and show model routes only after the controller publishes its first state. Click an agent to load its conversation in the Sidebar; `全部展开` / `全部收起` manage the role groups. Switch to **Workspace** to inspect agents created by earlier controllers.
+
+A `file:` installation may contain a snapshot rather than a live link to the checkout. Merging source changes does not prove that the installed bundle changed. Before accepting an upgrade, finish active runs, refresh the installed package through the host's plugin workflow, and compare its `lib/core.js`, `lib/runtime.js`, and `lib/store.js` with the intended checkout. Then restart/reload the host, refresh the GUI, and exercise the changed behavior in a disposable repository. Restarting alone cannot update an outdated on-disk package.
 
 The bundle composes `subagents`, `workingDirectory`, `llm`, and `tools`; the normal DSH base already supplies them.
 
@@ -108,11 +112,11 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 
 1. Make the Session's working directory the intended repository (`working_directory` supports `cd`), check out the local base branch, and ensure the main worktree is clean.
 2. `tower({action:"init"})`.
-3. Add missions with complete descriptions and optional `depends_on`/`scope`.
-4. `spawn` a worker. It works in the mission worktree and must commit before finishing.
+3. Add missions with complete descriptions and optional `depends_on`/`scope`. `scope` must be an array of repository-relative glob strings; omit it or use `[]` for unrestricted changes. Explicit `null`, strings, and other non-array values are rejected. Patterns preserve literal whitespace, including leading/trailing spaces in file names. For `edit`, omitted scope keeps the existing restriction; `[]` clears it.
+4. `spawn` a worker. Before a pending mission first starts, its untouched, clean worktree fast-forwards to the current base so merged dependencies are available. Local changes, ignored-file collisions, or divergent commits block that refresh rather than being overwritten; preserve local files and explicitly `rebase` divergent work. The worker must commit before finishing. Restarting an existing worker does not automatically rebase its worktree.
 5. When the mission becomes `worker_completed`, `spawn` a reviewer. The reviewer returns a structured verdict; if it fails (rate limit, crash, or no structured verdict) the mission moves to `review_failed` — spawn the reviewer again, or a worker for direct rework.
 6. `status`/`gate` inspect state. An `approved` mission can be merged; `changes_requested` needs another worker round; `review_failed` is neither running nor terminal, so both a fresh reviewer and a fresh worker can start from it.
-7. If the base moved, `rebase`, then obtain a fresh review before merging.
+7. If the base moved, `rebase`, then obtain a fresh review before merging. A changed review base invalidates the verdict even when the mission tip stays unchanged; `reviewRequired` reports this too.
 8. `merge` evaluates the gate and merges the exact reviewed SHA. `teardown` later removes eligible worktrees only.
 
 `send` and `interrupt` address the currently active worker/reviewer. `models` lists a provider's catalog or resolves one exact route, including reasoning metadata when available. After a restart, persisted `worker_running`/`review_running` records intentionally block new work until the controller explicitly confirms the old runtime stopped and calls `recover`; this records stale activations as interrupted without adopting their processes.
@@ -121,12 +125,15 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 
 - Failure always reaches the controller: every settled worker/reviewer steers the controller Session a notice shaped `Tower <role> for <mission> <outcome>: mission status <status>`, and failure/interrupted/stale outcomes add a bounded `reason` (≤500 characters from the recorded error or diagnostic) plus the next action — even when state recording or projection publishing fails, the notice still goes out (at worst as a fallback naming role, mission, run, and error).
 - A failed review is explicit: a reviewer that errors out, returns no structured verdict, or never starts moves the mission to `review_failed` (recorded with `error`, `stopReason`, and `completedAt`, and a `spawn-failed` event) instead of collapsing back into `worker_completed`. Spawn a fresh reviewer from it, or a worker for direct rework; the merge gate reports `NOT_APPROVED` until a clean review approves the mission.
-- After a host restart, the runtime watches for agents recreated over a tower workspace and proactively steers the controller one stale-run warning per persisted `worker_running`/`review_running` activation (mission/role/start time), suggesting `tower action=recover` — persisted zombies never sit silently as "running".
+- The panel distinguishes failed reviews from running or approved ones and shows retry guidance. Stale review evidence takes precedence over its old verdict. Agent cards and mission role rows show errors as plain text, capped at 500 Unicode code points including the ellipsis; expanded results retain the recorded output. A failed launch without a child Session is shown in the mission view, never as a fictitious agent or a permanently starting chat.
+- After a host restart, the runtime resolves the agent's current working directory to its Git repository root, including sessions that changed directories or work inside a subdirectory. It proactively steers the controller one stale-run warning per persisted `worker_running`/`review_running` activation (mission/role/start time), suggesting `tower action=recover`. The creation-time session directory is only a fallback when the working-directory service is unavailable.
+- `node scripts/tower-doctor.mjs --repo <path>` performs read-only state and Git diagnostics. A valid `review_failed` mission is not corrupt state; its branch and worktree are still required and checked.
 - `recover` is explicit and never adopts old processes. After confirming the previous controller stopped, it marks persisted running activations interrupted (worker runs become `worker_failed`, reviewer runs `review_failed`) so fresh agents can start.
 - Retrying `add` with the same mission id reconciles only exactly matching branch/worktree artifacts with no unique commits. Conflicting artifacts require manual inspection and are never deleted automatically.
 - `gate` reports `alreadyMerged` when the exact clean-reviewed SHA is already contained in the base and still matches the mission tip. `merge` then performs accounting-only reconciliation instead of merging again.
 - `merge` distinguishes Git completion from state accounting and returns `postMerge`/`recoveryRequired` when later observation or persistence needs attention. Inspection failure is `mergeAttempted: true`, `merged: false`, `verified: false`; only exact-SHA verification or later reconciliation produces `merged: true`.
 - Retrying `teardown` reconciles a terminal mission when its recorded path is both absent on disk and absent from Git's registered worktrees. An existing unexpected path is never removed.
+- State is replaced only after writing a temporary sibling file. If writing or renaming fails, the store attempts to remove only that write's temporary file and rethrows the original error; unrelated temporary files and the existing target are not removed. Cleanup can itself fail under filesystem or permission errors, and does not roll back earlier Git operations.
 
 ## Deliberate limits
 

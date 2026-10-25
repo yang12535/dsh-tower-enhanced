@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { apply, inject, name } from '../lib/index.js';
@@ -552,6 +553,83 @@ test('agent/created stays silent without tower state and only warns on unreadabl
   await harness.runtime.onAgentCreated({ agent: agent({ header: { cwd: broken } }) });
   assert.equal(steered.length, 0);
   assert.ok(harness.lifecycle.logs.warn.some((line) => /could not read tower state/.test(line)));
+});
+
+/** Seed one stale worker run for a controller session in a real temporary tower. */
+async function staleTower(repo, id, sessionId = 'controller-session') {
+  const core = await initializedCore(repo);
+  const mission = await core.addMission({ id, title: `Stale ${id}`, description: 'Stale after restart' });
+  const run = await core.beginSpawn({ missionId: mission.id, role: 'worker', controllerSessionId: sessionId });
+  return { core, mission, run };
+}
+
+test('agent/created probes the effective working directory, not the creation-time cwd', async (t) => {
+  // The Session was created in repo A, but its durable working directory has
+  // since moved to a subdirectory of repo B. Both repositories hold stale runs
+  // for this controller, so probing the wrong root is observable.
+  const repoA = makeRepo(t);
+  await staleTower(repoA, 'A1');
+  const repoB = makeRepo(t);
+  await staleTower(repoB, 'B1');
+  const subdir = path.join(repoB, 'nested');
+  mkdirSync(subdir);
+  const harness = trackHarness();
+  const ensureCalls = [];
+  harness.runtime.ctx.workingDirectory = {
+    async ensure(agent, signal) {
+      ensureCalls.push({ sessionId: agent.session.id, signal });
+      return subdir;
+    },
+  };
+  const steered = [];
+  const agent = { session: { id: 'controller-session', header: { cwd: repoA } }, steer: (message) => steered.push(message) };
+  await harness.runtime.onAgentCreated({ agent });
+  assert.deepEqual(ensureCalls.map((call) => call.sessionId), ['controller-session']);
+  assert.equal(steered.length, 1);
+  const text = steered[0].content[0].text;
+  assert.match(text, /- B1 worker started /);
+  assert.ok(!text.includes('- A1 worker'), 'the creation-time repo must not be probed');
+  assert.match(text, /tower action=recover/);
+  // The runtime dedupes the persisted run: a repeat creation steers nothing,
+  // while still resolving the current directory exactly once per event.
+  await harness.runtime.onAgentCreated({ agent });
+  assert.equal(ensureCalls.length, 2);
+  assert.equal(steered.length, 1);
+});
+
+test('agent/created never falls back to the creation cwd when the working directory cannot be resolved', async (t) => {
+  const repoA = makeRepo(t);
+  await staleTower(repoA, 'A1');
+  const harness = trackHarness();
+  let ensureCalls = 0;
+  harness.runtime.ctx.workingDirectory = {
+    async ensure() {
+      ensureCalls += 1;
+      throw new Error('working directory disappeared');
+    },
+  };
+  const steered = [];
+  const agent = { session: { id: 'controller-session', header: { cwd: repoA } }, steer: (message) => steered.push(message) };
+  await harness.runtime.onAgentCreated({ agent });
+  assert.equal(ensureCalls, 1);
+  assert.equal(steered.length, 0, 'a failed resolution must not probe the old repository');
+  assert.ok(harness.lifecycle.logs.warn.some((line) => /could not resolve the current working directory/.test(line)));
+});
+
+test('agent/created stays quiet when the effective directory is outside Git', async (t) => {
+  const repoA = makeRepo(t);
+  await staleTower(repoA, 'A1');
+  const outside = mkdtempSync(path.join(tmpdir(), 'dsh-tower-probe-plain-'));
+  t.after(() => {
+    if (outside.startsWith(path.join(tmpdir(), 'dsh-tower-probe-plain-'))) rmSync(outside, { recursive: true, force: true });
+  });
+  const harness = trackHarness();
+  harness.runtime.ctx.workingDirectory = { async ensure() { return outside; } };
+  const steered = [];
+  const agent = { session: { id: 'controller-session', header: { cwd: repoA } }, steer: (message) => steered.push(message) };
+  await harness.runtime.onAgentCreated({ agent });
+  assert.equal(steered.length, 0);
+  assert.deepEqual(harness.lifecycle.logs.warn, [], 'a non-repository cwd is the ordinary no-tower case');
 });
 
 test('bundle registers the tower tool and owned runtime effect', () => {
