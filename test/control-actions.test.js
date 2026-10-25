@@ -246,6 +246,14 @@ test('send and interrupt report a missing mission', async (t) => {
   assert.deepEqual(harness.calls.interrupt, []);
 });
 
+// Reproduction: this test creates a worker_running mission with an active worker, then calls
+// send with role=manager through that same runtime.
+// Current behavior: core.agentAddress treats manager as reviewer, so send rejects with
+// AGENT_NOT_RUNNING ("has no attached reviewer") and does not forward the message.
+// Expected: reject before address resolution with ARGUMENT_INVALID and a role whitelist message.
+// Suggested fix: in lib/core.js agentAddress or the lib/runtime.js entry point, allow only
+// worker/reviewer and throw ARGUMENT_INVALID for every other role.
+// After the production fix (see M37), convert this todo into a passing test.
 test('send rejects an unsupported role', { todo: 'core.agentAddress currently treats every non-worker role as reviewer' }, async (t) => {
   const harness = await controlHarness(t);
   const run = await runningWorker(harness);
@@ -257,6 +265,15 @@ test('send rejects an unsupported role', { todo: 'core.agentAddress currently tr
   assert.deepEqual(harness.calls.send, []);
 });
 
+// Reproduction: this test persists a worker_running run and attached childId but deliberately
+// leaves runtime.active empty, as after a process restart, then sends through that runtime.
+// Current behavior: send still forwards to the persisted childId and returns sent/messageId/
+// childId/runId instead of detecting that this runtime owns no active activation for the run.
+// Expected: throw AGENT_NOT_RUNNING and make no subagents call.
+// Suggested fix: before calling subagents, lib/runtime.js should look up address.runId in
+// this.active and verify core, missionId, role, and childId; missing or mismatched entries must
+// throw AGENT_NOT_RUNNING.
+// After the production fix (see M37), convert this todo into a passing test.
 test('send rejects an attached run left active in state after a runtime restart', { todo: 'runtime currently forwards using persisted childId without checking runtime.active' }, async (t) => {
   const harness = await controlHarness(t);
   const run = await runningWorker(harness, { active: false });
@@ -267,6 +284,14 @@ test('send rejects an attached run left active in state after a runtime restart'
   assert.deepEqual(harness.calls.send, []);
 });
 
+// Reproduction: this test persists a worker_running run and attached childId with no matching
+// entry in runtime.active, then calls interrupt through that same runtime (the restart case).
+// Current behavior: interrupt still calls subagents.interrupt for the persisted childId with
+// kind=ancestor and returns interrupted/childId/runId, cancelling a run this runtime does not own.
+// Expected: throw AGENT_NOT_RUNNING and make no cancellation call.
+// Suggested fix: before calling subagents, lib/runtime.js should find address.runId in this.active
+// and verify core, missionId, role, and childId, throwing AGENT_NOT_RUNNING when absent or mismatched.
+// After the production fix (see M37), convert this todo into a passing test.
 test('interrupt rejects an attached run left active in state after a runtime restart', { todo: 'runtime currently cancels using persisted childId without checking runtime.active' }, async (t) => {
   const harness = await controlHarness(t);
   const run = await runningWorker(harness, { active: false });
@@ -277,6 +302,15 @@ test('interrupt rejects an attached run left active in state after a runtime res
   assert.deepEqual(harness.calls.interrupt, []);
 });
 
+// Reproduction: this test persists run A with an attached childId, registers only another-run
+// in runtime.active, and sends to run A through that runtime.
+// Current behavior: send forwards to run A's persisted childId and returns sent/messageId/
+// childId/runId even though the sole local activation belongs to a different runId.
+// Expected: reject run A with AGENT_NOT_RUNNING and make no subagents call.
+// Suggested fix: before calling subagents, lib/runtime.js should look up address.runId itself in
+// this.active and verify core, missionId, role, and childId; do not substitute another active run,
+// and throw AGENT_NOT_RUNNING on a missing or mismatched entry.
+// After the production fix (see M37), convert this todo into a passing test.
 test('send rejects a persisted run not owned by this runtime', { todo: 'runtime currently does not compare agentAddress.runId with its active entries' }, async (t) => {
   const harness = await controlHarness(t);
   const run = await runningWorker(harness, { active: false });
@@ -288,6 +322,14 @@ test('send rejects a persisted run not owned by this runtime', { todo: 'runtime 
   assert.deepEqual(harness.calls.send, []);
 });
 
+// Reproduction: this test creates a worker_running mission with a matching active activation,
+// then executes successful send and interrupt calls through the same runtime.
+// Current behavior: send returns sent/messageId/childId/runId and interrupt returns
+// interrupted/childId/runId; both results have mission === undefined and role === undefined.
+// Expected: each successful result explicitly identifies mission and role as well as runId.
+// Suggested fix: include mission and role in the success result assembled by lib/runtime.js
+// (or enrich the address returned by lib/core.js agentAddress and preserve both fields).
+// After the production fix (see M37), convert this todo into a passing test.
 test('send and interrupt results identify mission and role as well as runId', { todo: 'core.agentAddress currently returns only childId and runId' }, async (t) => {
   const harness = await controlHarness(t);
   const run = await runningWorker(harness);
