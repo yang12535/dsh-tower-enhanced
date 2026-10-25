@@ -313,3 +313,39 @@ test('mission cards consume the projection wire view end to end', () => {
   assert.equal(gate('DONE'), undefined);
   assert.equal(textOf(findAll(cardOf(tree, 'DONE'), has('data-merge-short', sha.slice(0, 7)))[0]), '1234567');
 });
+
+test('ready badge is explicitly state-scoped and the gate hint covers remaining git checks', () => {
+  for (const [language, readyText, hintText] of [
+    [
+      'zh',
+      '状态就绪',
+      '仅覆盖状态检查；base 脏、基线漂移、超出 scope、base 变更导致审查过期等 git 检查仍由 tower gate 判定',
+    ],
+    [
+      'en',
+      'Ready (state checks)',
+      'Covers state checks only; git checks for a dirty base, base drift, out-of-scope changes, and reviews made stale by base changes remain with tower gate',
+    ],
+  ]) {
+    const tree = missionsView(harness(towerOf([gateMission({ gateBlocks: [] })]), { language }));
+    const gate = findAll(cardOf(tree, 'M1'), withProp('data-gate-blocks'))[0];
+    const ready = findAll(gate, (node) => node.props?.className === 'Tw_gateReady')[0];
+    const hint = findAll(gate, has('data-gate-hint', true))[0];
+    assert.equal(textOf(ready), readyText, language);
+    assert.equal(textOf(hint), hintText, language);
+    assert.equal(gate.props['data-ready'], true, language);
+  }
+});
+
+test('qualified gate copy preserves block chip order and +N overflow', () => {
+  const codes = ['NOT_APPROVED', 'DEPENDENCIES_NOT_MERGED', 'WORKTREE_REMOVED', 'NO_CLEAN_REVIEW', 'BASE_DIRTY'];
+  const tree = missionsView(harness(towerOf([gateMission({ gateBlocks: codes })])));
+  const gate = findAll(cardOf(tree, 'M1'), withProp('data-gate-blocks'))[0];
+  const chips = findAll(gate, withProp('data-block-code'));
+  const overflow = findAll(gate, withProp('data-block-overflow'));
+  assert.deepEqual(chips.map((chip) => chip.props['data-block-code']), codes.slice(0, 3));
+  assert.equal(overflow.length, 1);
+  assert.equal(overflow[0].props['data-block-overflow'], 2);
+  assert.equal(textOf(overflow[0]), '+2');
+  assert.doesNotMatch(textOf(gate), /NO_CLEAN_REVIEW|BASE_DIRTY/);
+});
