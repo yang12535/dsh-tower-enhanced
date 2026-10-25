@@ -78,6 +78,208 @@ test('provider and model must be supplied together', async () => {
   await assert.rejects(runtime.resolveRoute(parent, 'worker', { max_tokens: 0 }, new AbortController().signal), /positive safe integer/);
 });
 
+function catalogHarness(options = {}) {
+  const calls = { listProviders: 0, listModels: [], resolveModelInfo: [], resolveCallConfig: [] };
+  const ctx = {
+    llm: {
+      listProviders() {
+        calls.listProviders += 1;
+        return (options.providers ?? []).map((info) => ({ ...info }));
+      },
+      async listModels(provider) {
+        calls.listModels.push(provider);
+        const catalog = (options.catalogs ?? {})[provider];
+        if (catalog instanceof Error) throw catalog;
+        if (catalog === undefined) {
+          const missing = new Error(`no adapter registered for provider "${provider}"`);
+          missing.code = 'NO_ADAPTER';
+          throw missing;
+        }
+        return catalog.map((model) => ({ ...model }));
+      },
+      async resolveModelInfo(provider, model) {
+        calls.resolveModelInfo.push({ provider, model });
+        const info = (options.exact ?? {})[model];
+        if (info instanceof Error) throw info;
+        return { ...info };
+      },
+      async resolveCallConfig(config) {
+        calls.resolveCallConfig.push(config);
+        return { ...config };
+      },
+    },
+  };
+  return { ctx, calls, runtime: new TowerRuntime(ctx, options.config ?? {}) };
+}
+
+function runModels(runtime, args = {}) {
+  return runtime.execute({ action: 'models', ...args }, { agent: sessionAgent('controller-session'), signal: new AbortController().signal });
+}
+
+test('models without a provider aggregates every registered catalog in stable order', async () => {
+  const { runtime, calls } = catalogHarness({
+    providers: [
+      { id: 'zai-coding-cn', name: 'ZAI Coding (CN)' },
+      { id: 'deepseek-official', name: 'DeepSeek Official' },
+      { id: 'kimi-coding', name: 'Kimi Coding' },
+    ],
+    catalogs: {
+      'zai-coding-cn': [
+        { provider: 'zai-coding-cn', id: 'glm-5.3-air', name: 'GLM 5.3 Air' },
+        { provider: 'zai-coding-cn', id: 'glm-5.3', name: 'GLM 5.3', inputModalities: ['text'] },
+      ],
+      'deepseek-official': [
+        { provider: 'deepseek-official', id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+        { provider: 'deepseek-official', id: 'deepseek-chat', name: 'DeepSeek Chat', description: 'General chat model' },
+      ],
+      'kimi-coding': [
+        { provider: 'kimi-coding', id: 'kimi-k2', name: 'Kimi K2' },
+      ],
+    },
+    config: { allowedModels: [{ provider: 'deepseek-official', model: 'deepseek-chat' }] },
+  });
+  const result = await runModels(runtime);
+  // Providers sort by route ascending; the parent's own route must not narrow the listing.
+  assert.deepEqual(result.providers.map((entry) => entry.provider), ['deepseek-official', 'kimi-coding', 'zai-coding-cn']);
+  assert.deepEqual(result.providers.map((entry) => entry.name), ['DeepSeek Official', 'Kimi Coding', 'ZAI Coding (CN)']);
+  // Models sort by id ascending and keep only the fields the adapter disclosed.
+  assert.deepEqual(result.providers[0].models, [
+    { provider: 'deepseek-official', id: 'deepseek-chat', name: 'DeepSeek Chat', description: 'General chat model' },
+    { provider: 'deepseek-official', id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+  ]);
+  assert.deepEqual(result.providers[2].models, [
+    { provider: 'zai-coding-cn', id: 'glm-5.3', name: 'GLM 5.3', inputModalities: ['text'] },
+    { provider: 'zai-coding-cn', id: 'glm-5.3-air', name: 'GLM 5.3 Air' },
+  ]);
+  assert.deepEqual(result.providers.map((entry) => entry.truncated), [false, false, false]);
+  assert.equal('provider' in result, false);
+  assert.equal('models' in result, false);
+  assert.deepEqual(result.allowedModels, [{ provider: 'deepseek-official', model: 'deepseek-chat' }]);
+  // The catalog walk must not resolve each advertised model's route.
+  assert.equal(calls.listProviders, 1);
+  assert.deepEqual(calls.resolveModelInfo, []);
+  assert.deepEqual(calls.resolveCallConfig, []);
+});
+
+test('models aggregation truncates each provider catalog at 100 entries', async () => {
+  const wide = Array.from({ length: 105 }, (_, index) => ({ provider: 'wide', id: `wide-${String(104 - index).padStart(3, '0')}`, name: `Wide ${104 - index}` }));
+  const { runtime } = catalogHarness({
+    providers: [
+      { id: 'wide', name: 'Wide Provider' },
+      { id: 'narrow', name: 'Narrow Provider' },
+    ],
+    catalogs: {
+      wide,
+      narrow: [
+        { provider: 'narrow', id: 'narrow-2', name: 'Narrow 2' },
+        { provider: 'narrow', id: 'narrow-1', name: 'Narrow 1' },
+      ],
+    },
+  });
+  const result = await runModels(runtime);
+  // The descending mock input is sorted ascending first, so truncation keeps a deterministic prefix.
+  assert.equal(result.providers[0].provider, 'narrow');
+  assert.equal(result.providers[0].truncated, false);
+  assert.deepEqual(result.providers[0].models.map((model) => model.id), ['narrow-1', 'narrow-2']);
+  assert.equal(result.providers[1].provider, 'wide');
+  assert.equal(result.providers[1].truncated, true);
+  assert.equal(result.providers[1].models.length, 100);
+  assert.equal(result.providers[1].models[0].id, 'wide-000');
+  assert.equal(result.providers[1].models[99].id, 'wide-099');
+});
+
+test('one provider catalog failure does not fail the aggregate summary', async () => {
+  const failure = new Error('gateway catalog unavailable');
+  failure.code = 'AUTH';
+  const { runtime } = catalogHarness({
+    providers: [
+      { id: 'broken', name: 'Broken' },
+      { id: 'healthy', name: 'Healthy' },
+      { id: 'untyped', name: 'Untyped' },
+    ],
+    catalogs: {
+      broken: failure,
+      healthy: [{ provider: 'healthy', id: 'good-1', name: 'Good 1' }],
+      untyped: new Error('plain failure without a code'),
+    },
+  });
+  const result = await runModels(runtime);
+  assert.deepEqual(result.providers[0], {
+    provider: 'broken',
+    name: 'Broken',
+    truncated: false,
+    models: [],
+    error: { code: 'AUTH', message: 'gateway catalog unavailable' },
+  });
+  assert.deepEqual(result.providers[1].models, [{ provider: 'healthy', id: 'good-1', name: 'Good 1' }]);
+  assert.equal(result.providers[1].error, undefined);
+  assert.deepEqual(result.providers[2].error, { code: 'MODEL_CATALOG_FAILED', message: 'plain failure without a code' });
+});
+
+test('a cancelled aggregate listing surfaces the cancellation instead of per-provider errors', async () => {
+  const { runtime } = catalogHarness({
+    providers: [
+      { id: 'a', name: 'A' },
+      { id: 'b', name: 'B' },
+    ],
+    catalogs: {
+      a: Object.assign(new Error('catalog fetch aborted mid-flight'), { code: 'AUTH' }),
+      b: [{ provider: 'b', id: 'b-1', name: 'B1' }],
+    },
+  });
+  const controller = new AbortController();
+  controller.abort(new Error('caller cancelled'));
+  await assert.rejects(
+    runtime.execute({ action: 'models' }, { agent: sessionAgent('controller-session'), signal: controller.signal }),
+    /catalog fetch aborted mid-flight/,
+  );
+});
+
+test('models with a provider keeps the single-provider catalog listing', async () => {
+  const { runtime, calls } = catalogHarness({
+    providers: [{ id: 'deepseek-official', name: 'DeepSeek Official' }],
+    catalogs: {
+      'deepseek-official': Array.from({ length: 502 }, (_, index) => ({ provider: 'deepseek-official', id: `m-${String(index).padStart(3, '0')}`, name: `M ${index}` })),
+    },
+  });
+  const result = await runModels(runtime, { provider: 'deepseek-official' });
+  assert.equal(result.provider, 'deepseek-official');
+  assert.equal(result.models.length, 500);
+  assert.deepEqual(result.models[0], { provider: 'deepseek-official', id: 'm-000', name: 'M 0' });
+  assert.equal('providers' in result, false);
+  assert.equal('allowedModels' in result, false);
+  assert.equal(calls.listProviders, 0);
+  assert.deepEqual(calls.listModels, ['deepseek-official']);
+});
+
+test('models with provider and model resolves the exact route metadata', async () => {
+  const resolved = {
+    provider: 'deepseek-official',
+    id: 'deepseek-reasoner',
+    name: 'DeepSeek Reasoner',
+    inputModalities: ['text'],
+    context: { contextWindow: 128000 },
+    defaultMaxTokens: 8192,
+    reasoning: { efforts: [{ id: 'high', name: 'High' }], defaultEffort: 'high' },
+  };
+  const { runtime, calls } = catalogHarness({
+    providers: [{ id: 'deepseek-official', name: 'DeepSeek Official' }],
+    catalogs: { 'deepseek-official': [{ provider: 'deepseek-official', id: 'deepseek-chat', name: 'DeepSeek Chat' }] },
+    exact: { 'deepseek-reasoner': resolved },
+  });
+  const result = await runModels(runtime, { provider: 'deepseek-official', model: 'deepseek-reasoner' });
+  assert.deepEqual(result, { provider: 'deepseek-official', models: [resolved] });
+  assert.deepEqual(calls.resolveModelInfo, [{ provider: 'deepseek-official', model: 'deepseek-reasoner' }]);
+  assert.equal(calls.listProviders, 0);
+  assert.deepEqual(calls.listModels, []);
+});
+
+test('models exact route failures still propagate unchanged', async () => {
+  const notFound = Object.assign(new Error('unknown model "missing"'), { code: 'MODEL_NOT_FOUND' });
+  const { runtime } = catalogHarness({ exact: { missing: notFound } });
+  await assert.rejects(runModels(runtime, { provider: 'deepseek-official', model: 'missing' }), /unknown model/);
+});
+
 function spawnHarness(attachSpawn) {
   const lifecycle = { disposeCalls: 0, failCalls: 0, activation: undefined };
   let settleResult;
