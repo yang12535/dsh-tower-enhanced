@@ -763,3 +763,431 @@ test('stale and retry review hints are localized', () => {
     assert.match(textOf(nextOf(card)), retryHint);
   }
 });
+
+// --- Agents view interaction coverage (scope, filter, collapse, selection) ---
+
+const withProp = (name) => (node) => node.props != null && name in node.props;
+const pressedMap = (container, key) => Object.fromEntries(
+  findAll(container, withProp(key)).map((node) => [node.props[key], node.props['aria-pressed']]),
+);
+const groupOf = (tree, role) => findAll(tree, has('data-tower-group', role))[0];
+const headOf = (group) => findAll(group, has('className', 'Tw_groupHead'))[0];
+const chevronOf = (group) => findAll(group, has('className', 'Tw_chevron'))[0];
+const countOf = (group) => findAll(headOf(group), (node) => node.type === 'small')[0];
+const cardArticle = (tree, childId) => findAll(tree, has('data-agent-session', childId))[0];
+const agentCardsOf = (tree, id) => findAll(tree, has('data-tower-agent', id))[0];
+const footerButtons = (tree) => findAll(findAll(tree, has('className', 'Tw_footer'))[0], (node) => node.type === 'button');
+
+// Five session-owned agents spanning done / running / failed so every filter
+// bucket and both role groups are inhabited at once.
+function filterMatrixTower() {
+  const tower = sampleTowerState();
+  const template = tower.missions[0];
+  const done = (over = {}) => ({
+    startedAt: '2026-01-01T00:00:10.000Z', completedAt: '2026-01-01T00:00:40.000Z', stopReason: 'completed', ...over,
+  });
+  tower.missions[0] = {
+    ...template,
+    worker: { ...template.worker, ...done() },
+    review: { ...template.review, ...done() },
+  };
+  const extra = (over) => ({
+    ...template, branch: `tower/${over.id.toLowerCase()}`, revision: 1, dependsOn: [],
+    worker: undefined, review: undefined, merge: undefined, ...over,
+  });
+  tower.missions.push(
+    extra({
+      id: 'RUN', title: 'Running mission', status: 'worker_running',
+      worker: { runId: 'run', provider: 'deepseek-official', model: 'run-model', childId: 'run-child', startedAt: '2026-01-01T00:00:05.000Z' },
+    }),
+    extra({
+      id: 'FAIL', title: 'Failed review mission', status: 'review_failed',
+      worker: { ...template.worker, childId: 'fail-worker-child', ...done() },
+      review: {
+        ...template.review, childId: 'fail-review-child',
+        completedAt: '2026-01-01T00:00:30.000Z', error: 'review blew up',
+      },
+    }),
+  );
+  return tower;
+}
+
+function matrixHarness() {
+  const h = harness(filterMatrixTower());
+  for (const childId of ['run-child', 'fail-worker-child', 'fail-review-child']) h.rows[childId] = { parentId: 'root' };
+  return h;
+}
+
+test('agents view opens on session scope with the all filter pressed', () => {
+  const tree = harness().render();
+  // the agents view is the default surface
+  assert.equal(findAll(tree, has('data-tower-view-button', 'agents'))[0].props['aria-pressed'], true);
+  assert.equal(findAll(tree, has('data-tower-view-button', 'missions'))[0].props['aria-pressed'], false);
+  assert.equal(missionCards(tree).length, 0);
+  assert.deepEqual(agents(tree), ['M1:worker', 'M1:reviewer']);
+  // scope defaults to session with correct pressed states and labels
+  assert.equal(findAll(tree, has('data-tower-scope', 'session')).length, 1);
+  const scopeBar = findAll(tree, has('className', 'Tw_scope'))[0];
+  assert.deepEqual(pressedMap(scopeBar, 'data-tower-scope-button'), { session: true, workspace: false });
+  assert.equal(textOf(findAll(scopeBar, has('data-tower-scope-button', 'session'))[0]), '本会话');
+  assert.equal(textOf(findAll(scopeBar, has('data-tower-scope-button', 'workspace'))[0]), '工作区');
+  // filter defaults to all
+  const filterBar = findAll(tree, has('className', 'Tw_filters'))[0];
+  assert.deepEqual(pressedMap(filterBar, 'data-tower-filter'), { all: true, running: false, attention: false });
+  assert.equal(textOf(findAll(filterBar, has('data-tower-filter', 'all'))[0]), '全部');
+  assert.equal(textOf(findAll(filterBar, has('data-tower-filter', 'running'))[0]), '运行中');
+  assert.equal(textOf(findAll(filterBar, has('data-tower-filter', 'attention'))[0]), '需处理');
+  // the session hint and summary describe the default entries
+  assert.match(textOf(findAll(tree, has('className', 'Tw_hint'))[0]), /仅显示本会话派生的子代理/);
+  assert.match(textOf(tree), /2 个子代理/);
+  assert.match(textOf(tree), /0 运行中/);
+  assert.match(textOf(tree), /1 需处理/);
+});
+
+test('switching scope swaps hints and entries and resets filter and selection', () => {
+  const h = harness();
+  h.rows['worker-child'].parentId = 'older-controller';
+  let tree = h.render();
+  // session scope shows only this controller's own reviewer
+  assert.deepEqual(agents(tree), ['M1:reviewer']);
+  assert.match(textOf(findAll(tree, has('className', 'Tw_hint'))[0]), /仅显示本会话派生的子代理/);
+  // select it, then narrow the filter until its card disappears
+  findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0].props.onClick();
+  tree = h.render();
+  assert.equal(findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0].props['aria-pressed'], true);
+  findAll(tree, has('data-tower-filter', 'running'))[0].props.onClick();
+  assert.match(textOf(h.render()), /没有符合条件的子代理/);
+  // workspace scope: the foreign controller's worker appears, hints change,
+  // and both the filter and the selection were reset by the switch
+  findAll(h.render(), has('data-tower-scope-button', 'workspace'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), ['M1:worker', 'M1:reviewer']);
+  assert.match(textOf(findAll(tree, has('className', 'Tw_hint'))[0]), /整个工作区的子代理，包含其他会话/);
+  assert.deepEqual(pressedMap(findAll(tree, has('className', 'Tw_filters'))[0], 'data-tower-filter'), { all: true, running: false, attention: false });
+  assert.equal(findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0].props['aria-pressed'], false);
+  // and back to session scope restores the narrower list and hint
+  findAll(tree, has('data-tower-scope-button', 'session'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), ['M1:reviewer']);
+  assert.match(textOf(findAll(tree, has('className', 'Tw_hint'))[0]), /仅显示本会话派生的子代理/);
+  // re-clicking the already-active session scope still resets filter and selection
+  findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0].props.onClick();
+  findAll(h.render(), has('data-tower-filter', 'running'))[0].props.onClick();
+  assert.match(textOf(h.render()), /没有符合条件的子代理/);
+  findAll(h.render(), has('data-tower-scope-button', 'session'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(pressedMap(findAll(tree, has('className', 'Tw_filters'))[0], 'data-tower-filter'), { all: true, running: false, attention: false });
+  assert.equal(findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0].props['aria-pressed'], false);
+  assert.deepEqual(agents(tree), ['M1:reviewer']);
+});
+
+test('filters round-trip across groups, counts, and card content', () => {
+  const h = matrixHarness();
+  let tree = h.render();
+  assert.deepEqual(agents(tree), ['M1:worker', 'RUN:worker', 'FAIL:worker', 'M1:reviewer', 'FAIL:reviewer']);
+  assert.deepEqual(pressedMap(findAll(tree, has('className', 'Tw_filters'))[0], 'data-tower-filter'), { all: true, running: false, attention: false });
+  assert.match(textOf(findAll(tree, has('className', 'Tw_summary'))[0]), /5 个子代理/);
+  assert.match(textOf(tree), /1 运行中/);
+  assert.match(textOf(tree), /1 需处理/);
+  assert.equal(countOf(groupOf(tree, 'worker')).props.children, 3);
+  assert.equal(countOf(groupOf(tree, 'reviewer')).props.children, 2);
+  // card content reflects each state
+  assert.match(textOf(agentCardsOf(tree, 'M1:reviewer')), /审查通过/);
+  assert.match(textOf(agentCardsOf(tree, 'RUN:worker')), /运行中/);
+  assert.match(textOf(agentCardsOf(tree, 'RUN:worker')), /run-model/);
+  assert.match(textOf(agentCardsOf(tree, 'FAIL:worker')), /执行完成/);
+  assert.match(textOf(agentCardsOf(tree, 'FAIL:reviewer')), /失败/);
+  assert.doesNotMatch(textOf(agentCardsOf(tree, 'FAIL:reviewer')), /审查通过/);
+  assert.match(textOf(findAll(tree, has('data-agent-error', 'reviewer'))[0]), /review blew up/);
+
+  // running keeps only the running worker and drops the reviewer group
+  findAll(tree, has('data-tower-filter', 'running'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), ['RUN:worker']);
+  assert.equal(findAll(tree, has('data-tower-group', 'reviewer')).length, 0);
+  assert.equal(countOf(groupOf(tree, 'worker')).props.children, 1);
+  // summary counts stay entry-based, not visibility-based
+  assert.match(textOf(findAll(tree, has('className', 'Tw_summary'))[0]), /5 个子代理/);
+
+  // attention keeps only the failed reviewer and drops the worker group
+  findAll(tree, has('data-tower-filter', 'attention'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), ['FAIL:reviewer']);
+  assert.equal(findAll(tree, has('data-tower-group', 'worker')).length, 0);
+
+  // and back to all: the full matrix returns with its group counts
+  findAll(tree, has('data-tower-filter', 'all'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), ['M1:worker', 'RUN:worker', 'FAIL:worker', 'M1:reviewer', 'FAIL:reviewer']);
+  assert.equal(countOf(groupOf(tree, 'worker')).props.children, 3);
+  assert.equal(countOf(groupOf(tree, 'reviewer')).props.children, 2);
+});
+
+test('an empty filter result explains itself and stays operable', () => {
+  const tower = sampleTowerState();
+  tower.missions[0].worker = {
+    ...tower.missions[0].worker,
+    startedAt: '2026-01-01T00:00:10.000Z', completedAt: '2026-01-01T00:00:40.000Z', stopReason: 'completed',
+  };
+  const h = harness(tower);
+  let tree = h.render();
+  // both agents ended cleanly, so running and attention are both empty
+  assert.deepEqual(agents(tree), ['M1:worker', 'M1:reviewer']);
+  findAll(tree, has('data-tower-filter', 'running'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), []);
+  assert.equal(textOf(findAll(tree, has('role', 'status'))[0]), '没有符合条件的子代理。');
+  assert.equal(findAll(tree, has('className', 'Tw_footer')).length, 0);
+  // the filter row is still rendered and clickable in the empty state
+  assert.deepEqual(pressedMap(findAll(tree, has('className', 'Tw_filters'))[0], 'data-tower-filter'), { all: false, running: true, attention: false });
+  findAll(tree, has('data-tower-filter', 'attention'))[0].props.onClick();
+  tree = h.render();
+  assert.equal(textOf(findAll(tree, has('role', 'status'))[0]), '没有符合条件的子代理。');
+  findAll(tree, has('data-tower-filter', 'all'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), ['M1:worker', 'M1:reviewer']);
+  assert.equal(findAll(tree, has('role', 'status')).length, 0);
+});
+
+test('group heads and bulk buttons drive aria-expanded, bodies, and counts', () => {
+  const h = matrixHarness();
+  let tree = h.render();
+  let worker = groupOf(tree, 'worker');
+  assert.match(textOf(headOf(worker)), /执行 · Work/);
+  assert.match(textOf(headOf(groupOf(tree, 'reviewer'))), /审查 · Review/);
+  assert.equal(headOf(worker).props['aria-expanded'], true);
+  assert.equal(chevronOf(worker).props.children, '▾');
+  assert.deepEqual(agents(worker), ['M1:worker', 'RUN:worker', 'FAIL:worker']);
+  // collapsing one group hides its cards and flips its arrow, nothing else
+  headOf(worker).props.onClick();
+  tree = h.render();
+  worker = groupOf(tree, 'worker');
+  assert.equal(headOf(worker).props['aria-expanded'], false);
+  assert.equal(chevronOf(worker).props.children, '▸');
+  assert.equal(findAll(worker, has('className', 'Tw_groupBody')).length, 0);
+  assert.deepEqual(agents(worker), []);
+  // the collapsed header still reports the group count
+  assert.equal(countOf(worker).props.children, 3);
+  const reviewer = groupOf(tree, 'reviewer');
+  assert.equal(headOf(reviewer).props['aria-expanded'], true);
+  assert.deepEqual(agents(reviewer), ['M1:reviewer', 'FAIL:reviewer']);
+  // collapse-all empties every body but keeps the footer usable
+  assert.deepEqual(footerButtons(tree).map(textOf), ['全部展开', '全部收起']);
+  footerButtons(tree)[1].props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), []);
+  assert.equal(headOf(groupOf(tree, 'worker')).props['aria-expanded'], false);
+  assert.equal(headOf(groupOf(tree, 'reviewer')).props['aria-expanded'], false);
+  assert.ok(findAll(tree, has('className', 'Tw_footer')).length > 0);
+  // expand-all restores both bodies
+  footerButtons(tree)[0].props.onClick();
+  tree = h.render();
+  assert.equal(headOf(groupOf(tree, 'worker')).props['aria-expanded'], true);
+  assert.deepEqual(agents(groupOf(tree, 'worker')), ['M1:worker', 'RUN:worker', 'FAIL:worker']);
+  assert.deepEqual(agents(groupOf(tree, 'reviewer')), ['M1:reviewer', 'FAIL:reviewer']);
+  // collapse state survives a filter round-trip and counts follow the filter
+  headOf(groupOf(tree, 'reviewer')).props.onClick();
+  findAll(tree, has('data-tower-filter', 'running'))[0].props.onClick();
+  tree = h.render();
+  assert.equal(countOf(groupOf(tree, 'worker')).props.children, 1);
+  headOf(groupOf(tree, 'worker')).props.onClick();
+  findAll(h.render(), has('data-tower-filter', 'all'))[0].props.onClick();
+  tree = h.render();
+  assert.equal(headOf(groupOf(tree, 'worker')).props['aria-expanded'], false);
+  assert.equal(headOf(groupOf(tree, 'reviewer')).props['aria-expanded'], false);
+  assert.equal(countOf(groupOf(tree, 'worker')).props.children, 3);
+});
+
+test('cards pass exact lineage to openAgent and recover from a refused open', () => {
+  const tower = sampleTowerState();
+  tower.missions[0].worker.controllerSessionId = 'recorded-controller';
+  const h = harness(tower);
+  const calls = [];
+  let allowOpen = false;
+  const pane = h.slots.get('sidebar.right.pane.tab');
+  const realInject = pane.meta.inject;
+  pane.meta.inject = () => ({
+    ...realInject(),
+    openAgent: (childId, controllerSessionId) => { calls.push([childId, controllerSessionId]); return allowOpen; },
+  });
+  let tree = h.render();
+  findAll(tree, has('data-tower-agent', 'M1:worker'))[0].props.onClick();
+  assert.deepEqual(calls, [['worker-child', 'recorded-controller']]);
+  // a refused open marks only that card and never selects it
+  tree = h.render();
+  const refused = cardArticle(tree, 'worker-child');
+  assert.equal(refused.props['data-selected'], false);
+  assert.equal(findAll(tree, has('data-tower-agent', 'M1:worker'))[0].props['aria-pressed'], false);
+  const alert = findAll(refused, has('role', 'alert'))[0];
+  assert.match(textOf(alert), /无法确认这个子代理的归属，暂时不能打开对话。/);
+  assert.equal(findAll(cardArticle(tree, 'review-child'), has('role', 'alert')).length, 0);
+  // a successful retry clears the hint and selects the card
+  allowOpen = true;
+  findAll(tree, has('data-tower-agent', 'M1:worker'))[0].props.onClick();
+  assert.deepEqual(calls, [['worker-child', 'recorded-controller'], ['worker-child', 'recorded-controller']]);
+  tree = h.render();
+  const opened = cardArticle(tree, 'worker-child');
+  assert.equal(findAll(opened, has('role', 'alert')).length, 0);
+  assert.equal(opened.props['data-selected'], true);
+  assert.equal(findAll(tree, has('data-tower-agent', 'M1:worker'))[0].props['aria-pressed'], true);
+});
+
+test('selection is exclusive and swaps the per-card open label', () => {
+  const h = harness();
+  let tree = h.render();
+  assert.equal(cardArticle(tree, 'worker-child').props['data-selected'], false);
+  assert.equal(cardArticle(tree, 'review-child').props['data-selected'], false);
+  findAll(tree, has('data-tower-agent', 'M1:worker'))[0].props.onClick();
+  tree = h.render();
+  assert.equal(cardArticle(tree, 'worker-child').props['data-selected'], true);
+  assert.equal(cardArticle(tree, 'review-child').props['data-selected'], false);
+  assert.equal(findAll(tree, has('data-tower-agent', 'M1:worker'))[0].props['aria-pressed'], true);
+  assert.equal(findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0].props['aria-pressed'], false);
+  assert.match(textOf(cardArticle(tree, 'worker-child')), /已打开 ↗/);
+  assert.match(textOf(cardArticle(tree, 'review-child')), /查看对话 ↗/);
+  assert.equal(h.opened.length, 1);
+  assert.match(h.opened[0].address, /subagentchat\/session\/worker-child\?parent=root&mode=continuable/);
+  // opening the reviewer moves the exclusive selection and both labels
+  findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0].props.onClick();
+  tree = h.render();
+  assert.equal(cardArticle(tree, 'worker-child').props['data-selected'], false);
+  assert.equal(cardArticle(tree, 'review-child').props['data-selected'], true);
+  assert.equal(findAll(tree, has('data-tower-agent', 'M1:worker'))[0].props['aria-pressed'], false);
+  assert.equal(findAll(tree, has('data-tower-agent', 'M1:reviewer'))[0].props['aria-pressed'], true);
+  assert.match(textOf(cardArticle(tree, 'worker-child')), /查看对话 ↗/);
+  assert.match(textOf(cardArticle(tree, 'review-child')), /已打开 ↗/);
+  assert.equal(h.opened.length, 2);
+  assert.match(h.opened[1].address, /review-child\?parent=root&mode=continuable/);
+});
+
+test('workspace cards attribute their controller with the best available name', () => {
+  const h = harness();
+  h.rows['worker-child'].parentId = 'older-controller';
+  h.rows['older-controller'] = { title: 'Older title', displayTitle: 'Older display' };
+  // session scope never attributes owners
+  assert.doesNotMatch(textOf(h.render()), /来自/);
+  findAll(h.render(), has('data-tower-scope-button', 'workspace'))[0].props.onClick();
+  let tree = h.render();
+  // displayTitle outranks title, and the tooltip carries the raw session id
+  let owner = findAll(cardArticle(tree, 'worker-child'), has('title', 'older-controller'))[0];
+  assert.match(textOf(owner), /来自 Older display/);
+  assert.doesNotMatch(textOf(cardArticle(tree, 'worker-child')), /Older title/);
+  // root has only a title, so that is what the attribution shows
+  owner = findAll(cardArticle(tree, 'review-child'), has('title', 'root'))[0];
+  assert.match(textOf(owner), /来自 Controller A/);
+  // an unlisted parent falls back to the raw session id
+  h.rows['review-child'].parentId = 'ghost-parent';
+  tree = h.render();
+  owner = findAll(cardArticle(tree, 'review-child'), has('title', 'ghost-parent'))[0];
+  assert.match(textOf(owner), /来自 ghost-parent/);
+});
+
+test('the newest same-repo snapshot wins and foreign repos stay out', () => {
+  // equal updatedAt keeps the session's own seed snapshot
+  {
+    const h = harness();
+    const equal = sampleTowerState();
+    equal.missions[0].title = 'Equal snapshot';
+    h.projections.equalSession = { values: { tower: equal } };
+    assert.match(textOf(h.render()), /Different models/);
+    assert.doesNotMatch(textOf(h.render()), /Equal snapshot/);
+  }
+  // a strictly newer same-repo snapshot wins and the repo badge stays put
+  {
+    const h = harness();
+    const newer = sampleTowerState();
+    newer.updatedAt = '2026-01-02T00:00:00.000Z';
+    newer.missions[0].review.model = 'newer-review-model';
+    h.projections.newerSession = { values: { tower: newer } };
+    const tree = h.render();
+    assert.match(textOf(tree), /newer-review-model/);
+    const badge = findAll(tree, has('className', 'Tw_repo'))[0];
+    assert.equal(badge.props.title, '/tmp/tower-panel');
+    assert.match(textOf(badge), /tower-panel · main/);
+  }
+  // a newer snapshot from another repo never leaks into this workspace
+  {
+    const h = harness();
+    const foreign = sampleTowerState();
+    foreign.repoRoot = '/another/workspace';
+    foreign.baseBranch = 'foreign';
+    foreign.updatedAt = '2026-01-03T00:00:00.000Z';
+    foreign.missions[0].title = 'Foreign mission';
+    h.projections.foreignSession = { values: { tower: foreign } };
+    const tree = h.render();
+    assert.doesNotMatch(textOf(tree), /Foreign mission|foreign/);
+    assert.match(textOf(findAll(tree, has('className', 'Tw_repo'))[0]), /tower-panel · main/);
+  }
+  // the parent session's fresher snapshot outranks the session's own stale one
+  {
+    const h = harness();
+    const ownOld = sampleTowerState();
+    ownOld.updatedAt = '2025-12-31T00:00:00.000Z';
+    ownOld.missions[0].title = 'Own older snapshot';
+    h.projections['review-child'] = { values: { tower: ownOld } };
+    const parentNew = sampleTowerState();
+    parentNew.updatedAt = '2026-01-05T00:00:00.000Z';
+    parentNew.missions[0].title = 'Parent newer snapshot';
+    h.projections.root = { values: { tower: parentNew } };
+    const tree = h.render('review-child', 'root');
+    assert.match(textOf(tree), /Parent newer snapshot/);
+    assert.doesNotMatch(textOf(tree), /Own older snapshot/);
+  }
+});
+
+test('sessions without any tower show unavailable and no agents controls', () => {
+  const h = harness();
+  h.projections.empty = { values: { tower: null } };
+  const tree = h.render('empty');
+  const notice = findAll(tree, has('role', 'status'))[0];
+  assert.match(textOf(notice), /还没有 Tower 状态/);
+  // no view toggle, scope switch, or filter row exists without a tower
+  assert.equal(findAll(tree, withProp('data-tower-view-button')).length, 0);
+  assert.equal(findAll(tree, withProp('data-tower-scope-button')).length, 0);
+  assert.equal(findAll(tree, withProp('data-tower-filter')).length, 0);
+  assert.equal(findAll(tree, has('className', 'Tw_scope')).length, 0);
+  assert.equal(findAll(tree, has('className', 'Tw_filters')).length, 0);
+  assert.equal(agents(tree).length, 0);
+  assert.equal(findAll(tree, has('className', 'Tw_repo')).length, 0);
+});
+
+test('view switches preserve agents state; only a scope change resets it', () => {
+  const h = matrixHarness();
+  let tree = h.render();
+  // workspace + running + selected + collapsed is the state to carry across views
+  findAll(tree, has('data-tower-scope-button', 'workspace'))[0].props.onClick();
+  tree = h.render();
+  findAll(tree, has('data-tower-filter', 'running'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), ['RUN:worker']);
+  findAll(tree, has('data-tower-agent', 'RUN:worker'))[0].props.onClick();
+  tree = h.render();
+  assert.equal(findAll(tree, has('data-tower-agent', 'RUN:worker'))[0].props['aria-pressed'], true);
+  headOf(groupOf(tree, 'worker')).props.onClick();
+  tree = h.render();
+  assert.deepEqual(agents(tree), []);
+  // a missions detour unmounts the agents controls entirely
+  findAll(tree, has('data-tower-view-button', 'missions'))[0].props.onClick();
+  tree = h.render();
+  assert.ok(findAll(tree, has('data-tower-mission-view', true)).length > 0);
+  assert.deepEqual(missionCards(tree).map((node) => node.props['data-mission-id']), ['M1', 'RUN', 'FAIL']);
+  assert.match(textOf(tree), /3 个任务/);
+  assert.equal(findAll(tree, withProp('data-tower-scope-button')).length, 0);
+  assert.equal(findAll(tree, withProp('data-tower-filter')).length, 0);
+  // returning restores scope, filter, collapse, and selection untouched
+  findAll(tree, has('data-tower-view-button', 'agents'))[0].props.onClick();
+  tree = h.render();
+  assert.equal(findAll(tree, has('data-tower-scope', 'workspace')).length, 1);
+  assert.deepEqual(pressedMap(findAll(tree, has('className', 'Tw_filters'))[0], 'data-tower-filter'), { all: false, running: true, attention: false });
+  assert.equal(headOf(groupOf(tree, 'worker')).props['aria-expanded'], false);
+  headOf(groupOf(tree, 'worker')).props.onClick();
+  tree = h.render();
+  assert.equal(findAll(tree, has('data-tower-agent', 'RUN:worker'))[0].props['aria-pressed'], true);
+  assert.match(textOf(cardArticle(tree, 'run-child')), /已打开 ↗/);
+  // the scope switch is what actually resets the agents view
+  findAll(tree, has('data-tower-scope-button', 'session'))[0].props.onClick();
+  tree = h.render();
+  assert.deepEqual(pressedMap(findAll(tree, has('className', 'Tw_filters'))[0], 'data-tower-filter'), { all: true, running: false, attention: false });
+  assert.equal(findAll(tree, has('data-tower-agent', 'RUN:worker'))[0].props['aria-pressed'], false);
+  assert.match(textOf(cardArticle(tree, 'run-child')), /查看对话 ↗/);
+});
