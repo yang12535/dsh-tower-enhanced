@@ -1,10 +1,23 @@
+// WORKER_START_BLOCKED is a defensive assertion at lib/core.js:485: after the
+// terminal/active guards at lib/core.js:479-480, every valid status is worker-
+// restartable, so the branch is unreachable without forging an invalid state.
+// The state-set invariant below guards that property. REVIEW_START_BLOCKED at
+// lib/core.js:507 is reachable and is covered directly by the matrix.
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { addAndRunWorker, approve, commitFile, initializedCore, makeRepo } from './helpers.js';
 
 const ACTIONS = ['spawnWorker', 'spawnReviewer', 'merge', 'rebase', 'teardown', 'editMission', 'addDependent'];
+
+function statusSetFromSource(source, name) {
+  const declaration = source.match(new RegExp(`const ${name} = new Set\\(\\[([\\s\\S]*?)\\]\\);`));
+  assert.ok(declaration, `must locate ${name} so a new status cannot escape the invariant`);
+  const statuses = new Set([...declaration[1].matchAll(/'([^']+)'/g)].map((match) => match[1]));
+  assert.ok(statuses.size > 0, `${name} must contain statuses`);
+  return statuses;
+}
 
 const allow = (status, note, extra = {}) => ({ kind: 'allow', status, note, ...extra });
 const reject = (code, message, note) => ({ kind: 'reject', code, message, note });
@@ -315,6 +328,39 @@ for (const row of MATRIX) {
     });
   }
 }
+
+test('state matrix invariant: every valid status has an exhaustive spawn-guard classification', async () => {
+  const [storeSource, coreSource] = await Promise.all([
+    readFile(new URL('../lib/store.js', import.meta.url), 'utf8'),
+    readFile(new URL('../lib/core.js', import.meta.url), 'utf8'),
+  ]);
+  const statuses = statusSetFromSource(storeSource, 'STATUSES');
+  const active = statusSetFromSource(coreSource, 'ACTIVE_STATUSES');
+  const terminal = statusSetFromSource(coreSource, 'TERMINAL_STATUSES');
+  const workerRestartable = statusSetFromSource(coreSource, 'WORKER_RESTARTABLE');
+  const reviewRestartable = statusSetFromSource(coreSource, 'REVIEW_RESTARTABLE');
+  const sorted = (values) => [...values].sort();
+
+  // A status omitted from all three primary sets would newly expose the
+  // defensive WORKER_START_BLOCKED branch. Unknown statuses in a guard set or
+  // missing matrix rows fail here too, without ever writing an invalid state.
+  const classified = new Set([...active, ...terminal, ...workerRestartable]);
+  assert.deepEqual(sorted(classified), sorted(statuses), 'ACTIVE, TERMINAL, and WORKER_RESTARTABLE must partition the valid status space by coverage');
+  assert.deepEqual(sorted(MATRIX.map((row) => row.status)), sorted(statuses), 'every valid status must retain its matrix row');
+
+  // Earlier beginSpawn guards must remain mutually exclusive with the worker
+  // restart set; otherwise these assertions would not prove unreachability.
+  for (const [leftName, left, rightName, right] of [
+    ['ACTIVE_STATUSES', active, 'TERMINAL_STATUSES', terminal],
+    ['ACTIVE_STATUSES', active, 'WORKER_RESTARTABLE', workerRestartable],
+    ['TERMINAL_STATUSES', terminal, 'WORKER_RESTARTABLE', workerRestartable],
+  ]) {
+    assert.deepEqual([...left].filter((status) => right.has(status)), [], `${leftName} and ${rightName} must be disjoint`);
+  }
+  for (const status of reviewRestartable) {
+    assert.ok(workerRestartable.has(status), `review-restartable ${status} must also be worker-restartable`);
+  }
+});
 
 test('state matrix guard: unmerged dependencies block worker startup without mutation', async (t) => {
   const { core } = await createFixture(t, 'pending');
