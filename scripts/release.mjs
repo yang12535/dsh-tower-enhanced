@@ -1,0 +1,562 @@
+#!/usr/bin/env node
+// Local release helper: bumps package.json and promotes the CHANGELOG
+// "[Unreleased]" section into a dated version section.
+//
+// Safety model: the default mode is a dry run that only prints the planned
+// diff and never writes a file. --apply additionally requires a clean work
+// tree (`git status --porcelain`), writes each file atomically (temporary
+// file + rename) only after every validation has passed, and rolls back the
+// first file best effort when writing the second one fails. The script never
+// commits, tags, pushes, or touches the network.
+
+import { spawnSync } from 'node:child_process';
+import { readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+export const PACKAGE_FILE = 'package.json';
+export const CHANGELOG_FILE = 'CHANGELOG.md';
+
+const UNRELEASED_HEADING = /^##\s*\[Unreleased\]\s*$/;
+
+export class ReleaseError extends Error {
+  constructor(code, message, options = undefined) {
+    super(message, options);
+    this.name = 'ReleaseError';
+    this.code = code;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Semver (subset: MAJOR.MINOR.PATCH with an optional prerelease suffix)
+// ---------------------------------------------------------------------------
+
+export function parseSemver(input) {
+  const value = typeof input === 'string' ? input.trim() : '';
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(value);
+  if (!match) {
+    throw new ReleaseError(
+      'INVALID_SEMVER',
+      `invalid semver version ${JSON.stringify(input ?? '')}: expected MAJOR.MINOR.PATCH with an optional prerelease suffix, for example 0.3.0 or 0.3.0-rc.1`,
+    );
+  }
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4] ?? null,
+    raw: value.replace(/^v/, ''),
+  };
+}
+
+function comparePrerelease(a, b) {
+  const partsA = a.split('.');
+  const partsB = b.split('.');
+  const length = Math.min(partsA.length, partsB.length);
+  for (let index = 0; index < length; index++) {
+    const x = partsA[index];
+    const y = partsB[index];
+    const xNumeric = /^[0-9]+$/.test(x);
+    const yNumeric = /^[0-9]+$/.test(y);
+    if (xNumeric && yNumeric) {
+      const difference = Number(x) - Number(y);
+      if (difference !== 0) return difference < 0 ? -1 : 1;
+    } else if (xNumeric !== yNumeric) {
+      // Numeric identifiers always have lower precedence than alphanumeric ones.
+      return xNumeric ? -1 : 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  if (partsA.length !== partsB.length) return partsA.length < partsB.length ? -1 : 1;
+  return 0;
+}
+
+export function compareSemver(a, b) {
+  const pa = typeof a === 'string' ? parseSemver(a) : a;
+  const pb = typeof b === 'string' ? parseSemver(b) : b;
+  for (const key of ['major', 'minor', 'patch']) {
+    if (pa[key] !== pb[key]) return pa[key] < pb[key] ? -1 : 1;
+  }
+  if (pa.prerelease === null && pb.prerelease === null) return 0;
+  if (pa.prerelease === null) return 1; // a release outranks any prerelease
+  if (pb.prerelease === null) return -1;
+  return comparePrerelease(pa.prerelease, pb.prerelease);
+}
+
+// ---------------------------------------------------------------------------
+// Dates
+// ---------------------------------------------------------------------------
+
+export function isValidReleaseDate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function todayLocal() {
+  const now = new Date();
+  const pad = (part) => String(part).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+// ---------------------------------------------------------------------------
+// CHANGELOG rewriting
+// ---------------------------------------------------------------------------
+
+export function promoteChangelog(content, version, date) {
+  const lines = content.split('\n');
+  const index = lines.findIndex((line) => UNRELEASED_HEADING.test(line));
+  if (index === -1) {
+    throw new ReleaseError('NO_UNRELEASED', `${CHANGELOG_FILE} has no "## [Unreleased]" section to promote`);
+  }
+  let restStart = index + 1;
+  while (restStart < lines.length && lines[restStart].trim() === '') restStart++;
+  return [
+    ...lines.slice(0, index),
+    '## [Unreleased]',
+    '',
+    `## [${version}] - ${date}`,
+    '',
+    ...lines.slice(restStart),
+  ].join('\n');
+}
+
+function changelogSkeleton(packageName, version, date) {
+  return [
+    '# Changelog',
+    '',
+    `All notable changes to ${packageName} are documented in this file.`,
+    '',
+    'The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).',
+    '',
+    '## [Unreleased]',
+    '',
+    `## [${version}] - ${date}`,
+    '',
+  ].join('\n');
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ---------------------------------------------------------------------------
+// Planning (validation only — never writes)
+// ---------------------------------------------------------------------------
+
+export function computePlan(options = {}) {
+  const repo = path.resolve(options.repo ?? process.cwd());
+  let repoStat;
+  try {
+    repoStat = statSync(repo);
+  } catch {
+    throw new ReleaseError('REPO_NOT_FOUND', `repository directory not found: ${repo}`);
+  }
+  if (!repoStat.isDirectory()) throw new ReleaseError('REPO_NOT_FOUND', `--repo is not a directory: ${repo}`);
+
+  if (!options.version) {
+    throw new ReleaseError('MISSING_VERSION', 'missing required option --version <semver>, for example --version 0.3.0 (see --help)');
+  }
+  const next = parseSemver(options.version);
+  const date = options.date ?? todayLocal();
+  if (!isValidReleaseDate(date)) {
+    throw new ReleaseError('INVALID_DATE', `invalid --date ${JSON.stringify(options.date)}: expected a real calendar date formatted YYYY-MM-DD`);
+  }
+
+  const packagePath = path.join(repo, PACKAGE_FILE);
+  let packageRaw;
+  try {
+    packageRaw = readFileSync(packagePath, 'utf8');
+  } catch {
+    throw new ReleaseError('MISSING_PACKAGE_JSON', `${PACKAGE_FILE} not found in ${repo}`);
+  }
+  let pkg;
+  try {
+    pkg = JSON.parse(packageRaw);
+  } catch (error) {
+    throw new ReleaseError('INVALID_PACKAGE_JSON', `${PACKAGE_FILE} is not valid JSON: ${error.message}`);
+  }
+  if (typeof pkg.name !== 'string' || pkg.name.trim() === '') {
+    throw new ReleaseError('INVALID_PACKAGE_JSON', `${PACKAGE_FILE} has no non-empty string "name"`);
+  }
+  let current;
+  try {
+    current = parseSemver(pkg.version);
+  } catch {
+    throw new ReleaseError('INVALID_CURRENT_VERSION', `${PACKAGE_FILE} "version" ${JSON.stringify(pkg.version)} is not valid semver`);
+  }
+  if (compareSemver(next, current) <= 0) {
+    const hint = next.raw === current.raw ? ` (${next.raw} is already the current version; nothing to release)` : '';
+    throw new ReleaseError('VERSION_NOT_GREATER', `target version ${next.raw} must be greater than the current version ${current.raw} in ${PACKAGE_FILE}${hint}`);
+  }
+
+  const files = [
+    {
+      path: PACKAGE_FILE,
+      absolute: packagePath,
+      action: 'update',
+      before: packageRaw,
+      after: `${JSON.stringify({ ...pkg, version: next.raw }, null, 2)}\n`,
+    },
+  ];
+
+  const changelogPath = path.join(repo, CHANGELOG_FILE);
+  let changelogRaw = null;
+  try {
+    changelogRaw = readFileSync(changelogPath, 'utf8');
+  } catch {
+    // handled below: a missing CHANGELOG is only tolerated with --create-changelog
+  }
+  if (changelogRaw === null) {
+    if (!options.createChangelog) {
+      throw new ReleaseError('CHANGELOG_MISSING', `${CHANGELOG_FILE} not found in ${repo}; pass --create-changelog to create a minimal skeleton instead`);
+    }
+    files.push({
+      path: CHANGELOG_FILE,
+      absolute: changelogPath,
+      action: 'create',
+      before: null,
+      after: changelogSkeleton(pkg.name, next.raw, date),
+    });
+  } else {
+    if (new RegExp(`^##\\s*\\[${escapeRegExp(next.raw)}\\]`, 'm').test(changelogRaw)) {
+      throw new ReleaseError('VERSION_ALREADY_RELEASED', `${CHANGELOG_FILE} already contains a section for ${next.raw}`);
+    }
+    files.push({
+      path: CHANGELOG_FILE,
+      absolute: changelogPath,
+      action: 'update',
+      before: changelogRaw,
+      after: promoteChangelog(changelogRaw, next.raw, date),
+    });
+  }
+
+  return {
+    repo,
+    packageName: pkg.name,
+    currentVersion: current.raw,
+    nextVersion: next.raw,
+    date,
+    files,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Atomic writes with best-effort rollback
+// ---------------------------------------------------------------------------
+
+let tempFileCounter = 0;
+
+export function atomicWrite(filePath, content) {
+  const directory = path.dirname(filePath);
+  const tempPath = path.join(directory, `.${path.basename(filePath)}.release-tmp-${process.pid}-${Date.now()}-${tempFileCounter++}`);
+  try {
+    writeFileSync(tempPath, content, 'utf8');
+    renameSync(tempPath, filePath);
+  } catch (error) {
+    try {
+      rmSync(tempPath, { force: true });
+    } catch {
+      // best-effort cleanup of the temporary file
+    }
+    throw error;
+  }
+}
+
+export function applyPlan(plan) {
+  const written = [];
+  try {
+    for (const file of plan.files) {
+      atomicWrite(file.absolute, file.after);
+      written.push(file);
+    }
+  } catch (error) {
+    const failed = plan.files[written.length];
+    const rollbackErrors = [];
+    for (const file of written.reverse()) {
+      try {
+        if (file.action === 'create') rmSync(file.absolute, { force: true });
+        else atomicWrite(file.absolute, file.before);
+      } catch (rollbackError) {
+        rollbackErrors.push(`${file.path}: ${rollbackError.message}`);
+      }
+    }
+    let rollbackNote;
+    if (written.length === 0) rollbackNote = 'no files had been written yet';
+    else if (rollbackErrors.length === 0) rollbackNote = `rolled back ${written.map((file) => file.path).join(', ')} to their previous content`;
+    else rollbackNote = `best-effort rollback failed for ${rollbackErrors.join('; ')}`;
+    throw new ReleaseError('WRITE_FAILED', `failed to write ${failed.path}: ${error.message}; ${rollbackNote}`, { cause: error });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Clean work tree check (read-only; used before --apply writes anything)
+// ---------------------------------------------------------------------------
+
+export function dirtyWorktreeEntries(repo) {
+  const result = spawnSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' });
+  if (result.error) {
+    throw new ReleaseError('GIT_UNAVAILABLE', `cannot run git to check the work tree: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const detail = String(result.stderr).trim() || `exit code ${result.status}`;
+    throw new ReleaseError('GIT_CHECK_FAILED', `git status failed in ${repo}: ${detail}`);
+  }
+  return result.stdout.split('\n').map((line) => line.trim()).filter((line) => line !== '');
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
+
+export function runRelease(options = {}) {
+  const plan = computePlan(options);
+  if (!options.apply) return { plan, applied: false };
+  const dirty = dirtyWorktreeEntries(plan.repo);
+  if (dirty.length > 0) {
+    const shown = dirty.slice(0, 10).join('\n  ');
+    const more = dirty.length > 10 ? `\n  ... and ${dirty.length - 10} more` : '';
+    throw new ReleaseError('DIRTY_WORKTREE', `refusing --apply: the work tree is not clean (git status --porcelain is not empty)\n  ${shown}${more}\ncommit or stash your changes first`);
+  }
+  applyPlan(plan);
+  return { plan, applied: true };
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+function splitLines(text) {
+  const lines = text.split('\n');
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+function diffOps(aLines, bLines) {
+  const n = aLines.length;
+  const m = bLines.length;
+  if ((n + 1) * (m + 1) > 4_000_000) {
+    // Safety valve for pathologically large files: fall back to a full replace.
+    return [
+      ...aLines.map((text) => ({ type: '-', text })),
+      ...bLines.map((text) => ({ type: '+', text })),
+    ];
+  }
+  const table = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      table[i][j] = aLines[i] === bLines[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+    }
+  }
+  const ops = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (aLines[i] === bLines[j]) {
+      ops.push({ type: ' ', text: aLines[i] });
+      i++;
+      j++;
+    } else if (table[i + 1][j] >= table[i][j + 1]) {
+      ops.push({ type: '-', text: aLines[i] });
+      i++;
+    } else {
+      ops.push({ type: '+', text: bLines[j] });
+      j++;
+    }
+  }
+  for (; i < n; i++) ops.push({ type: '-', text: aLines[i] });
+  for (; j < m; j++) ops.push({ type: '+', text: bLines[j] });
+  return ops;
+}
+
+function unifiedHunks(ops, context) {
+  const changed = [];
+  ops.forEach((op, index) => {
+    if (op.type !== ' ') changed.push(index);
+  });
+  if (changed.length === 0) return [];
+  const groups = [];
+  let group = [changed[0]];
+  for (let k = 1; k < changed.length; k++) {
+    if (changed[k] - group[group.length - 1] <= context * 2 + 1) group.push(changed[k]);
+    else {
+      groups.push(group);
+      group = [changed[k]];
+    }
+  }
+  groups.push(group);
+  return groups.map((indices) => {
+    const start = Math.max(0, indices[0] - context);
+    const end = Math.min(ops.length - 1, indices[indices.length - 1] + context);
+    const slice = ops.slice(start, end + 1);
+    let aStart = 0;
+    let bStart = 0;
+    for (let index = 0; index < start; index++) {
+      if (ops[index].type !== '+') aStart++;
+      if (ops[index].type !== '-') bStart++;
+    }
+    let aCount = 0;
+    let bCount = 0;
+    for (const op of slice) {
+      if (op.type !== '+') aCount++;
+      if (op.type !== '-') bCount++;
+    }
+    const aLine = aCount === 0 ? aStart : aStart + 1;
+    const bLine = bCount === 0 ? bStart : bStart + 1;
+    return {
+      header: `@@ -${aLine},${aCount} +${bLine},${bCount} @@`,
+      body: slice.map((op) => `${op.type}${op.text}`),
+    };
+  });
+}
+
+function renderFileDiff(file) {
+  const aLines = file.before === null ? [] : splitLines(file.before);
+  const bLines = splitLines(file.after);
+  const fromName = file.action === 'create' ? '/dev/null' : `a/${file.path}`;
+  const hunks = unifiedHunks(diffOps(aLines, bLines), 3);
+  const lines = [`diff --git ${fromName} b/${file.path}`, `--- ${fromName}`, `+++ b/${file.path}`];
+  if (hunks.length === 0) lines.push('(no textual changes)');
+  for (const hunk of hunks) lines.push(hunk.header, ...hunk.body);
+  return lines.join('\n');
+}
+
+function renderHuman(result) {
+  const { plan, applied } = result;
+  const lines = [
+    `${applied ? 'Applying' : 'Planning'} release of ${plan.packageName}: ${plan.currentVersion} -> ${plan.nextVersion} (${plan.date})`,
+    `Repository: ${plan.repo}`,
+  ];
+  for (const file of plan.files) lines.push(renderFileDiff(file));
+  if (applied) {
+    lines.push(
+      `Applied changes to ${plan.files.map((file) => file.path).join(' and ')} (atomic tmp file + rename).`,
+      'The work tree is now dirty on purpose: review the result, then commit and tag manually.',
+      'This script never runs git commit, tag, or push.',
+    );
+  } else {
+    lines.push('Dry run: no files were modified. Re-run with --apply to write these changes.');
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function jsonSummary({ plan, applied }) {
+  return {
+    ok: true,
+    dryRun: !applied,
+    repo: plan.repo,
+    packageName: plan.packageName,
+    currentVersion: plan.currentVersion,
+    nextVersion: plan.nextVersion,
+    date: plan.date,
+    files: plan.files.map((file) => ({
+      path: file.path,
+      action: file.action,
+      bytesBefore: file.before === null ? null : Buffer.byteLength(file.before, 'utf8'),
+      bytesAfter: Buffer.byteLength(file.after, 'utf8'),
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+const USAGE = `Usage: node scripts/release.mjs --version <semver> [options]
+
+Local release helper: bump the package.json version and promote the CHANGELOG
+"## [Unreleased]" section into a "## [<version>] - <date>" section while keeping
+a fresh empty Unreleased section on top. Never commits, tags, pushes, or uses
+the network.
+
+Options:
+  --version <semver>   Target version, for example 0.3.0. Must be strictly
+                       greater than the current package.json version
+                       (semver precedence; prerelease suffixes such as
+                       0.3.0-rc.1 are supported).
+  --date <YYYY-MM-DD>  Release date recorded in the CHANGELOG section
+                       (default: today, local time).
+  --apply              Write the files. Without this flag the script is a
+                       dry run that only prints the planned diff and never
+                       writes anything.
+  --repo <path>        Repository directory to operate on (default: cwd).
+  --json               Print machine-readable JSON (errors go to stderr as
+                       JSON with ok:false, code, and message).
+  --create-changelog   When CHANGELOG.md is missing, create a minimal
+                       skeleton instead of failing. An existing CHANGELOG.md
+                       without a "## [Unreleased]" section is always an error.
+  --help               Show this help.
+
+Safety:
+  - Dry run never writes any file.
+  - --apply refuses a dirty work tree (git status --porcelain must be empty).
+  - Every validation runs before the first file is written; files are written
+    atomically (temporary file + rename) and the first file is rolled back
+    best effort if writing the second one fails.
+
+Exit codes: 0 on success (including dry run), 1 on any validation or write error.`;
+
+const FLAG_NAMES = new Set(['--help', '-h', '--apply', '--json', '--create-changelog']);
+const VALUE_NAMES = new Set(['--version', '--date', '--repo']);
+
+export function parseArgs(argv) {
+  const options = { apply: false, json: false, createChangelog: false, help: false };
+  for (let index = 0; index < argv.length; index++) {
+    const argument = argv[index];
+    const equals = argument.indexOf('=');
+    const name = argument.startsWith('--') && equals !== -1 ? argument.slice(0, equals) : argument;
+    if (FLAG_NAMES.has(name)) {
+      if (name !== argument) throw new ReleaseError('INVALID_ARG', `flag ${name} does not take a value: ${argument}`);
+      if (name === '-h' || name === '--help') options.help = true;
+      else if (name === '--apply') options.apply = true;
+      else if (name === '--json') options.json = true;
+      else options.createChangelog = true;
+    } else if (VALUE_NAMES.has(name)) {
+      const value = name !== argument ? argument.slice(equals + 1) : argv[++index];
+      if (value === undefined) throw new ReleaseError('MISSING_VALUE', `${name} requires a value, for example ${name} 0.3.0`);
+      const key = name.slice(2);
+      options[key] = value;
+    } else {
+      throw new ReleaseError('UNKNOWN_ARG', `unknown argument: ${argument} (see --help)`);
+    }
+  }
+  return options;
+}
+
+export function cliMain(argv = process.argv.slice(2), io = process) {
+  let options;
+  try {
+    options = parseArgs(argv);
+  } catch (error) {
+    if (argv.includes('--json')) {
+      io.stderr.write(`${JSON.stringify({ ok: false, code: error.code ?? 'ERROR', message: error.message })}\n`);
+    } else {
+      io.stderr.write(`release: error: ${error.message}\n`);
+    }
+    return 1;
+  }
+  if (options.help) {
+    io.stdout.write(`${USAGE}\n`);
+    return 0;
+  }
+  try {
+    const result = runRelease(options);
+    if (options.json) io.stdout.write(`${JSON.stringify(jsonSummary(result))}\n`);
+    else io.stdout.write(renderHuman(result));
+    return 0;
+  } catch (error) {
+    if (options.json) {
+      io.stderr.write(`${JSON.stringify({ ok: false, code: error.code ?? 'ERROR', message: error.message })}\n`);
+    } else {
+      io.stderr.write(`release: error: ${error.message}\n`);
+    }
+    return 1;
+  }
+}
+
+const isCliEntry = process.argv[1] !== undefined && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isCliEntry) {
+  process.exitCode = cliMain();
+}
