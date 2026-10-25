@@ -302,6 +302,51 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
   - 此流程属于灾难恢复，执行前与仓库 owner 确认，全程对照第一步的 git 事实清单。
 - 何时不应重试：损坏原因未查明（例如磁盘满、并发写入）之前不要急着重建，否则新 state 可能再次损坏；注意 `lib/store.js` 的写入是临时文件 + 原子 rename 且失败即清理本次临时文件，正常单控制器使用不应产生语法损坏——若反复出现，先排查是否存在双进程控制（见 §5 禁令 2）。
 
+### 3.12 Git 元数据属主异常或关键路径不可写
+
+另一个用户（尤其 root）曾向仓库写入对象或元数据时，当前用户后续的 `git rebase`、`merge`、提交或 state 写入可能报权限错误。[scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs) 用两类 finding 区分「发现其他属主」与「关键路径已确认不可写」；它只报告，不修复。
+
+- 症状：
+  - `GIT_METADATA_FOREIGN_OWNER` 是 **warning**。若没有其它 error，doctor 退出码为 `1`；输出形如（路径、uid 与计数随环境变化）：
+
+    ```text
+    [warning] GIT_METADATA_FOREIGN_OWNER: 2 repo/git metadata entries are owned by another user (current uid 1000): e.g. /srv/repo/.git/index, /srv/repo/.git/objects/ab; suggested fix to run manually (doctor never executes it): sudo chown -R $(id -u):$(id -g) /srv/repo/.git
+    24 checks passed, 1 warning(s), 0 error(s)
+    ```
+
+  - `GIT_METADATA_NOT_WRITABLE` 是 **error**。只要存在任一 error，doctor 退出码即为 `2`（即使同时有 warning）；典型输出为：
+
+    ```text
+    [error] GIT_METADATA_NOT_WRITABLE: git object store /srv/repo/.git/objects is not writable by the current user (current uid 1000) (EACCES): git operations writing here will fail (e.g. "insufficient permission for adding an object to repository database"); suggested fixes to run manually (doctor never executes them): sudo chown -R $(id -u):$(id -g) /srv/repo/.git or chmod u+w /srv/repo/.git/objects
+    24 checks passed, 0 warning(s), 1 error(s)
+    ```
+
+    检查目标是现存的对象库、refs、index 与 Tower state 目录；不存在的路径会跳过（例如首次提交前没有 index），缺失 state 由其它检查报告。可用 `node scripts/tower-doctor.mjs --json` 读取结构化 `findings` 与 `summary.exitCode`。
+- 常见成因：另一个 agent 或人工用 root/`sudo` 在该仓库运行 git；同一 checkout 被多个系统用户共享；CI 容器以一种 uid 写入挂载目录，本地用户再以另一 uid 操作；或一次 `sudo git ...`/`sudo` 运行的 Tower 留下 root 属主的 index、对象、refs 或日志。`GIT_METADATA_FOREIGN_OWNER` 也可能是共享仓库的预期属主布局，须结合样例路径和当前 uid 判断，不能看到 warning 就递归改整个仓库。
+- 诊断（先停止该仓库的写入，再从**主仓库根目录**执行只读命令）：
+
+  ```bash
+  cd <repo>
+  id
+  git rev-parse --absolute-git-dir       # 后文 <gitdir> 以此处真实输出为准
+  find .git -user root -print            # 定位 root 属主的文件/目录；linked worktree 应查主仓库的 .git
+  ls -ld .git/objects                    # 核对对象库属主与权限
+  node scripts/tower-doctor.mjs --json
+  ```
+
+  对照 JSON finding 的 `path`/`label`（不可写目标）或 `sample`/`ownerUids`/`currentUid`（属主异常）确认影响范围。ownership finding 的 `sample` 最多 **10 条**，`count` 是本次扫描发现的异常条数；默认最多进行 **5000 次** `lstat`，达到预算后停止，`truncated:true` 表示结果并非全量，人类可读消息也会显示扫描截断。扫描只覆盖脚本选定的 repo/git/state 范围，并跳过 `node_modules` 与 Tower worktrees 目录，不能把它当作完整的仓库属主审计。非 POSIX 平台没有 `process.getuid()` 时会跳过 ownership 扫描，因此不会出现 `GIT_METADATA_FOREIGN_OWNER`；关键路径可写性检查仍照常执行。
+- 安全处理：
+  1. 先停止会写该仓库的 worker、CI 与人工 git 操作，保留现场并完成诊断；**修复前备份**。至少用 `cp -a <gitdir> <备份位置>` 保存实际 git 元数据，存在未提交工作时同时备份受影响 worktree；linked worktree 的 `<gitdir>` 可能只是主仓库下的管理目录，备份不能只覆盖它就假定对象库也已保存。
+  2. 确认 finding 中的异常属主不是共享仓库的有意配置，并核对 `<gitdir>` 确为上一步 `git rev-parse --absolute-git-dir` 的输出后，由仓库 owner 人工执行：
+
+     ```bash
+     sudo chown -R $(id -u):$(id -g) <gitdir>
+     ```
+
+     这会把该 gitdir 递归交给**当前执行用户**；若样例还包括 `.dsh-tower/` 等 gitdir 之外的路径，应逐项确认并单独修复，不能盲目扩大 `chown -R` 范围。单纯权限位过严且属主正确时，才可针对 doctor 报告的不可写目标评估 `chmod u+w <target>`，不要用宽泛的 `chmod -R 777`。
+  3. 重新运行 doctor，确认相关 finding 消失后，再恢复 git/Tower 操作。doctor 的消息会建议命令，但**绝不会执行 `chown`、`chmod`、git 写操作或 state 修改**：递归改属主需要提权、可能破坏有意的多用户/CI 权限布局，而且脚本无法推断每个路径的正确属主，因此自动修复不符合其只读契约。
+- 何时不应重试：不要靠反复 `rebase`/`merge`/`spawn` 来验证权限是否“碰巧恢复”，这可能留下半写对象或中间态。worker/reviewer 仍持有并使用 worktree 时，不要同时 `chown`、清理或 teardown；先暂停新写入，让 worker 提交并干净收尾（必要时 `interrupt` 并确认进程已停），mission 到达终态且 worktree 干净后再按 3.9 `teardown`。仍看到活跃 git 进程、处于 rebase/merge 中间态、备份未完成，或 `truncated:true` 却尚未用 `find` 补查影响范围时，都不要直接重试写操作。
+
 ## 4. Merge gate block code 速查表
 
 block 由 [lib/core.js](../lib/core.js) `TowerCore.evaluateMergeGate` 产生；`message`/`entries`/`files` 字段给出细节。按「先修 base 环境，再修 mission 工件，再修审查绑定」的顺序排查通常最快。
@@ -389,7 +434,7 @@ node scripts/tower-doctor.mjs --help              # 用法
 ```
 
 - 退出码：`0` = 全部检查通过；`1` = 有 warning；`2` = 有 error（或参数用法错误）。人类可读输出逐行列出 `[severity] code: message` 并汇总 `N checks passed, X warning(s), Y error(s)`。
-- 检查范围：state 结构（镜像 [lib/store.js](../lib/store.js) 规则）、repo 一致性、base 分支与 `baseCommit` 关系、每个 mission 的分支存在性 / worktree 注册与磁盘存在性 / 检出分支、已合并 mission 的 `mergeCommit` 是否可达自 base、teardown 一致性、悬置的 running 记录，以及 `.dsh-tower/worktrees/` 下的孤儿目录。
+- 检查范围：state 结构（镜像 [lib/store.js](../lib/store.js) 规则）、repo 一致性、base 分支与 `baseCommit` 关系、每个 mission 的分支存在性 / worktree 注册与磁盘存在性 / 检出分支、已合并 mission 的 `mergeCommit` 是否可达自 base、teardown 一致性、悬置的 running 记录、`.dsh-tower/worktrees/` 下的孤儿目录，以及 git 元数据属主（仅 POSIX）与对象库 / refs / index / Tower state 目录的可写性。属主扫描的样例上限、扫描预算与非 POSIX 行为见 3.12。
 - 常见 finding 与处置：
 
 | code（severity） | 含义 | 处置 |
@@ -404,3 +449,5 @@ node scripts/tower-doctor.mjs --help              # 用法
 | `TEARDOWN_INCOMPLETE` / `WORKTREE_STILL_REGISTERED`（error） | `worktreeRemoved:true` 但目录/注册仍在 | 复核后人工清理（3.10 惟一例外） |
 | `MERGE_RECORD_MISSING` / `MERGE_COMMIT_NOT_IN_BASE`（error） | `merged` mission 记账不完整或不在 base | 3.4 / 3.5 对账 |
 | `RUNNING_RECORD_MISSING`（error）/ `RUNNING_RECORD_FINISHED`（warning） | running 状态但记录缺失 / 记录已结束 | 后者按提示执行 `tower action=recover`（3.8） |
+| `GIT_METADATA_FOREIGN_OWNER`（warning） | 扫描发现由其它 uid 拥有的 repo/git 元数据；`sample` 最多 10 条，`truncated:true` 表示达到扫描预算 | 3.12；先停止写入、诊断与备份，再由人工确认并修复属主 |
+| `GIT_METADATA_NOT_WRITABLE`（error） | 现存的对象库 / refs / index / Tower state 目录对当前用户不可写 | 3.12；先备份并处理活跃 worker，再人工修复属主或目标权限 |
