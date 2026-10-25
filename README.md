@@ -16,9 +16,14 @@ This is an independently maintained prototype, not Kimi Tower and not an officia
 - Each real child Session appears once, grouped by its recorded role (`Work` or `Review`). A missing child Session produces no agent row or role placeholder. A review-only view has no Work group, and vice versa. Workspace tasks that have not created a child are listed separately from agents.
 - Cards show the task, role, outcome, elapsed time, and the provider/model/reasoning effort recorded at launch. They never substitute the main conversation's model selector. Clicking a card opens its native `subagentchat` transcript; **Task & result** expands the recorded output, review checks, branch, and commit information. Failed, interrupted, stale, and changes-requested outcomes remain distinct from completion. Filters select all, running, or attention-needed agents.
 - Chat links and session membership use the host's child catalog, then listed lineage, then the controller recorded at spawn. Unknown ownership is never guessed from the panel's current Session. Views use the newest available projection for the same repository; these are recorded Tower activations, not a live feed of every subsequent model change inside a child chat.
-- Review evidence binds both the current base SHA and reviewed tip SHA. Any rebase or relevant movement requires a fresh review.
+- `edit` corrects a pending mission's title, description, scope, and dependencies with the same validation as `add`. `summary` provides a read-only compact overview with global counts and one-line mission entries; an optional `mission_id` narrows only the entries.
+- Failed reviewer launches and runs produce an explicit, retryable `review_failed` state: spawn a fresh reviewer, or a worker for direct rework. Every settled worker/reviewer sends the controller an outcome notice, including a bounded reason and next action for failures, even if state recording or projection publishing fails.
+- After a host restart, persisted running activations proactively produce stale-run warnings. They block new work until the old controller is confirmed stopped and `recover` explicitly marks them interrupted; recovery never adopts old processes.
+- Before a pending mission's first worker starts, its untouched, clean worktree fast-forwards to the current base. Local changes, ignored-file collisions, or divergent commits block that refresh rather than being overwritten.
+- Review evidence binds both the current base SHA and reviewed tip SHA. Any rebase or relevant movement requires a fresh review; a base change invalidates the verdict even when the mission tip stays unchanged.
 - Merge checks dependencies, scope, clean worktrees, checked-out base, current-base ancestry, and review binding. The merge consumes the exact reviewed SHA and verifies the result.
 - Conservative teardown: only clean, registered worktrees for merged or abandoned missions; branches and state remain.
+- Repository scripts provide read-only state/Git diagnostics and guarded local release preparation; see [Diagnostics & release](#diagnostics--release).
 
 ## Install
 
@@ -110,6 +115,8 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 
 ## Tool flow
 
+Available actions: `init`, `add`, `edit`, `spawn`, `recover`, `send`, `interrupt`, `status`, `summary`, `gate`, `merge`, `rebase`, `abandon`, `teardown`, `models`.
+
 1. Make the Session's working directory the intended repository (`working_directory` supports `cd`), check out the local base branch, and ensure the main worktree is clean.
 2. `tower({action:"init"})`.
 3. Add missions with complete descriptions and optional `depends_on`/`scope`. `scope` must be an array of repository-relative glob strings; omit it or use `[]` for unrestricted changes. Explicit `null`, strings, and other non-array values are rejected. Patterns preserve literal whitespace, including leading/trailing spaces in file names. For `edit`, omitted scope keeps the existing restriction; `[]` clears it.
@@ -134,6 +141,21 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 - `merge` distinguishes Git completion from state accounting and returns `postMerge`/`recoveryRequired` when later observation or persistence needs attention. Inspection failure is `mergeAttempted: true`, `merged: false`, `verified: false`; only exact-SHA verification or later reconciliation produces `merged: true`.
 - Retrying `teardown` reconciles a terminal mission when its recorded path is both absent on disk and absent from Git's registered worktrees. An existing unexpected path is never removed.
 - State is replaced only after writing a temporary sibling file. If writing or renaming fails, the store attempts to remove only that write's temporary file and rethrows the original error; unrelated temporary files and the existing target are not removed. Cleanup can itself fail under filesystem or permission errors, and does not roll back earlier Git operations.
+
+## Diagnostics & release
+
+Run these repository-local scripts from the checkout:
+
+```bash
+node scripts/tower-doctor.mjs [--repo <path>] [--json]
+node scripts/release.mjs --version <semver> [--date <YYYY-MM-DD>]
+node scripts/release.mjs --version <semver> --apply
+```
+
+- `scripts/tower-doctor.mjs` cross-checks Tower state against repository and worktree facts without modifying state or Git. Exit codes are `0` for all checks passed, `1` for warnings, and `2` for errors or invalid usage; `--json` emits machine-readable findings and a summary.
+- `scripts/release.mjs` defaults to a non-writing dry run that prints the planned diff. `--apply` validates the version, date, and changelog before writing, requires a clean worktree, and atomically updates `package.json` and `CHANGELOG.md`. It never commits, tags, pushes, or uses the network.
+
+See the [operations runbook](docs/operations.md) for diagnostic findings, recovery procedures, and script details.
 
 ## Deliberate limits
 

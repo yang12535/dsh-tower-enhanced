@@ -16,9 +16,14 @@
 - 每个真实子会话只出现一次，按其记录的角色（`Work` 或 `Review`）分组。缺失的子会话不会产生 agent 行或角色占位符。只有 review 的视图没有 Work 分组，反之亦然。尚未创建子会话的工作区任务会与 agent 分开列出。
 - 卡片显示任务、角色、结果、耗时，以及启动时记录的 provider/model/reasoning effort，绝不替代主会话的模型选择器。点击卡片会打开其原生 `subagentchat` 会话记录；**任务与结果** 可展开记录的输出、review 检查项、分支与提交信息。失败、被中断、过期（stale）与 changes-requested 的结果和正常完成始终保持可区分。筛选器可以选择全部、运行中或需要关注的 agent。
 - 聊天链接与会话成员关系依次使用宿主的子会话目录、列出的谱系、spawn 时记录的控制器，绝不会从面板当前 Session 猜测未知归属。视图使用同一仓库最新可用的投影；这些是已记录的 Tower 激活，不是子会话内部后续每次模型变更的实时流。
-- review 证据同时绑定当前的 base SHA 与被审查的 tip SHA。任何 rebase 或相关移动都需要重新审查。
+- `edit` 可按与 `add` 相同的校验规则修正 pending 任务的标题、描述、scope 与依赖。`summary` 提供只读的紧凑概览，包含全局计数与每个任务一行的条目；可选 `mission_id` 只收窄条目，不改变全局计数。
+- reviewer 启动或运行失败会进入显式且可重试的 `review_failed` 状态：可以重新 spawn reviewer，也可以直接另派 worker 返工。每个落定的 worker/reviewer 都会向控制器发送结果通知；失败时附带截断的原因与下一步操作，即使状态记录或投影发布失败也仍会发送通知。
+- 宿主重启后，持久化的运行中激活会主动触发僵尸告警。在确认旧控制器已停止并显式调用 `recover` 将其标记为中断之前，这些记录会阻塞新工作；恢复过程绝不接管旧进程。
+- pending 任务首次启动 worker 前，会把尚未改动且干净的 worktree 快进到当前 base。本地改动、被忽略文件的覆盖冲突或分叉提交会阻止刷新，而不会被覆盖。
+- review 证据同时绑定当前的 base SHA 与被审查的 tip SHA。任何 rebase 或相关移动都需要重新审查；即使任务 tip 没变，只要 base 变化，旧 verdict 也会失效。
 - merge 会检查依赖、scope、干净的 worktree、检出的 base、当前 base 的祖先关系与 review 绑定。merge 消费被审查的精确 SHA 并验证结果。
 - 保守的 teardown：只移除已合并或已放弃任务中干净且已注册的 worktree；分支与状态会保留。
+- 仓库脚本提供只读的状态/Git 诊断与带前置检查的本地发布准备；见[诊断与发布](#诊断与发布)。
 
 ## 安装
 
@@ -139,6 +144,21 @@ config:
 - `merge` 区分 Git 完成与状态记账，当后续观察或持久化需要关注时返回 `postMerge`/`recoveryRequired`。观察失败时返回 `mergeAttempted: true`、`merged: false`、`verified: false`；只有精确 SHA 验证或后续调和才会产生 `merged: true`。
 - 重试 `teardown` 会在记录的路径既不在磁盘上、也不在 Git 已注册 worktree 中时，调和一个已终结的任务。已存在的意外路径永远不会被移除。
 - 状态先写入同目录临时文件，成功后才替换目标。写入或重命名失败时，只尝试清理本次写入的临时文件并原样抛出原错误，不删除无关临时文件或现有目标。文件系统或权限异常可能导致清理也失败；这项清理不会回滚此前已经执行的 Git 操作。
+
+## 诊断与发布
+
+在源码仓库中运行以下脚本：
+
+```bash
+node scripts/tower-doctor.mjs [--repo <路径>] [--json]
+node scripts/release.mjs --version <semver> [--date <YYYY-MM-DD>]
+node scripts/release.mjs --version <semver> --apply
+```
+
+- `scripts/tower-doctor.mjs` 对账 Tower 状态与仓库、worktree 的实际事实，不修改状态或 Git。退出码为 `0`（全部检查通过）、`1`（有 warning）或 `2`（有 error 或参数用法错误）；`--json` 输出机器可读的 findings 与汇总。
+- `scripts/release.mjs` 默认执行不写入文件的 dry-run，只打印计划 diff。`--apply` 会在写入前校验版本、日期与 changelog，要求 worktree 干净，并以原子方式更新 `package.json` 与 `CHANGELOG.md`。它绝不会 commit、tag、push，也不访问网络。
+
+诊断 finding、恢复步骤与脚本详情见[运维手册](docs/operations.md)。
 
 ## 刻意限制
 
