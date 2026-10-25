@@ -50,6 +50,20 @@ Tower 的 briefing 把多段内容按字面拼进子代理的初始提示：
 - `.dsh-tower/state.json` 以 `0o600` 权限原子写入（[../lib/store.js](../lib/store.js) 的 `write`），但它**不是机密存储**：mission 描述、briefing 引用的 instructions 片段、子代理输出与 review findings 都会沉淀在里面。不要把密钥、token 写进 mission description / instructions / scope。
 - 子代理继承宿主的路由与环境，没有独立的凭证隔离；`allowedModels` 只是路由允许清单，不是配额或密钥控制。
 
+### 2.6 0.3 新增威胁与防护矩阵
+
+下表补充运行期控制、运维脚本与 pending 首派写入面的防护。它们与 §1 的核心边界一致：**review 仍只是 instruction 级流程约束，不是安全沙箱**；下表也没有把任何脚本检查或状态校验升级为子代理能力隔离。
+
+| 威胁 / 失误 | 代码中的防护 | 不是什么安全边界 |
+| --- | --- | --- |
+| 用非法 role 寻址，或对旧 run / 其他 mission 的 run 执行 `send` / `interrupt` | [../lib/runtime.js](../lib/runtime.js) 的 `controlAddress` 只接受 `worker` / `reviewer`（非法值报 `ARGUMENT_INVALID`），并把 [../lib/core.js](../lib/core.js) `agentAddress` 返回的持久化地址与当前 runtime 的活跃 entry 逐项核对 `core`、`runId`、`missionId`、`role`、`childId`；状态不符或 run 不属于本 runtime 均报 `AGENT_NOT_RUNNING`，不会仅凭残留 state 递话或取消 | 这是活跃 run 的归属与状态校验，不是控制器调用方的身份认证，也不提供跨进程激活所有权 |
+| 多进程同时执行 `release --apply`，基于过期计划相互覆盖版本与 changelog | [../scripts/release.mjs](../scripts/release.mjs) 的 `runRelease` 在计算计划前经 `acquireReleaseLock` 以 `wx`、`0o600` 创建 `<git-dir>/release-apply.lock`；活跃锁立即报 `RELEASE_LOCKED`，不等待。holder PID 已不存在或锁龄至少 10 分钟时允许陈旧锁接管，并在删除前复核内容；`atomicWrite` 以临时文件 + rename 写入，`applyPlan` 对第二份文件写入失败做 best-effort rollback | 锁只序列化此脚本的 `--apply`，不约束其他 Git/Tower 写入方；原子替换与回滚不等于两份文件的事务，也不是仓库级并发安全边界 |
+| 另一个 uid（常见为 root）污染 `.git` / Tower 元数据，后续写入因属主或权限失败 | [../scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs) 的 `checkGitMetadata` 只读报告 `GIT_METADATA_FOREIGN_OWNER`（warning）与 `GIT_METADATA_NOT_WRITABLE`（error），消息建议人工核对后执行 `chown`，或仅针对确认的不可写目标评估 `chmod`。**doctor 绝不自动修复**，不会执行 `chown` / `chmod`、Git 写操作或 state 修改 | 诊断不是权限修复，也不是完整属主审计；扫描有范围与预算限制，非 POSIX 平台没有 `process.getuid()` 时跳过属主扫描 |
+| worker / reviewer 失败、被中断或审查过期后静默，失败审查被误当成有效结论 | [../lib/runtime.js](../lib/runtime.js) 的 `track` / `settlementNotice` 在每个激活落定后通知控制器；状态落账或 projection 发布失败不会吞掉通知，`steer` 自身失败至少记录 error 日志。失败、中断、stale 的 `reason` 经 `boundedReason` 截断到 500 字符并附 next action；[../lib/core.js](../lib/core.js) 的 `completeSpawn` / `failSpawn` / `recover` 用显式 `review_failed` 区分审查运行失败与有效 verdict | 通知是落定路径上的可靠告知机制，不是持久消息队列或内容安全过滤；`review_failed` 是状态机约束，不保证模型 verdict 正确 |
+| pending 首派时 base 已前进，worker 在旧基线上开工；自动同步又可能覆盖本地内容 | [../lib/core.js](../lib/core.js) `beginSpawn` 仅在 `pending` 第一次启动 worker 且 worktree 尚未包含当前 base 时尝试同步：先要求 worktree 干净（`WORKTREE_DIRTY`）、分支匹配（`WORKTREE_BRANCH_MISMATCH`）、tip 恰为记录的 `mission.baseCommit` 且仍是当前 base 的祖先，否则以 `STALE_BASE` 要求显式 rebase；满足后才执行 `git merge --ff-only --no-overwrite-ignore <base>`。有独有提交不会自动变基，忽略文件冲突等快进失败原样报错而不覆盖；非 pending 重派不自动同步 | 这是受限的 ff-only 基线更新，不是通用写入许可；它既不清理脏工作区，也不替代 rebase、review 或 merge gate |
+
+这些防护的共同性质是**减少误寻址、状态漂移与运维写入事故**，而不是建立新的信任边界。尤其是 release 锁、doctor 和通知都运行在宿主用户权限下；它们无法阻止拥有同权限的模型或外部进程直接修改文件。日常处置见 [operations.md](operations.md)。
+
 ## 3. 现有防护（与代码对应）
 
 ### 3.1 流程与状态防护
@@ -83,9 +97,12 @@ Tower 的 briefing 把多段内容按字面拼进子代理的初始提示：
    - 对 `clean + merge=true` 的 verdict 保持怀疑，合并前用 `gate` 观察（它独立核对 scope、绑定、干净度）并抽查关键文件；
    - 高风险 mission（改 CI、改依赖、改凭证处理）显式收紧 `scope`，并优先路由到更强的 reviewer 模型（per-spawn `provider`+`model` 已支持）；
    - worker 声称的检查结果（"tests pass"）不由 Tower 验证——必要时在 reviewer briefing 的 `instructions` 中要求复查，或由控制器在 base 上复跑。
-4. **跨进程互斥缺失**：所有权与 store 队列只在单 Host 进程内有效。建议：短期在文档与运维上禁止双进程控制器（已写入 [architecture.md](architecture.md) §6.4）；长期用状态文件锁（如 `state.json` 旁的锁文件 + PID/心跳）把互斥扩展到跨进程。
+4. **Tower 的跨进程互斥仍缺失**：所有权与 store 队列只在单 Host 进程内有效；`release --apply` 的专用锁不保护 Tower state 或 Git 操作。建议：短期在文档与运维上禁止双进程控制器（已写入 [architecture.md](architecture.md) §6.4）；长期用状态文件锁（如 `state.json` 旁的锁文件 + PID/心跳）把互斥扩展到跨进程。
 5. **`state.json` 的机密沉淀**：mission 描述与子代理输出明文留在仓库目录内（虽 `0o600` 且被 `.git/info/exclude` 排除）。建议：使用守则明确「不把密钥写进 mission 字段」；可考虑对 output/findings 字段做体积上限与脱敏钩子。
 6. **注入链接力**：reviewer findings 会被拼进下一轮 worker briefing（`previousReview`）。建议在拼接前把这些字段视为不可信数据（截断、去控制字符），并在文档中明确该信任传递路径。
+7. **release 锁可能在强杀后残留**：`runRelease` 的 `finally` 会释放正常结束或异常返回时的锁，但 `SIGKILL`、宿主崩溃等路径无法执行清理。后续 `--apply` 依赖 `acquireReleaseLock` 的陈旧锁接管：holder PID 已不存在（`ESRCH`）或锁龄至少 10 分钟才接管；PID 复用、畸形锁及接管竞态仍需谨慎，不能看到锁文件就盲目删除。锁也只覆盖本脚本，崩溃发生在两次原子写之间时仍可能需要人工核对。
+8. **doctor 检测不等于修复或完整审计**：finding 中的 `chown` / `chmod` 只是人工建议，脚本绝不执行；属主扫描最多 5000 次 `lstat`、样例最多 10 条，达到预算会标 `truncated`，并跳过 `node_modules` 与 Tower worktrees。不可读目录、非 POSIX 属主扫描缺省及共享仓库的有意属主布局都需要人工判断；修复前应按 [operations.md](operations.md) §3.12 停止写入、核对真实 gitdir 并备份。
+9. **通知可能泄露诊断片段，且不是无限可靠的消息总线**：失败通知的 `reason` 来自记录的 `error` / `diagnostic` 或落账异常，可能包含模型、provider 或工具输出片段；500 字符截断只控制体积，**不做脱敏**。`track` 保证落定后尝试通知并隔离 state/projection 失败，但 `steer` 失败只能记 error 日志，进程被强杀、宿主未运行或底层投递不可用时也没有持久重试队列。不要把秘密写入 mission / 模型上下文，也不要把通知当作唯一审计记录。
 
 ## 5. 结论
 
