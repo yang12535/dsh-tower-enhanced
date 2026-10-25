@@ -26,6 +26,8 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 | [../lib/projection.js](../lib/projection.js) | 把控制器发布的状态变成 session projection 事件（zod 校验） | `TOWER_RECORD_TYPE`、`towerProjectionDefinition`、`towerStateSchema` |
 | [../lib/client.js](../lib/client.js) | Web UI：会话头 popover + 右侧 Sidebar Tower 标签页，missions / agents 两个视图 | `apply`（client）、`missionNextStep`、`missionDependencyState`（后两者供测试） |
 | [../lib/errors.js](../lib/errors.js) | 统一错误类型 | `TowerError`、`assertTower`、`errorMessage`、`errorDetails` |
+| [../scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs) | 独立只读诊断 CLI：state 结构、Git/Worktree 事实与元数据健康对账（§8.1） | `collectFindings`、`runDoctor`、`validateStateStructure` |
+| [../scripts/release.mjs](../scripts/release.mjs) | 独立本地发布 CLI：plan/apply 分离、双层跨进程锁、原子写与回滚（§8.2） | `computePlan`、`runRelease`、`applyPlan`、`atomicWrite` |
 
 依赖方向：`index.js` → `runtime.js` → `core.js` → (`store.js`, `git.js`, `errors.js`)；`projection.js` 被 `index.js` 注册、被 `runtime.js` 写入、被 `client.js` 消费；`client.js` 仅读取 projection，不直接触碰 Git 或状态文件。
 
@@ -33,7 +35,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 
 `apply` 注入 `tools`、`subagents`、`workingDirectory`、`llm`、`sessions`、`sessionProjections` 六个服务，注册名为 `tower` 的工具。工具的 action 枚举为 `init / add / edit / spawn / recover / send / interrupt / status / summary / gate / merge / rebase / abandon / teardown / models`（共 15 个，见 [../lib/index.js](../lib/index.js) 的 `enum`）。所有动作都委托给 `TowerRuntime.execute`。
 
-其中 `summary`（紧凑只读概览）已在工具 schema 中宣告、`TowerCore.summary` 也已实现（见 §2 组件表与 §2.3），但 `TowerRuntime.execute` 的 switch 尚无 `case 'summary'` 分支：当前经 `tower` 工具调用 `summary` 会落入 default 分支并抛出 `unknown Tower action summary`（[../lib/runtime.js](../lib/runtime.js)），runtime 侧的 dispatch 接线由后续变更（tower mission M17）完成。
+`summary` 已由 `TowerRuntime.execute` 的 `case 'summary'` 接入，返回 `{ summary: await core.summary(...) }`；它与 `status` / `gate` 一样属于只读动作，完整返回契约见 §2.7。
 
 `edit` 已可用：`execute` 的 `case 'edit'` 分支把 `mission_id / title / description / scope / depends_on` 映射到 `TowerCore.editMission`，且只转发调用方实际提供的字段（未提供的字段保持原值，不会被 `undefined` 覆盖）；仅 `pending` 状态的 mission 可编辑，其余状态抛 `MISSION_NOT_EDITABLE`（依赖校验的不变量见 §4.6；测试见 [../test/core.test.js](../test/core.test.js) 与 [../test/runtime.test.js](../test/runtime.test.js)）。
 
@@ -47,7 +49,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 
 主要流程：
 
-- **`execute(args, exec)`**：校验调用方 Session（`assertCallingAgent`）→ `models` 动作直接走 LLM 目录（不触碰仓库状态）→ 其余动作先 `resolveRoot`（经 `workingDirectory.ensure` + `git rev-parse --show-toplevel`），再 `claimWorkspace`，然后 `coreAt` 打开（或 init）core 并分发动作，最后 `releaseWorkspace`。除 `status / gate / send / interrupt` 外的动作成功后（以及任何动作抛错的 catch 路径上）调用 `publish` 发布 projection。
+- **`execute(args, exec)`**：校验调用方 Session（`assertCallingAgent`）→ `models` 动作直接走 LLM 目录（不触碰仓库状态）→ 其余动作先 `resolveRoot`（经 `workingDirectory.ensure` + `git rev-parse --show-toplevel`），再 `claimWorkspace`，然后 `coreAt` 打开（或 init）core 并分发动作，最后 `releaseWorkspace`。除 `status / summary / gate / send / interrupt` 外的动作成功后（以及任何动作抛错的 catch 路径上）调用 `publish` 发布 projection。
 - **`spawn(core, agent, args, signal)`**：`resolveRoute` 解析模型路由 → `core.beginSpawn` 预写状态（先占位，防并发重复派生）→ 生成角色 briefing（`workerBrief` / `reviewerBrief`）→ `ctx.subagents.startActivation` 以 `provider: spawn`、`cwd: mission.worktree`、reviewer 附带 `outputSchema: REVIEW_OUTPUT_SCHEMA` 启动子代理 → `core.attachSpawn` 记录 `childId` → `track(entry)` 在后台跟踪。启动失败会回滚：`failSpawn` 记录失败状态；attach 失败额外 `activation.dispose()`。
 - **`track(entry)`**：等待 `activation.result`，交给 `core.completeSpawn` 结算状态；随后 `publish` 并向控制器 Session `steer` 一条 `subagent-settled` 通知（子代理落定提示，不是结果本身）。
 - **`resolveRoute`**：合并 role 默认（config 的 `workerAgentOptions` / `reviewerAgentOptions`）与 per-spawn 参数（`provider`+`model` 必须成对、`reasoning_effort`、`max_tokens` 正安全整数）；无任何覆盖时子代理继承控制器路由（`parentAgentOptionsForDelegation`）；配置了 `allowedModels` 时做精确路由允许清单校验（`MODEL_ROUTE_NOT_ALLOWED`）；最终经 `ctx.llm.resolveCallConfig` 验证。解析出的 route 同时写进 mission 的 `worker` / `review` 记录，供 projection/UI 展示。
@@ -57,7 +59,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 
 `TowerCore` 的全部变更都通过 `store.update`（读-改-写 + 校验 + 落盘）完成；状态迁移伴随 `mission.revision += 1` 与事件追加（`appendEvent`，全量保留最近 200 条，`publicState` 对外只暴露最近 20 条）。状态机细节见 §3，门禁细节见 §5。
 
-只读查询不经过 `store.update`：`status` / `mission` 返回完整快照；`summary` 返回紧凑概览——全局 `counts`（missions / workerRunning / reviewRunning / approved / merged / blocked（= `rebase_blocked + merge_blocked`）/ abandoned）加每 mission 一行条目（`summaryMission`：id、标题、状态、依赖、精简的 worker/review 路由信息与 verdict、mergeCommit，不含 description/scope/worktree/历史）。可选 `mission_id` 只收窄条目，counts 始终描述整个 tower；未知 id 抛 `MISSION_NOT_FOUND`，未 init 抛与 `status` 相同的初始化错误。`summary` 不追加事件、不递增 revision、也不改 `updatedAt`，对 §4 不变量与 §5 gate 均无影响（但其 runtime dispatch 尚未接线，见 §2.1）。
+只读查询不经过 `store.update`：`status` / `mission` 返回完整快照；`summary` 返回紧凑概览——全局 `counts` 加每 mission 一行条目。可选 `mission_id` 只收窄条目，counts 始终描述整个 tower；未知 id 抛 `MISSION_NOT_FOUND`，未 init 抛与 `status` 相同的初始化错误。`summary` 不追加事件、不递增 revision、也不改 `updatedAt`，对 §4 不变量与 §5 gate 均无影响；精确字段与工具层包装见 §2.7。
 
 ### 2.4 存储（lib/store.js）
 
@@ -78,12 +80,27 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 - projection 侧：`towerProjectionDefinition`（key 为 `tower`）用 zod schema 校验记录，坏记录变成 `failure` 字段而不是抛错。
 - UI 侧（[../lib/client.js](../lib/client.js)）：会话头 popover 与右侧 Sidebar 标签页共享 `TowerWorkspace`。它汇总所有 Session 的 tower projection，按 `repoRoot` 聚合并取 `updatedAt` 最新的一份；提供 missions 视图（`MissionCard`：阶段、依赖芯片、worker/reviewer 行、mergeCommit、由 `missionNextStep` 推导的「下一步/受阻」提示）与 agents 视图（按角色分组、all/running/attention 过滤、点击卡片经 `subagentchat` 资源打开子代理会话）。UI 是只读投影，不是实时镜像。
 
+### 2.7 只读动作契约
+
+`status` / `summary` / `gate` / `models` 均不调用 `store.update` 或 `store.write`，成功路径也不发布 projection；它们不会追加事件、递增 mission revision 或刷新 `updatedAt`，必须让 `state.json` **逐字节不变**。前三个动作只读取 state 与 Git 实况；`models` 在 `resolveRoot` / `coreAt` 之前直接返回，甚至不要求仓库已 init。这里的「只读」不表示跳过 §6.1 的进程内 workspace 归属校验。
+
+| 工具动作 | 返回结构与精简规则 |
+| --- | --- |
+| `status` | 无 `mission_id` 时直接返回 `publicState`：`version / repoRoot / baseBranch / baseCommit / createdAt / updatedAt / missions / events`（events 仅末 20 条）；带 `mission_id` 时返回 `{ mission }`。`observe:true` 只增加只读 Git 观察 `observations`，不改持久化状态。 |
+| `summary` | 返回 `{ summary }`，其中 `summary` 含 `version / repoRoot / baseBranch / baseCommit / counts / missions`。`counts` 是七个全塔桶：`missions` 为总数，`workerRunning` / `reviewRunning` / `approved` / `merged` / `abandoned` 各计同名状态，`blocked` 合并计算 `rebase_blocked + merge_blocked`；其余状态只体现在总数与条目中。 |
+| `gate` | 直接返回 `evaluateMergeGate` 的 `{ ready, blocks, observations }`；block code 见 §5。已合并对账形态为 `ready:false, alreadyMerged:true, blocks:[], warnings, observations`，仍只是查询，真正记账由 `merge` 完成。 |
+| `models` | 无 `provider` 时返回 `{ providers, allowedModels? }`，每个 provider 条目含 `provider / name? / models / truncated`，失败时另带该 provider 的 `error`，按 provider/model 排序且每个 provider 最多 100 个模型；只带 `provider` 时返回 `{ provider, models, allowedModels? }`，最多 500 条；`provider + model` 时同样返回 `{ provider, models:[精确路由元数据], allowedModels? }`。目录查询不逐模型解析调用配置。 |
+
+`summary.missions[]` 的每项只有 `id / title / status / dependsOn / worker / review / mergeCommit`：无 worker/review 记录时对应字段为 `null`，无 merge commit 时 `mergeCommit:null`；worker 精简为实际存在的 `provider / model / reasoningEffort / stopReason`，review 精简为 `provider / model / verdict / merge`。description、scope、worktree、事件与运行历史均不进入该概览。可选 `mission_id` **只收窄 `missions[]`**，七个 counts 仍是全塔值；未知 id 抛 `MISSION_NOT_FOUND`。
+
+可执行契约：[../test/readonly-actions.test.js](../test/readonly-actions.test.js) 用真实 Git 仓库固定 status/summary/gate 的跨状态一致性、JSON round-trip 与 state 字节不变；[../test/runtime.test.js](../test/runtime.test.js) 固定 runtime 的 summary 接线及只读动作不发布 projection；[../test/doctor-json-schema.test.js](../test/doctor-json-schema.test.js) 则固定 §8.1 诊断 JSON 的键集合、退出码与重复运行字节稳定性。[../test/scale-smoke.test.js](../test/scale-smoke.test.js) 另以 100-mission state 固定紧凑查询与事件上限的抗退化行为。
+
 ## 3. Mission 状态机
 
-状态全集（[../lib/store.js](../lib/store.js) 的 `STATUSES`，共 11 个）：
+状态全集（[../lib/store.js](../lib/store.js) 的 `STATUSES`，共 12 个）：
 
 ```
-pending / worker_running / worker_completed / worker_failed / review_running /
+pending / worker_running / worker_completed / worker_failed / review_failed / review_running /
 changes_requested / approved / rebase_blocked / merge_blocked / merged / abandoned
 ```
 
@@ -91,7 +108,10 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 - `ACTIVE_STATUSES = { worker_running, review_running }` —— 有子代理在跑，阻止同 mission 的其他变更动作。
 - `TERMINAL_STATUSES = { merged, abandoned }` —— 终态，同时是依赖（`depends_on`）的「已解决」判据（`dependenciesReady`）。
-- `WORKER_RESTARTABLE = { pending, worker_completed, worker_failed, changes_requested, approved, rebase_blocked, merge_blocked }` —— 可启动（或重启）worker 的状态。
+- `WORKER_RESTARTABLE = { pending, worker_completed, worker_failed, review_failed, changes_requested, approved, rebase_blocked, merge_blocked }` —— 可启动（或重启）worker 的状态。
+- `REVIEW_RESTARTABLE = { worker_completed, review_failed, approved, changes_requested }` —— 可启动（或重试）reviewer 的状态。
+
+状态集合的不变量与「状态 × 动作」全集结局由 [../test/state-machine.test.js](../test/state-machine.test.js) 固定：它用真实 Git 仓库跑满 **12 个状态 × 7 个动作**（spawnWorker、spawnReviewer、merge、rebase、teardown、editMission、addDependent）矩阵，并断言 `ACTIVE ∪ TERMINAL ∪ WORKER_RESTARTABLE` 恰好覆盖全部合法状态、三者两两不相交、`REVIEW_RESTARTABLE ⊆ WORKER_RESTARTABLE`、每个合法状态都有矩阵行；所有拒绝/拒绝式结果还要求 mission、revision 与 events 逐项不变。
 
 ### 3.1 合法迁移
 
@@ -112,14 +132,38 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 | `approved` / `merge_blocked` → `worker_completed` | `merge`（`mission-merge-advanced`） | Git 合并成功但结算时发现 worktree tip 已越过 reviewedCommit：合并本身有效，但多出的提交未经审查，清空 review 回到待审查 |
 | 任意非终态 → `merged`（对账） | `merge`（`alreadyMerged`） | reviewed SHA 已包含在 base 中且仍等于当前 tip：只做记账（`mission.merge.reconciled = true`），不重复合并 |
 | 任意非 `merged`、非活跃 → `abandoned` | `abandon` | `merged` 不可放弃（`MISSION_MERGED`）；artifacts 保留，可事后 `teardown` |
-| `worker_running` → `worker_failed`；`review_running` → `worker_completed` | `recover` | 仅处理不属于本运行时的 running 记录（§4.4） |
+| `worker_running` → `worker_failed`；`review_running` → `review_failed` | `recover` | 仅处理不属于本运行时的 running 记录（§4.4）；reviewer 记录额外标 `stale:true` |
 | （不改 status）`worktreeRemoved = true` | `teardown` | 仅终态 mission；见 §4.5 |
 
-### 3.2 不允许的操作
+### 3.2 `review_failed` 的进入与离开
+
+`review_failed` 是**非活跃、非终态**的可恢复失败，不是审查结论，也不等于绑定过期：
+
+- **进入**：reviewer 启动或 attach 后的回滚由 `failSpawn` 记入；`completeSpawn` 观察到 `stopReason !== 'completed'` 或缺少结构化 verdict 时进入；`recover` 对不属于当前 runtime 的 persisted `review_running` 也进入此态，并记 `stopReason:'aborted'`、`stale:true`。这些路径均保留诊断到 `review.error` / `diagnostic`，追加 `spawn-failed` 或 `activation-recovered` 事件。
+- **直接离开**：可重新 `spawn` reviewer（`REVIEW_RESTARTABLE`），也可 `spawn` worker 返工（`WORKER_RESTARTABLE`）；后者按 §3.1 清空旧 review。拿到有效结论后仍只会进入 `approved` 或 `changes_requested`。
+- **rebase / abandon**：真正改变 tip 或使 base/tip 绑定过期的 rebase 清空 review 并回 `worker_completed`；完全 no-op 的 rebase 保留 `review_failed` 及失败记录；rebase 失败走 `rebase_blocked`；非活跃时也可 `abandon`。
+- **合并边界**：gate 对该状态报 `NOT_APPROVED`。reviewer 运行期间 base/tip 漂移则回 `worker_completed` 且 `review.stale:true`，这是另一条路径，不能误记为 `review_failed`（§4.1）。
+
+### 3.3 `send` / `interrupt` 的归属与返回
+
+`send` 与 `interrupt` 共用 `TowerRuntime.controlAddress`（[../lib/runtime.js](../lib/runtime.js)）的三步校验：`role` 参数先过白名单，只接受 `worker` / `reviewer`，其余值立即抛 `ARGUMENT_INVALID`；core 的 `agentAddress`（[../lib/core.js](../lib/core.js)）再按 role 取对应 worker/review 记录，要求该记录已有 `childId`，且 mission status 分别为 `worker_running` / `review_running`；最后核对本进程 `active` 中的激活，要求 core、runId、missionId、role、childId **全部一致**。因此，已完成的 agent、未 attach 的 running 记录、指向另一角色的地址、重启后遗留或由另一 runtime 拥有的 run 都抛 `AGENT_NOT_RUNNING`，且不会调用 subagents 的发送/取消接口；这避免把消息或中断投递给同名的另一轮运行。
+
+成功返回均带完整地址 `{ mission, role, runId, childId }`：`send` 另含 `sent:true` 与宿主返回的 `messageId`，消息文本经 trim 后转发；`interrupt` 另含 `interrupted:true`，以 `{ kind:'ancestor', agent }` 请求取消。两个动作本身不写 Tower state，成功路径也不 publish；实际落定状态仍由 §6.3 的 `track` 统一结算。覆盖测试见 [../test/control-actions.test.js](../test/control-actions.test.js)。
+
+### 3.4 落定通知的保证
+
+`TowerRuntime.track` 对每个激活只走一条结算链：等待 `activation.result` → `completeSpawn`，异常时尝试 `failSpawn` → 在 `finally` 删除 active 并 dispose activation → 独立尝试 publish → 构造并向控制器 `steer` 一条 `subagent-settled` 通知。状态落账与 projection 发布分别被隔离，二者失败都不能吞掉后续通知；即使两次状态写入都失败，fallback 通知仍点名 role、mission、runId 与错误，并提示先用 `status` 检查。
+
+通知首行是 `Tower <role> for <mission> <outcome>: mission status <status>`；`failed` / `interrupted` / `stale` 附 reason 和下一步，reason 统一以 `boundedReason` 截到 500 字符。`review_failed` 指引重派 reviewer，`changes_requested` 指引 worker 返工后重审，approved 指引 gate/merge。这里的「保证送达」指**每次落定都必然生成并尝试投递，前序失败不会静默**；若宿主 `steer` 自身抛错，则记录 error 日志，不伪称还有跨进程持久队列或自动重试。可执行契约见 [../test/runtime.test.js](../test/runtime.test.js) 的 track/settlement 用例。
+
+### 3.5 不允许的操作
 
 - 终态（`merged` / `abandoned`）不能再 `spawn`（`MISSION_TERMINAL`）或 `rebase`；`merged` 不能 `abandon`。
-- 活跃状态（`worker_running` / `review_running`）不能再 `spawn`（`AGENT_BUSY`）、`rebase`、`abandon`；`send` / `interrupt` 只寻址活跃子代理（`agentAddress` 要求 `childId` 已记录且 status 匹配）。
+- 活跃状态（`worker_running` / `review_running`）不能再 `spawn`（`AGENT_BUSY`）、`rebase`、`abandon`；`send` / `interrupt` 只寻址活跃子代理（§3.3）。
+- 非 `REVIEW_RESTARTABLE` 状态（如 `pending`、`worker_failed`、`rebase_blocked`、`merge_blocked`）不能 `spawn` reviewer（`REVIEW_START_BLOCKED`）——审查必须先有一轮可审查的 worker 产出。
+- `teardown` 对非终态 mission 不抛异常，而是逐条返回结构化拒绝（`removed:false` + `reason:'status-<status>'`）。
 - 活跃状态下不会出现 `worker_failed` / `changes_requested` 等落定状态（它们是活跃态的结算结果）；`rebase_blocked` / `merge_blocked` 也只在非活跃的 Git 操作失败时产生。
+- 上述拒绝与结构化拒绝都**不改 state**：mission、revision 与 events 逐项不变（[../test/state-machine.test.js](../test/state-machine.test.js) 对每个矩阵单元格断言）。
 
 ## 4. 关键不变量
 
@@ -147,7 +191,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 ### 4.4 Recover 不接管旧进程
 
-`recover(activeRunIds)` 只把「状态文件里是 running、但 runId 不属于本运行时活跃集合」的记录标记为中止：worker 记录 `stopReason: 'aborted'` → `worker_failed`；reviewer 记录额外标 `stale: true` → `worker_completed`。它从不尝试 attach、杀掉或继承旧控制器启动的进程；旧激活落定后由其宿主自行处理。重启后 persisted running 记录会一直阻塞新派生，直到控制器显式调用 `recover`。
+`recover(activeRunIds)` 只把「状态文件里是 running、但 runId 不属于本运行时活跃集合」的记录标记为中止：worker 记录 `stopReason: 'aborted'` → `worker_failed`；reviewer 记录额外标 `stale: true` → `review_failed`。它从不尝试 attach、杀掉或继承旧控制器启动的进程；旧激活落定后由其宿主自行处理。重启后 persisted running 记录会一直阻塞新派生，直到控制器显式调用 `recover`。
 
 ### 4.5 Teardown 只清理 merged/abandoned 且干净的 worktree
 
@@ -209,7 +253,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 ### 6.4 单进程边界（重要）
 
-所有权与串行队列都只在**单个 Host 进程内**成立。它们不是跨进程的 Git 锁：两个 Host 进程同时对该仓库充当控制器不会被 `WORKSPACE_BUSY` 拦住。不要在两个进程中同时操作同一份 tower 状态。
+所有权与串行队列都只在**单个 Host 进程内**成立。它们不是跨进程的 Git 锁：两个 Host 进程同时对该仓库充当控制器不会被 `WORKSPACE_BUSY` 拦住。不要在两个进程中同时操作同一份 tower 状态。§8.2 发布脚本的锁只保护 release apply 自己的目标文件，不能替代这里的单控制器约束。
 
 ## 7. 数据布局
 
@@ -220,7 +264,9 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 │   └── worktrees/
 │       └── <mission-id 小写>/       # 每 mission 一个 Git worktree（如 m1/）
 ├── .git/
-│   └── info/exclude                # 追加 "<stateDirectory>/" 条目（本地排除，不提交）
+│   ├── info/exclude                # 追加 "<stateDirectory>/" 条目（本地排除，不提交）
+│   ├── release-apply.lock          # release --apply 主锁（§8.2，瞬时跨进程锁，非 Tower state）
+│   └── release-apply.reclaim.lock  # 陈旧主锁回收的串行化锁（§8.2）
 └── ...
 ```
 
@@ -228,7 +274,57 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 - **`state.json` 结构**（`validateState`）：`version: 1`、`repoRoot`（绝对路径）、`baseBranch`、`baseCommit`、`createdAt` / `updatedAt`、`missions[]`、`events[]`（最多保留 200 条）。每个 mission 记录：`id`、`title`、`description`、`dependsOn`、`scope`、`branch`、`worktree`、`baseCommit`、`status`、`revision`、`createdAt`、`worktreeRemoved`，以及可选的 `worker` / `review`（runId、route、childId、起止时间、stopReason、output、headCommit / 绑定与 verdict、`stale` 等字段）与 `merge`（mergedAt、commit、reviewedCommit、baseCommit、可选 reconciled）记录。projection 的 zod schema（[../lib/projection.js](../lib/projection.js)）与之对应。
 - **artifact 对账**：`addMission` 遇到已存在的同名分支/worktree 时，只有「两者同时存在、worktree 干净、位于该分支、tip 是当前 base 的祖先（无独立提交）」才对账复用（`mission-artifacts-reconciled`，mission 记 `reconciled: true`、`baseCommit` 取 worktree tip）；任何不匹配都抛 `MISSION_ARTIFACT_CONFLICT`，交给人工检查，绝不自动删除。
 
-## 8. 失败恢复语义（汇总）
+## 8. 诊断与发布工具
+
+两个脚本都是独立 CLI，不经过 `TowerRuntime`，也不取得 Tower 的进程内 workspace ownership；它们的读写边界不能与 §6 的控制器模型混为一谈。操作步骤见 [operations.md](operations.md)，本节只固定设计与输出契约。
+
+### 8.1 `tower-doctor`：只读对账与稳定 JSON
+
+[../scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs) 默认检查当前仓库的 `.dsh-tower/state.json`，也可用 `--repo` / `--state` 指定目标。检查维度包括：
+
+1. state 可读性、JSON/schema、版本、必填字段、mission id 与依赖；
+2. state.repoRoot 与实际仓库、base 分支及记录的 baseCommit 是否存在、漂移或分叉；
+3. 每 mission 的分支/baseCommit、worktree 的磁盘存在性、Git 注册、检出分支与 teardown 标记一致性，以及孤儿 worktree；
+4. merged mission 的 merge 记录及 mergeCommit 是否可达于 base；
+5. running 状态的 run 记录是否缺失或看似已经结束；
+6. Git 元数据健康：POSIX 下的异属主扫描，以及现存 objects、refs、index 和 Tower state 目录的可写性。
+
+脚本只执行查询型 Git 命令与 `readFile/readdir/stat/lstat/access` 等读取，不改 state、不改 Git、不执行修复建议中的 `chown` / `chmod`。退出码默认为 `0`（无 finding）、`1`（有 warning 且无 error）、`2`（任一 error，或参数用法错误）；error 优先于 warning。可选 `--fail-on-warning` 提供严格守门：仅有 warning 的运行退出码由 `1` 升级为 `2`，clean 仍为 `0`、error 仍为 `2`，默认策略不变，适合发布检查 / CI 门禁在 warning 即失败（用法速查见 [operations.md](operations.md) 附录 C）。
+
+有效参数的 `--json` 诊断运行把**唯一一个 JSON 对象写入 stdout**，人类可读诊断不混入 stdout，stderr 为空。对象含 `repo / statePath / findings / summary`，state 结构可用时另含 `baseBranch / baseTip`；仅在显式给出 `--fail-on-warning` 时额外携带 `failOnWarning: true`，默认输出的键集与类型保持不变（向后兼容的可选增键）；早期失败无法解析的字段用 `null` 或省略可选 base 字段。`summary` 固定为 `checksPassed / warnings / errors / exitCode`；finding 至少有 `code / severity / message`，再按类别附 `mission / role / path / sample` 等上下文。用法错误以退出码 2 输出到 stderr，不属于上述有效诊断 JSON 形态。
+
+当前共有 **32 个 finding code**，分类如下（测试用白名单封闭集合，新增 code 必须同步契约测试）：
+
+| 分类 | codes |
+| --- | --- |
+| state（5） | `STATE_CORRUPT`、`STATE_FIELD_INVALID`、`STATE_MISSING`、`STATE_READ_FAILED`、`STATE_VERSION` |
+| repo / base（7） | `REPO_INVALID`、`REPO_MISMATCH`、`BASE_BRANCH_MISSING`、`BASE_COMMIT_UNKNOWN`、`BASE_COMMIT_DRIFT`、`BASE_COMMIT_DIVERGED`、`BASE_COMPARE_FAILED` |
+| mission / 依赖（5） | `MISSION_BASE_UNKNOWN`、`MISSION_BRANCH_MISSING`、`MISSION_DEP_UNKNOWN`、`MISSION_DUPLICATE`、`MISSION_FIELD_INVALID` |
+| worktree / teardown（8） | `ORPHAN_WORKTREE`、`TEARDOWN_INCOMPLETE`、`WORKTREE_BRANCH_MISMATCH`、`WORKTREE_DIR_MISSING`、`WORKTREE_LIST_FAILED`、`WORKTREE_SCAN_FAILED`、`WORKTREE_STILL_REGISTERED`、`WORKTREE_UNREGISTERED` |
+| merge（3） | `MERGE_COMMIT_NOT_IN_BASE`、`MERGE_COMMIT_UNKNOWN`、`MERGE_RECORD_MISSING` |
+| running（2） | `RUNNING_RECORD_FINISHED`、`RUNNING_RECORD_MISSING` |
+| Git 元数据（2） | `GIT_METADATA_FOREIGN_OWNER`、`GIT_METADATA_NOT_WRITABLE` |
+
+异属主 finding 的 `sample` 最多 **10 条**，`count` 只表示本次实际扫描发现的数量。扫描默认最多执行 **5000 次 `lstat`**，达到预算即停止并置 `truncated:true`，所以结果不是完整仓库属主审计；`node_modules` 与 Tower worktrees 目录始终跳过，符号链接不跟随。无 `process.getuid()` 的平台跳过异属主扫描，可写性检查仍执行。
+
+[../test/doctor-json-schema.test.js](../test/doctor-json-schema.test.js) 是输出与退出码的可执行契约，并验证重复运行输出逐字节稳定、state 不变；[../test/doctor.test.js](../test/doctor.test.js) 固定 10 条样例上限、扫描预算和 `truncated` 行为，以及 `--fail-on-warning` 的退出码策略（含 `--json` 的向后兼容增键）；[../test/doctor-tower.test.js](../test/doctor-tower.test.js) 另以真实 `TowerCore` 生命周期（真实 worktree / commit / merge / teardown，Git 不 mock）产出的 state 做集成对账，仅人为改写 state.json 模拟健康生命周期不会自行产生的崩溃/伪造场景。
+
+### 8.2 `release`：plan/apply 分离、双层锁与回滚
+
+[../scripts/release.mjs](../scripts/release.mjs) 只准备本地版本变更，不 commit、tag、push 或访问网络。`computePlan` 读取并校验 semver、日期、`package.json` 与 `CHANGELOG.md`，生成包含每份文件 `before/after` 的计划；默认 dry-run 只渲染计划 diff，**不取锁、不写文件**。`--apply` 把整个操作——重新执行 `computePlan`、要求 `git status --porcelain` 为空、写入——都放进锁的临界区内，竞争者不可能使用持锁者写入前算出的旧计划；缺失 CHANGELOG 只有显式 `--create-changelog` 才允许创建。成功输出后文件保持 dirty，交由人工复核与提交；若本次接管了陈旧锁，输出附 `lockNotice` 说明接管原因。
+
+为避免两个进程同时依据同一旧版本完成计划并互相覆盖，`--apply` 使用**双层跨进程锁**（下称主锁 L 与回收锁 R），而不是复用 §6 的 Tower 单进程机制：
+
+- 两把锁都由 `git rev-parse --absolute-git-dir` 定位到 Git 实际 git-dir（linked worktree 各有各的 git-dir）：L 为 `<gitdir>/release-apply.lock`，R 为 `<gitdir>/release-apply.reclaim.lock`。锁不落在工作区，因此不会破坏 clean-worktree 前置条件，也不需要修改 `.gitignore`。
+- **快路径**：以排他创建（`open 'wx'`，权限 0o600）原子抢 L；锁内容为 JSON `{ pid, timestamp, token }`，`token` 是本次持有的唯一凭据。
+- L 已存在时先做陈旧判定：仅当持有 pid 已不存在（`process.kill(pid, 0)` 报 `ESRCH`）或锁龄至少 **10 分钟**（优先读锁内 timestamp，坏锁回退文件 mtime）才允许回收；否则立即抛 `RELEASE_LOCKED`，消息点名持有者 pid（无法解析时称 unknown pid）并明确**不等待、不自动重试**。
+- **回收先取 R**（获取协议与 L 相同，陈旧的 R 本身也要先被回收）：R 把「陈旧 L 的回收」串行化。持有 R 后重读 L，内容必须与陈旧判定时逐字节一致，否则视为被竞争者替换（`RELEASE_LOCKED`）；随后把 L 以 `rename` 原子移入唯一隔离路径，并核验移入的字节仍是判定时那把旧锁——若发现移动的其实是竞争者刚换上的新锁，用硬链接恢复原位并中止，绝不误删；确认无误才删除隔离文件并以 `wx` 创建新 L（此时 `EEXIST` 说明有更快者，同样 `RELEASE_LOCKED`）。
+- **释放只删自身 token**：释放同样先 `rename` 到唯一隔离路径、核验 token 仍属于自己才删除；若锁已被换成别人的则原样保留。L 与 R 都在 `finally` 中按此协议释放。文件系统层面的失败以 `RELEASE_LOCK_FAILED` / `RELEASE_UNLOCK_FAILED` 显式暴露。
+- dry-run 不经过上述锁协议；该锁只序列化发布脚本的目标文件写入，不授权两个 Host 同时控制 Tower state（§6.4）。
+
+写入仍逐文件采用同目录临时文件 + `rename` 原子替换，失败时清理本次临时文件。`applyPlan` 记录已成功写入的文件；后续文件失败时按逆序 best-effort 回滚：update 恢复原始字节，create 删除新文件，然后抛 `WRITE_FAILED`，消息区分「尚未写入」「已回滚」与「回滚失败」。因此原子替换降低单文件半写风险，回滚降低两份文件跨文件不一致风险，但后者不是事务保证，回滚错误会明确暴露。回归见 [../test/release.test.js](../test/release.test.js) 与 [../test/release-concurrency.test.js](../test/release-concurrency.test.js)（真进程并发：两个同时 `--apply` 恰有一个成功，落败方报结构化错误且仓库无临时/锁残留；dry-run 与 apply 并发时只有 apply 写文件）。
+
+## 9. 失败恢复语义（汇总）
 
 | 场景 | 行为 |
 | --- | --- |
@@ -239,7 +335,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 | reviewed SHA 已在 base 中 | `alreadyMerged` 记账对账（§4.2） |
 | 重试 `add` / `teardown` | 保守对账已有 artifact（§7、§4.5），意外路径绝不删除 |
 
-## 9. 测试与验证
+## 10. 测试与验证
 
 - `pnpm test`（[../package.json](../package.json)）：[../test/](../test) 下用真实临时 Git 仓库覆盖 core / runtime / store / git / projection / client 逻辑，仅 mock DSH 侧边界（subagents、llm、sessions 等）；[../test/integration.test.js](../test/integration.test.js) 另以真实 worktree / commit / merge（不 mock git）覆盖完整 mission 生命周期的端到端集成测试。
 - `pnpm run check`：对 `lib/` 下全部模块做 `node --check` 语法检查。
