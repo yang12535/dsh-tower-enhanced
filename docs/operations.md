@@ -1,43 +1,43 @@
 # Tower 运维 Runbook：故障诊断与恢复手册
 
-本手册面向 Tower 控制器（controller Session）的日常操作与故障处置：每一步的预期输出、失败后的下一步动作，以及各故障场景的安全处理边界。使用入门请先读 [README.md](README.md)（或 [README.zh-CN.md](README.zh-CN.md)）；本手册只做「操作 + 排障」，不重复架构论述。
+本手册面向 Tower 控制器（controller Session）的日常操作与故障处置：每一步的预期输出、失败后的下一步动作，以及各故障场景的安全处理边界。使用入门请先读 [README.md](../README.md)（或 [README.zh-CN.md](../README.zh-CN.md)）；架构论述见 [architecture.md](architecture.md)，安全边界见 [security-model.md](security-model.md)。本手册只做「操作 + 排障」。
 
-## 基线与文档现状
+## 基线
 
-- 本手册与 base `8fcc36c` 的代码行为一致：`lib/core.js`（状态机、merge gate、merge/rebase/teardown/recover 语义）、`lib/runtime.js`（action 分发、workspace 归属）、`lib/store.js`（state 持久化与校验）、`lib/git.js`（git 封装）。该基线已包含 M4 models 聚合、M5 `editMission`、M6 中文 README、M7 CI 加固、M8 `edit` 接线、M9 e2e 测试、M14 `summary` 的 core 实现与工具枚举。
-- `docs/architecture.md` 与 `docs/security-model.md`（M10）、`scripts/tower-doctor.mjs`（M12 只读体检）由并行 mission 交付，撰写本手册时**尚未合入 base**；本手册不依赖它们存在，相关章节给出合入前的替代做法。
-- 兼容性提示：`summary` 动作已在 `lib/index.js` 的工具枚举与 `lib/core.js`（`TowerCore.summary`）中就绪，但 `lib/runtime.js` 的 action 分发尚未接线（待 M17）。在本基线上调用 `tower({action:"summary"})` 会得到 `unknown Tower action summary`；日常巡检请继续用 `status`。
+本手册与 base `c6080c5` 的代码行为一致：[lib/core.js](../lib/core.js)（状态机、merge gate、merge/rebase/teardown/recover 语义）、[lib/runtime.js](../lib/runtime.js)（action 分发、workspace 归属、通知与僵尸探测）、[lib/store.js](../lib/store.js)（state 持久化与校验）、[lib/git.js](../lib/git.js)（git 封装）。该基线包含：`summary` 概览、`review_failed` 状态、pending 首次派发前的 ff-only 基线同步、失败通知保证送达与 `agent/created` 僵尸提示、rebase 时 base 变化即失效审查、`add`/`edit` 一致的 scope 校验、store 原子写失败清理临时文件，以及只读体检脚本 [scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs)。
 
 ## 约定
 
 - 所有变更类操作一律通过控制器 Session 的 `tower` 工具完成；**不要**用 bash 直接改 `.dsh-tower/state.json` 或代替 tower 执行 merge/rebase/teardown。git 命令只用于**只读诊断**（附录 A）。
 - 文中 `<repo>` 指仓库根（`state.repoRoot`），`<id>` 指 mission id；mission 的分支为 `tower/<id 小写>`，worktree 为 `<repo>/.dsh-tower/worktrees/<id 小写>`。
 - tower 归属跟随仓库而非 Session 血统：同一仓库的 tower 同一时刻只有一个 owner（一次调用在途，或它启动的 worker/reviewer 仍在运行）。第二个 Session 会被 `WORKSPACE_BUSY` 拒绝。
-- `status` 返回的 `events` 是 `state.events` 的最后 20 条（事件类型见附录 B），是排障的第一手时间线。
+- `status` 返回的 `events` 是 `state.events` 的最后 20 条（state 内上限 200 条，事件类型见附录 B），是排障的第一手时间线。
+- 每个 worker/reviewer 落定都会向控制器 Session 送达一条结算通知（保证送达，见 §2.10）——「静默失败」不是需要排查的场景。
 
 ## 1. 状态机速览
 
-合法状态集合定义在 `lib/store.js`（`STATUSES`），迁移逻辑在 `lib/core.js`。
+合法状态集合定义在 [lib/store.js](../lib/store.js)（`STATUSES`），迁移逻辑在 [lib/core.js](../lib/core.js)。
 
 | status | 含义 | 进入方式 | 允许的下一步 |
 |---|---|---|---|
-| `pending` | 已创建，未派生 | `add` / `add` 重试对账 | `spawn` worker；`edit` 修元数据；`abandon` |
+| `pending` | 已创建，未派生 | `add` / `add` 重试对账 | `spawn` worker（先做基线同步，§2.3）；`edit` 修元数据；`abandon` |
 | `worker_running` | worker 运行中 | `spawn` role=worker | `send` / `interrupt`；等待落定 |
-| `worker_completed` | worker 已完成且 worktree 干净 | worker 落定 / reviewer 异常落定 / `rebase` 后需复审 | `spawn` reviewer；`spawn` worker 返工；`rebase` |
+| `worker_completed` | worker 已完成且 worktree 干净 | worker 落定 / reviewer 绑定漂移 / `rebase` 后需复审 | `spawn` reviewer；`spawn` worker 返工；`rebase` |
 | `worker_failed` | worker 异常结束或留下脏 worktree | worker 落定失败 / `failSpawn` / `recover` | `spawn` worker 重试；`abandon` |
 | `review_running` | reviewer 运行中 | `spawn` role=reviewer | `send` / `interrupt`；等待落定 |
-| `changes_requested` | 审查要求返工 | reviewer verdict 非 clean 或 merge≠true | `spawn` worker 返工（会清空既有 review） |
+| `review_failed` | reviewer 异常结束（进程错误 / 无结构化结论 / 启动失败 / `recover` 标记） | reviewer 落定失败 / `failSpawn` / `recover` | `spawn` reviewer 重试；`spawn` worker 直接返工；`rebase`（真 no-op 时保持 `review_failed`） |
+| `changes_requested` | 审查要求返工 | reviewer verdict 非 clean 或 merge≠true | `spawn` worker 返工（清空既有 review） |
 | `approved` | clean 且 merge=true 的审查通过 | reviewer 落定 | `gate` → `merge`；`rebase`；`abandon` |
 | `rebase_blocked` | rebase 冲突，tower 已自动 `rebase --abort` | `rebase` 失败 | `spawn` worker 手工解决冲突；`abandon` |
 | `merge_blocked` | merge 的 git 步骤失败，tower 已尝试 `merge --abort` | `merge` 失败 | 修复后重试 `merge`（gate 对该状态放行）；`rebase`；`abandon` |
 | `merged` | 终态：已并入 base | `merge` 成功 / alreadyMerged 对账 | `teardown` |
 | `abandoned` | 终态：放弃（工件保留） | `abandon` | `teardown` |
 
-worker 可重启的状态集合（`WORKER_RESTARTABLE`，见 `lib/core.js`）：`pending`、`worker_completed`、`worker_failed`、`changes_requested`、`approved`、`rebase_blocked`、`merge_blocked`。reviewer 只能从 `worker_completed` / `approved` / `changes_requested` 启动。
+worker 可重启的状态集合（`WORKER_RESTARTABLE`）：`pending`、`worker_completed`、`worker_failed`、`review_failed`、`changes_requested`、`approved`、`rebase_blocked`、`merge_blocked`。reviewer 可启动的状态集合（`REVIEW_RESTARTABLE`）：`worker_completed`、`review_failed`、`approved`、`changes_requested`。`review_failed` 既非运行中也非终态，reviewer 与 worker 都能从它直接重派。
 
 ## 2. 日常操作流
 
-标准闭环：`init` → `add` → `spawn` worker → `status` → `spawn` reviewer → `gate` → `merge` → `teardown`。每小节给出调用、预期输出字段与失败后的 next action（均为 tower 动作）。
+标准闭环：`init` → `add` → `spawn` worker → `status`/`summary` → `spawn` reviewer → `gate` → `merge` → `teardown`。每小节给出调用、预期输出字段与失败后的 next action（均为 tower 动作）。
 
 ### 2.1 init
 
@@ -48,56 +48,66 @@ tower({action:"init"})            // 可选 base_branch，默认当前检出分�
 ```
 
 - 预期输出：`{ version, repoRoot, baseBranch, baseCommit, createdAt, updatedAt, missions: [], events }`。幂等：state 已存在时直接返回现有 state。
-- 首次 init 会创建 `.dsh-tower/worktrees/`、把 `.dsh-tower/` 写入 git 本地 exclude（`lib/store.js` `ensureLocalExclude`，不碰 `.gitignore`）。
+- 首次 init 会创建 `.dsh-tower/worktrees/`、把 `.dsh-tower/` 写入 git 本地 exclude（`ensureLocalExclude`，不碰 `.gitignore`）。
 - 失败与 next action：
   - `BASE_MISMATCH`：当前检出的分支不是请求的 base。先在主工作区检出 base 分支再 init。
   - `BASE_DIRTY`：主工作区有未提交/未跟踪文件。先提交或清理（不要指望 tower 容忍脏 base）。
   - `BASE_CONFLICT`：tower 已锚定其它 base 分支。确认仓库是否搞错；tower 不支持中途换 base。
   - `TOWER_NOT_INITIALIZED` 出现在其它动作上：说明 state 文件缺失，先 init。
 
-### 2.2 add（含 scope 设计建议）
+### 2.2 add（含 scope 设计与校验规则）
 
 ```text
 tower({action:"add", id:"M1", title:"...", description:"...", dependsOn:["M0"], scope:["docs/**"]})
 ```
 
-- 预期输出：`{ mission: { id, title, description, dependsOn, scope, branch, worktree, baseCommit, status:"pending", revision, createdAt, worktreeRemoved:false } }`，并创建分支 `tower/<id>` 与隔离 worktree。`id` 省略时自动分配 `M<最大序号+1>`。
+- 预期输出：`{ mission: { id, title, description, dependsOn, scope, branch, worktree, baseCommit, status:"pending", revision, createdAt, worktreeRemoved:false } }`，并创建分支 `tower/<id>` 与隔离 worktree（`git worktree add -b`）。`id` 省略时自动分配 `M<最大序号+1>`。
+- scope 校验（`add` 与 `edit` 完全一致，见 [lib/core.js](../lib/core.js) `validateScope`）：
+  - 非数组（字符串、`null`、其它类型）→ `ARGUMENT_INVALID`（`scope must be an array of glob patterns`）；空字符串模式 → `SCOPE_INVALID`（`scope patterns must be non-empty strings`）。
+  - **模式不做 trim**：字面空白被原样保留（含首尾空格的文件名可以由此匹配）；去重只对完全一致的模式生效。`title`/`description` 则会 trim 且纯空白被拒（`must be a non-empty string`）。
+  - 禁止绝对路径与 `..` 段（`SCOPE_INVALID`）；非法 glob 在探测时即抛 `SCOPE_INVALID`。
 - scope 设计建议：
   - scope 是仓库相对 glob，空数组 = 完全不限。**建议始终显式给出**——gate 的 `OUT_OF_SCOPE` 检查只在 scope 非空时生效。
   - 粒度以目录/主题为宜（如 `docs/**`、`lib/client.js` + `test/client.test.js` 成对给出）；过宽失去保护，过窄容易把测试、locale 文案等伴生改动误伤成 out-of-scope。
-  - 不允许绝对路径与 `..`（`SCOPE_INVALID`）；重复模式会被去重。
   - 预期会改同一区域的 mission 用 `dependsOn` 串行化，而不是靠 scope 并行硬撞（并行写同一文件最终会在 rebase/merge 阶段冲突）。
 - 失败与 next action：
-  - `MISSION_EXISTS` / `MISSION_ID_INVALID`：换 id（id 规则：大写字母开头，仅大写字母/数字/`_`/`-`）。
-  - `DEPENDENCY_INVALID` / `MISSION_NOT_FOUND`（依赖项）：修正 `depends_on` 指向已存在的 mission。
+  - `MISSION_EXISTS` / `MISSION_ID_INVALID`：换 id（id 规则：大写字母开头，仅大写字母/数字/`_`/`-`，≤32 字符）。
+  - `DEPENDENCY_INVALID`（重复或不存在）/ `MISSION_NOT_FOUND`（依赖项）：修正 `depends_on` 指向已存在的 mission。
   - `MISSION_ARTIFACT_CONFLICT`：同名分支/worktree 已存在且无法安全收编（见 3.10）。先用只读命令核对工件，再决定复用新 id 或人工清理。
-  - 派生前发现描述写错：不必删掉重来，用 `edit` 修 `title`/`description`/`scope`/`depends_on`（仅 `pending` 可改，`MISSION_NOT_EDITABLE`）。
+  - 派生前发现描述写错：不必删掉重来，用 `edit` 修 `title`/`description`/`scope`/`depends_on`（仅 `pending` 可改，`MISSION_NOT_EDITABLE`；`scope:[]` 表示清空限制，省略该字段保持原值）。
 
-### 2.3 spawn worker
+### 2.3 spawn worker（含 pending 首次派发的基线同步）
 
 ```text
 tower({action:"spawn", mission_id:"M1", role:"worker", provider:"...", model:"...", reasoning_effort:"...", max_tokens:...})   // 路由参数可选
 ```
 
 - 预期输出：`{ mission:"M1", role:"worker", runId, childId, status:"worker_running", worktree, route }`。worker 在 mission worktree 内实现并**必须先 commit** 再结束。
+- **pending 首次派发的基线同步**（[lib/core.js](../lib/core.js) `beginSpawn`）：`pending` mission 首次启动 worker 时，tower 读取 base 分支当前 tip；若 worktree 尚未包含它，则先验证 worktree 干净（否则 `WORKTREE_DIRTY`，state 与文件都不动）、检出分支正确（否则 `WORKTREE_BRANCH_MISMATCH`）、worktree tip 恰为记录的 `mission.baseCommit` 且仍在当前 base 的历史中（否则 `STALE_BASE`：worktree 已偏离当前基线——典型是已有 base 之外的独有提交，**必须显式 `rebase`**，tower 不会替你变基），然后执行 `git merge --ff-only --no-overwrite-ignore <base>` 快进到当前 base，使已合并的依赖成果立即可用。快进失败（如忽略文件与新 base 冲突）以 `GIT_FAILED` 原样抛出，本地文件不被覆盖。随后 `mission.baseCommit` 更新为当前 base。
+  - 该同步发生在 state 落账之前：若快进已成功但 state 写入失败，重试 `spawn` 即可（快进幂等，测试覆盖此路径）。
+  - 重派**已有** worker（非 `pending`）不会自动 rebase 其 worktree——基线同步只发生在 `pending` 的第一次。
 - 失败与 next action：
   - `WORKSPACE_BUSY`：另一 Session 正拥有本仓库 tower。回到那个 Session 处理，或等它的调用/子代理落定；不要强行并发。
   - `AGENT_BUSY`：该 mission 已有 worker/reviewer 在跑。先 `send`/`interrupt` 或等待落定。
   - `WORKER_START_BLOCKED`：当前状态不允许启 worker（见 §1 表）。
   - `DEPENDENCIES_NOT_MERGED`：依赖未到终态（`merged` 或 `abandoned` 都算解决）。先推进依赖 mission。
+  - `STALE_BASE`（pending 同步语境）：worktree 有独有提交，先 `tower({action:"rebase"})` 再 spawn。
+  - `WORKTREE_BRANCH_MISMATCH`：worktree 被检到了别的分支。查清是谁动的（§3.6 同理），人工检出 `tower/<id>` 后重试。
   - `MODEL_ROUTE_*` / `MAX_TOKENS_INVALID`：路由参数不合法或不在 `allowedModels`，修正参数或配置。
   - worker 结束后状态为 `worker_failed`：见 3.7 重试。
 
-### 2.4 status
+### 2.4 status / summary
 
 ```text
 tower({action:"status"})                       // 全量 state
-tower({action:"status", mission_id:"M1"})      // 单个 mission
+tower({action:"status", mission_id:"M1"})      // 单个 mission：{ mission }
 tower({action:"status", observe:true})         // 附带 git 实况观察
+tower({action:"summary"})                      // 紧凑只读概览
+tower({action:"summary", mission_id:"M1"})     // 概览，条目收窄到单个 mission
 ```
 
-- 预期输出：`{ version, repoRoot, baseBranch, baseCommit, missions[], events }`；`observe:true` 时额外返回 `observations: { checkedOutBranch, baseTip, baseStatus, missions: { "<id>": { tip, status:{clean, entries} } } }`。
-- 用法：`observe:true` 把「持久化 state」与「git 事实」并排摆出，是所有「状态怀疑滞后/不一致」场景的首选诊断（见 3.5）。mission 内 `worker`/`review` 记录的 `output`、`error`、`dirtyEntries`、`headCommit`、`structured`（审查结论）都在这里读。
+- `status` 预期输出：`{ version, repoRoot, baseBranch, baseCommit, missions[], events }`；`observe:true` 时额外返回 `observations: { checkedOutBranch, baseTip, baseStatus, missions: { "<id>": { tip, status:{clean, entries} } } }`。把「持久化 state」与「git 事实」并排摆出，是所有「状态怀疑滞后/不一致」场景的首选诊断（见 3.5）。mission 内 `worker`/`review` 记录的 `output`、`error`、`dirtyEntries`、`headCommit`、`structured`（审查结论）都在这里读。
+- `summary` 预期输出：`{ version, repoRoot, baseBranch, baseCommit, counts, missions[] }`，其中 `counts` 为**全塔**统计（`missions`/`workerRunning`/`reviewRunning`/`approved`/`merged`/`blocked`/`abandoned`），`missions[]` 为每任务一行（`id`/`title`/`status`/`dependsOn`/精简 `worker`/`review`/`mergeCommit`，不含 description/scope/worktree/历史）。`mission_id` 只收窄条目，不改 counts。纯读：无事件、无 revision 变化，适合日常巡检。
 
 ### 2.5 spawn reviewer
 
@@ -105,14 +115,15 @@ tower({action:"status", observe:true})         // 附带 git 实况观察
 tower({action:"spawn", mission_id:"M1", role:"reviewer", provider:"...", model:"..."})
 ```
 
-- 前置：mission 为 `worker_completed`（或 `approved`/`changes_requested` 复审），worktree 干净。
+- 前置：mission 为 `worker_completed`（或 `review_failed` 重试、`approved`/`changes_requested` 复审），worktree 干净。
 - 预期输出：在 worker 的字段之外多了 `binding: { baseCommit, reviewedCommit }`——审查证据绑定精确 SHA，base 或 tip 任何移动都需要重新审查。
+- 落定结果：正常返回结构化结论 → `approved`（clean 且 merge=true）或 `changes_requested`；reviewer 进程错误、被中断或未返回结构化结论 → `review_failed`（`spawn-failed` 事件，`review.error` 有诊断）；审查期间绑定漂移 → 回 `worker_completed` 且 `review.stale:true`（见 3.6）。
 - 失败与 next action：
   - `REVIEW_START_BLOCKED`：状态不对（如 `pending`、`worker_failed`），先把 worker 跑完。
   - `WORKTREE_DIRTY`：worktree 有未提交/未跟踪文件。派 worker 收尾（commit 或清理）。
   - `NO_CHANGE`：mission tip 与当前 base 相同，没有可审内容。
   - `STALE_BASE`：当前 base 已不是 mission tip 的祖先，先 `rebase`。
-  - reviewer 落定后 `review.stale:true`：见 3.6。
+  - 落定后 `review_failed`：见 3.7 重试。
 
 ### 2.6 gate
 
@@ -130,18 +141,18 @@ tower({action:"gate", mission_id:"M1"})
 tower({action:"merge", mission_id:"M1"})
 ```
 
-返回形态一览（完整语义见 `lib/core.js` `TowerCore.merge`）：
+返回形态一览（完整语义见 [lib/core.js](../lib/core.js) `TowerCore.merge`）：
 
 | 返回字段组合 | 含义 | 下一步 |
 |---|---|---|
 | `merged:true, advanced:false, mergeCommit` | 正常合并，mission → `merged`，`state.baseCommit` 前进 | `teardown` |
 | `merged:true, advanced:true, branchTip` | 合并成功但 worktree tip 已超过被审 tip；状态回 `worker_completed`，review 清空 | 对新增提交重新 `spawn` reviewer，再 merge |
-| `merged:true, reconciled:true`（或 `alreadyMerged:true`） | base 已包含被审 SHA，做记账式对账 | 无需动作，可 `teardown` |
+| `merged:true, reconciled:true`（或对已 `merged` 的 mission 重复 merge 得 `alreadyMerged:true`） | base 已包含被审 SHA，做记账式对账 | 无需动作，可 `teardown` |
 | `merged:false` + `gate.blocks` | gate 拦截，未执行 git merge | 按 §4 修复 |
 | `merged:false` + `error` + `recoveryRequired`（可能含 `abortError`/`remainingMergeState`/`restoredHead`/`clean`） | git merge 失败，tower 已尝试 `merge --abort`，mission → `merge_blocked` | 见 3.2 |
 | `merged:false, mergeAttempted:true, verified:false, recoveryRequired:true, postMerge:true` | git 层合并完成但其后核对/落账失败 | 见 3.3 |
 
-- 失败与 next action（工具层错误）：`MISSION_NOT_FOUND` 检查 id；若整个调用抛出非 gate 类异常，先 `status observe:true` 再对号入座。
+- 失败与 next action（工具层错误）：`MISSION_NOT_FOUND` 检查 id；merge 还有一种特殊**返回**形态 `merged:true, recoveryRequired:true, postMerge:true`（git 已成功、随后核对/落账失败），处置同 3.3；若整个调用抛出其它非 gate 类异常，先 `status observe:true` 再对号入座。
 
 ### 2.8 teardown
 
@@ -152,18 +163,23 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 - 预期输出：`{ results: [{ mission, removed:true }], state }`。只移除**终态、干净、已在 git 注册**的 worktree；分支与 state 永远保留。
 - 幂等与拒绝条件详见 3.9。
 
-### 2.9 辅助动作
+### 2.9 其它动作
 
-- `edit`：修正尚未派生的 mission 元数据（`title`/`description`/`scope`/`depends_on`；仅 `pending`，校验依赖环 `DEPENDENCY_CYCLE`）。
-- `rebase`：把 mission 分支变基到当前 base（详见 3.1 的失败路径）。成功且 tip 变化时会清空 review 并回到 `worker_completed`——**变基之后必须重新审查**。
-- `abandon`：mission → `abandoned`，工件保留，交给 `teardown` 清理；依赖它的 mission 视依赖为已解决。
+- `edit`：修正尚未派生的 mission 元数据（`title`/`description`/`scope`/`depends_on`；仅 `pending`，校验重复依赖与依赖环 `DEPENDENCY_CYCLE`）。校验规则与 `add` 一致（§2.2）；未提供的字段保持原值。
+- `rebase`：把 mission 分支变基到当前 base（失败路径见 3.1）。返回 `{ rebased:true, reviewRequired, previousTip, tip, mission }`。`reviewRequired:true` 表示旧审查已失效（review 清空、状态回 `worker_completed`）——触发条件是 **tip 变化，或审查绑定的 base/reviewed SHA 与当前不一致**：即使 tip 没动，base 前进也会使审查失效。`reviewRequired:false` 的真 no-op：既有结论原样保留（`approved`/`changes_requested` 不变）；对 `review_failed` 的 no-op 变基则保持 `review_failed`（失败记录不因变基消失，重派 reviewer 即可）。**变基之后凡 `reviewRequired:true` 必须重新审查。**
+- `abandon`：mission → `abandoned`，工件保留，交给 `teardown` 清理；依赖它的 mission 视依赖为已解决。`merged` mission 不可 abandon（`MISSION_MERGED`），运行中不可 abandon（`AGENT_BUSY`）。
 - `send` / `interrupt`：向当前运行中的 worker/reviewer 递话/取消（`AGENT_NOT_RUNNING` 表示没有活跃子代理可寻址）。
 - `recover`：处置跨重启的僵尸 running 记录，语义见 3.8。
 - `models`：查询 provider 目录/精确路由元数据，不做任何仓库操作。
 
+### 2.10 运行期通知（保证送达 + 僵尸提示）
+
+- **结算通知保证送达**（[lib/runtime.js](../lib/runtime.js) `track`/`settlementNotice`）：每个 worker/reviewer 落定都会向控制器 Session 递一条形如 `Tower <role> for <mission> <outcome>: mission status <status>` 的通知；`failed`/`interrupted`/`stale` 结局附带截断到 500 字符的 `reason` 与 next action（如 `review_failed` → `spawn a fresh reviewer when ready`）。即使 state 落账或投影发布失败，通知仍会送达（最差退化为点名 role/mission/run/error 并提示 `tower action=status`）；投递本身失败则记 error 日志，绝不静默。
+- **`agent/created` 僵尸提示**：Host 重启后，任何新 agent 创建时，runtime 会按其当前工作目录解析仓库，读取 tower state，把该 Session 名下仍标记 `worker_running`/`review_running`、但本运行时不再拥有的激活列成一条通知（每个 run 一次，不重复打扰），建议执行 `tower action=recover`。提示只发给记录中的控制器 Session；探测失败只记警告，不影响 agent 创建。
+
 ## 3. 故障场景 Runbook
 
-每个场景按「症状 / 诊断 / 安全处理 / 何时不应重试」组织。诊断命令统一列在附录 A。
+每个场景按「症状 / 诊断 / 安全处理 / 何时不应重试」组织。诊断命令统一列在附录 A，只读体检脚本见附录 C。
 
 ### 3.1 `rebase_blocked`
 
@@ -195,7 +211,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 - 安全处理：
   - 若被审 SHA 确已包含在 base 中：直接重试 `tower({action:"merge"})`。gate 会识别 `alreadyMerged`，这次执行**记账式对账**（事件 `mission-merge-reconciled`，mission → `merged`，返回 `merged:true, reconciled:true`），不会产生第二笔 merge commit。
   - 若 base 不包含被审 SHA 且顶端不是预期 merge commit：说明 git merge 实际没成，按 3.2 处置。
-  - 特例：若工具调用整体抛错但返回体含 `merged:true, recoveryRequired:true, postMerge:true`——git 已成功、state 写入失败——处理方式相同：先诊断，再重试 merge 让对账收尾。
+  - 变体形态 `merged:true, recoveryRequired:true, postMerge:true`（附 `error`）：git 合并已成功但其后的 state 写入抛错，merge 捕获后按 `alreadyMerged` 证据返回该形态——处理方式相同：先诊断确认 base 事实，再重试 `merge` 让对账收尾。
 - 何时不应重试：base 脏（`BASE_DIRTY`）或处在 merge 中间态时；以及尚未用只读命令确认 base 事实之前——盲目重试在"其实没合并成功"的情形下会走 3.2 的冲突路径。
 
 ### 3.4 `alreadyMerged` 对账
@@ -207,47 +223,50 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 
 ### 3.5 state 写入失败后的 reconciliation
 
-- 症状：git 操作已发生，但 `.dsh-tower/state.json` 没跟上——例如 merge 成功后进程被杀（`lib/store.js` 的写入是临时文件 + 原子 rename，不会写出半份文件，但"git 已变、state 未写"的窗口真实存在）。表现为：mission 状态与 git 事实矛盾、事件时间线缺尾、或 3.3 的 `postMerge` 形态。
-- 诊断：一律从 `tower({action:"status", observe:true})` 开始，把持久化字段与 `observations`（`checkedOutBranch`/`baseTip`/`baseStatus`/每 mission 的 `tip` 与 `status.clean`）逐项对照；再辅以附录 A 的祖先关系检查。state 里的 `events` 尾部（附录 B）能看出最后一次成功落账到哪一步。
+- 症状：git 操作已发生，但 `.dsh-tower/state.json` 没跟上——例如 merge 成功后进程被杀、pending 基线同步快进后 state 写入失败。表现为：mission 状态与 git 事实矛盾、事件时间线缺尾、或 3.3 的 `postMerge` 形态。
+- 写入机制（[lib/store.js](../lib/store.js) `TowerStore.write`）：先写临时文件 `<state.json>.<pid>.<uuid>.tmp`，再原子 rename 替换；**写或 rename 失败时会尽力清理本次的临时文件**（只删自己这份，不动无关临时文件与既有 state），然后原样重抛原始错误。注意：state 写失败不会回滚之前已发生的 git 操作。
+- 诊断：一律从 `tower({action:"status", observe:true})` 开始，把持久化字段与 `observations`（`checkedOutBranch`/`baseTip`/`baseStatus`/每 mission 的 `tip` 与 `status.clean`）逐项对照；再辅以附录 A 的祖先关系检查，或直接跑 `node scripts/tower-doctor.mjs`（附录 C）。state 里的 `events` 尾部（附录 B）能看出最后一次成功落账到哪一步。
 - 安全处理：tower 各动作自带保守对账，**用重试对应动作来收敛，而不是改 state**：
   - merge 已成、state 未记 → 重试 `merge`，走 3.4 的记账式对账（`mission-merge-reconciled`）。
+  - pending 基线同步快进成功、state 未记 → 重试 `spawn` worker（快进幂等，条件仍满足）。
   - add 中断留下的分支/worktree → 重试同 id 的 `add`，满足条件时收编（`mission-artifacts-reconciled`，mission 带 `reconciled:true`）；不满足则 `MISSION_ARTIFACT_CONFLICT`，见 3.10。
   - worktree 已被外部删掉 → 重试 `teardown`，路径在磁盘与 git 注册表中都不存在时补记 `worktreeRemoved`（`worktree-remove-reconciled`）。
   - running 记录跨重启悬置 → `recover`（3.8）。
-- 何时不应重试：对账动作本身连续失败、或 `observe` 显示 git 事实自相矛盾（如 base 处于 merge 中间态）时，停下来按 3.2/3.11 做只读排查；对账不收敛说明有更底层的问题。
+- 何时不应重试：对账动作本身连续失败、或 `observe`/doctor 显示 git 事实自相矛盾（如 base 处于 merge 中间态）时，停下来按 3.2/3.11 做只读排查；对账不收敛说明有更底层的问题。
 
 ### 3.6 reviewer stale / `REVIEW_BASE_STALE` / `REVIEW_TIP_STALE`
 
 - 症状：
   - reviewer 运行期间绑定漂移：落定记录 `review.stale:true`、`error:"review binding became stale while the reviewer was running; spawn a fresh reviewer"`，mission 回 `worker_completed`（结论作废，不采信其 verdict）。
   - merge 前 gate 给出 `REVIEW_TIP_STALE`（审查时的 tip ≠ 当前 tip）或 `REVIEW_BASE_STALE`（审查时的 base ≠ 当前 base）。
+  - 与 `review_failed` 的区别：stale 是「审查有效期内绑定动了、结论作废」；`review_failed` 是「reviewer 根本没产出结构化结论」（§3.7）。结算通知中 stale 结局会给出 `tower action=rebase` 指引。
 - 诊断：`status` 读 `review.baseCommit`/`review.reviewedCommit`，与 `observe:true` 的 `baseTip`、mission `tip` 比对，确认是哪一端动了。
 - 安全处理：
-  - base 动了（别处 merge 推进了 base）：`tower({action:"rebase"})`；成功后旧 review 被清空、mission 回 `worker_completed`，重新 `spawn` reviewer → gate → merge。
+  - base 动了（别处 merge 推进了 base）：`tower({action:"rebase"})`；返回 `reviewRequired:true`（即使 tip 未变，base 变化同样触发），旧 review 被清空、mission 回 `worker_completed`，重新 `spawn` reviewer → gate → merge。
   - tip 动了（审查期间 worktree 又有提交）：直接重新 `spawn` reviewer（从 `worker_completed`/`changes_requested` 均可），新审查绑定新 SHA。
   - reviewer 进程还在跑而绑定已漂移：先 `interrupt` 再重派，避免旧结论晚到覆盖。
 - 何时不应重试：绑定漂移的根因未明（例如有人手工在 worktree 提交）之前不要急着重派审查——先弄清谁动了 tip，否则新审查还会再 stale 一次。
 
-### 3.7 `worker_failed` 重试
+### 3.7 `worker_failed` / `review_failed` 重试
 
-- 症状：worker 落定后 mission → `worker_failed`。两类典型：进程异常（`stopReason ≠ completed`，`worker.error` 有诊断）与脏收尾（`error:"worker finished with uncommitted or untracked files; commit or clean them before review"`，附 `dirtyEntries`）。`spawn` 本身失败（`failSpawn`）也落此状态。
-- 诊断：`status` 读 `worker.stopReason`、`worker.error`、`worker.dirtyEntries`；需要更多上下文时 `send` 询问仍在线的 worker，或查看其子代理会话。
-- 安全处理：`worker_failed` 在 `WORKER_RESTARTABLE` 中，直接重派：`tower({action:"spawn", role:"worker"})`，在 instructions 里点名要处理的事项（先 commit / 清理 untracked / 修复报错）。注意两点：
-  - 重派 worker 会**清空既有 review 记录**（`beginSpawn` 的既定行为），完成后需要完整重审。
-  - 若上一轮是 `changes_requested` 后的返工失败，worker 的任务简报会自动附带上一轮审查反馈（`workerBrief` 注入 `previousReview`）。
-- 何时不应重试：同一失败连续复现（说明任务本身有问题，改 mission 或 `abandon`）；worktree 处于 rebase/merge 中间态（先按 3.1/3.2 清理）；或 `worker` 记录显示问题是环境性的（如路由不可用，`MODEL_ROUTE_*`）而未先修环境。
+- 症状：worker 落定后 mission → `worker_failed`：进程异常（`stopReason ≠ completed`，`worker.error` 有诊断）、脏收尾（`error:"worker finished with uncommitted or untracked files; ..."`，附 `dirtyEntries`）或 `spawn` 本身失败（`failSpawn`）。reviewer 落定后 mission → `review_failed`：进程错误、被中断、未返回结构化结论（`error:"reviewer did not return a structured verdict"` 或 diagnostic）或 spawn 失败；事件均为 `spawn-failed`。两者的结算通知都保证送达（§2.10）。
+- 诊断：`status`（或 `summary` 概览）读对应记录的 `stopReason`、`error`、`dirtyEntries`；需要更多上下文时 `send` 询问仍在线的 agent，或查看其子代理会话。
+- 安全处理（两个状态都在各自的重启集合里，直接重派）：
+  - `worker_failed` → `tower({action:"spawn", role:"worker"})`，instructions 里点名要处理的事项（先 commit / 清理 untracked / 修复报错）。重派 worker 会**清空既有 review 记录**（`beginSpawn` 的既定行为），完成后需要完整重审；若上一轮是 `changes_requested` 后的返工失败，worker 任务简报会自动附带上一轮审查反馈。脏 worktree 会保留给新 worker 修复（不自动清理）。
+  - `review_failed` → 二选一：`tower({action:"spawn", role:"reviewer"})` 重试审查（新 run 绑定当前 SHA）；或 `tower({action:"spawn", role:"worker"})` 直接返工（会清空失败记录与既有 review）。merge gate 在拿到 clean 审查前持续报 `NOT_APPROVED`。
+- 何时不应重试：同一失败连续复现（说明任务本身有问题，改 mission 或 `abandon`）；worktree 处于 rebase/merge 中间态（先按 3.1/3.2 清理）；或 `error` 显示问题是环境性的（如 `429` 限流、路由不可用 `MODEL_ROUTE_*`）而未先修环境/换路由。
 
 ### 3.8 `recover` 的语义
 
-- 语义（`lib/core.js` `TowerCore.recover`）：把**持久化**为 `worker_running`/`review_running`、且其 `runId` 不属于当前运行时活跃集合的记录，标记为已中断——`stopReason:"aborted"`、`error:"activation is not owned by this runtime; ..."`，worker 侧 mission → `worker_failed`，reviewer 侧 mission → `worker_completed` 且 `review.stale:true`。它**只改标记，绝不接管旧进程**：不会向旧子代理发消息，也不会替它收尾。
-- 症状（需要 recover 的信号）：Host/控制器重启后，mission 永远停在 `worker_running`/`review_running`，任何 spawn 被 `AGENT_BUSY` 拒绝。
+- 语义（[lib/core.js](../lib/core.js) `TowerCore.recover`）：把**持久化**为 `worker_running`/`review_running`、且其 `runId` 不属于当前运行时活跃集合的记录，标记为已中断——`stopReason:"aborted"`、`error:"activation is not owned by this runtime; ..."`；worker 侧 mission → `worker_failed`，reviewer 侧 mission → **`review_failed`**（记录同时置 `stale:true`）。它**只改标记，绝不接管旧进程**：不会向旧子代理发消息，也不会替它收尾。
+- 症状（需要 recover 的信号）：Host/控制器重启后，mission 永远停在 `worker_running`/`review_running`，任何 spawn 被 `AGENT_BUSY` 拒绝。重启后第一个新 agent 创建时通常已收到 §2.10 的僵尸提示通知。
 - 诊断：`status` 确认悬置的 role 与 `runId`。注意 `recover` 只会把「当前运行时不认领」的 runId 标记为中断；旧 Host 进程的活跃与否对当前运行时不可见，必须由操作者在进程层面确认它确实已停止。
-- 安全处理：**先确认旧控制器确实停止**（这是 `recover` 的前提，README "Failure recovery" 同义），再 `tower({action:"recover"})`。返回 `{ recovered: [{ mission, role, runId }], state }`。随后：worker 侧按 3.7 重派；reviewer 侧 mission 已回 `worker_completed`，直接重派 reviewer。
+- 安全处理：**先确认旧控制器确实停止**（这是 `recover` 的前提，README "Failure recovery" 同义），再 `tower({action:"recover"})`。返回 `{ recovered: [{ mission, role, runId }], state }`。随后：worker 侧按 3.7 重派；reviewer 侧 mission 已是 `review_failed`，直接重派 reviewer。
 - 何时不应重试（不应执行 recover）：旧 Host 进程可能仍在运行时——它的 worker/reviewer 落定回调仍会写 state，和 recover 的标记互相覆盖，制造真正的竞态。先停旧进程，再 recover，一次即可（幂等：没有可回收记录时返回空 `recovered`）。
 
 ### 3.9 `teardown` 的幂等与拒绝条件
 
-- 语义（`lib/core.js` `TowerCore.teardown`）：逐 mission 判定，结果在 `results[]`，每项互不阻塞。只删 worktree；分支与 state 永远保留。
+- 语义（[lib/core.js](../lib/core.js) `TowerCore.teardown`）：逐 mission 判定，结果在 `results[]`，每项互不阻塞。只删 worktree；分支与 state 永远保留。
 - 各返回形态：
   - `removed:true`：正常移除（终态 + 干净 + git 已注册）。
   - `removed:true, reconciled:true`：磁盘与 git 注册表都不存在该路径，补记 `worktreeRemoved`（对账式幂等）。
@@ -260,7 +279,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 
 ### 3.10 孤儿 worktree / branch
 
-- 症状：`git worktree list` 里存在 `.dsh-tower/worktrees/*` 或 `git branch --list 'tower/*'` 有分支，但 state 里没有对应 mission（state 丢失/损坏后重建、或历史 `MISSION_ARTIFACT_CONFLICT` 遗留）；或 `add` 重试报 `MISSION_ARTIFACT_CONFLICT`。
+- 症状：`git worktree list` 里存在 `.dsh-tower/worktrees/*` 或 `git branch --list 'tower/*'` 有分支，但 state 里没有对应 mission（state 丢失/损坏后重建、或历史 `MISSION_ARTIFACT_CONFLICT` 遗留）；或 `add` 重试报 `MISSION_ARTIFACT_CONFLICT`。`node scripts/tower-doctor.mjs` 会以 `ORPHAN_WORKTREE` 直接点名（注册未引用与磁盘残留两种都查）。
 - 诊断（全部只读）：`git worktree list --porcelain`、`git for-each-ref refs/heads/tower/`、对每个孤儿分支 `merge-base --is-ancestor <tip> <baseBranch>` 判断其提交是否已在 base 中，`log --oneline <baseBranch>..<tip>` 看有无 base 之外的独有提交。
 - 安全处理：
   - 想收编（推荐）：重试 `tower({action:"add", id:"<原id>"})`。仅当分支与注册 worktree 完全匹配、worktree 干净、检出该分支、且 tip 是当前 base 的祖先（无独有提交）时，tower 自动收编（`mission-artifacts-reconciled`，`reconciled:true`，状态 `pending`）；随后按需走完流程或 `abandon` + `teardown`。
@@ -270,52 +289,52 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 
 ### 3.11 `.dsh-tower/state.json` 损坏（只读诊断）
 
-- 症状：所有 tower 动作（含 `status`）抛 `STATE_INVALID`（消息形如 `could not parse ...state.json: ...` 或字段校验失败——校验规则见 `lib/store.js` `validateState`：version=1、repoRoot 绝对路径、mission 必填字段、status 枚举、revision 正整数、id 去重）。文件整个缺失则是 `TOWER_NOT_INITIALIZED`。
+- 症状：所有 tower 动作（含 `status`）抛 `STATE_INVALID`（消息形如 `could not parse ...state.json: ...` 或字段校验失败——校验规则见 [lib/store.js](../lib/store.js) `validateState`：version=1、repoRoot 绝对路径、mission 必填字段、status 枚举、revision 正整数、id 去重）。文件整个缺失则是 `TOWER_NOT_INITIALIZED`。
 - 诊断（只读）：
+  - `node scripts/tower-doctor.mjs`（真实用法与退出码见附录 C）：在仓库根对账 state 与 git——结构校验（`STATE_CORRUPT`/`STATE_VERSION`/字段错误）、repo 一致性（`REPO_MISMATCH`）、base 分支与 `baseCommit` 漂移/分叉（`BASE_COMMIT_DRIFT`/`BASE_COMMIT_DIVERGED`）、mission 分支存在性、worktree 注册与磁盘一致性、孤儿 worktree、已合并 mission 的 `mergeCommit` 祖先关系、teardown 一致性，以及「状态仍是 running 但记录看起来已结束」的悬置激活（`RUNNING_RECORD_FINISHED` → 提示 `tower recover`）。它只报告、不修复。
   - `python3 -m json.tool <repo>/.dsh-tower/state.json`（或 `jq .`）：区分「JSON 语法损坏」与「结构校验失败」。
   - `git worktree list --porcelain` + `git for-each-ref refs/heads/tower/`：盘点 git 侧事实（哪些分支/worktree 存在、tip 在哪）。
   - `git log --oneline --grep="Tower: " <baseBranch>`：从 merge commit 标题反推哪些 mission 已合入。
-  - `scripts/tower-doctor.mjs`（M12 交付中，**当前 base 尚未包含**）：期望用法为 `node scripts/tower-doctor.mjs`，在仓库根只读对账 state 与 git（worktree/branch/已合并 SHA 差异报告），不修改任何文件。合入前请用上述命令人工完成同样的对账。
 - 安全处理：
   - **先备份再谈修复**：`cp .dsh-tower/state.json state.json.bak.<时间戳>`（复制是只读于原文件的保险动作）。
-  - base 版本没有 state 修复工具，也**禁止手工编辑 state.json** 拼回一个"看起来对"的文件——半对的 state 比损坏的 state 更难排查。
+  - 没有 state 修复工具，也**禁止手工编辑 state.json** 拼回一个"看起来对"的文件——半对的 state 比损坏的 state 更难排查。
   - 重建的唯一受支持路径是让 tower 自己写 state：把损坏文件移出 `.dsh-tower/`（保留备份），`tower({action:"init"})` 建立全新 state，再用**同 id** 逐个 `add`——满足收编条件的分支/worktree 会被 `mission-artifacts-reconciled` 重新登记；已合并过的 mission 收编后状态为 `pending`，将其 `abandon`（其提交已在 base 中，无需重做）或按需重走审查。独有提交的分支不会被收编，按 3.10 人工处置。
   - 此流程属于灾难恢复，执行前与仓库 owner 确认，全程对照第一步的 git 事实清单。
-- 何时不应重试：损坏原因未查明（例如磁盘满、并发写入）之前不要急着重建，否则新 state 可能再次损坏；注意 `lib/store.js` 的写入是临时文件 + 原子 rename，正常单控制器使用不应产生语法损坏——若反复出现，先排查是否存在双进程控制（见 §5 禁令 2）。
+- 何时不应重试：损坏原因未查明（例如磁盘满、并发写入）之前不要急着重建，否则新 state 可能再次损坏；注意 `lib/store.js` 的写入是临时文件 + 原子 rename 且失败即清理本次临时文件，正常单控制器使用不应产生语法损坏——若反复出现，先排查是否存在双进程控制（见 §5 禁令 2）。
 
 ## 4. Merge gate block code 速查表
 
-block 由 `lib/core.js` `TowerCore.evaluateMergeGate` 产生；`message`/`entries`/`files` 字段给出细节。按「先修 base 环境，再修 mission 工件，再修审查绑定」的顺序排查通常最快。
+block 由 [lib/core.js](../lib/core.js) `TowerCore.evaluateMergeGate` 产生；`message`/`entries`/`files` 字段给出细节。按「先修 base 环境，再修 mission 工件，再修审查绑定」的顺序排查通常最快。
 
 | code | 含义 | 修复动作 |
 |---|---|---|
-| `NOT_APPROVED` | mission 状态不是 `approved`/`merge_blocked`，没有可合并的 clean 审查 | 走完 worker → reviewer 流程；返工则重派 worker（3.7） |
+| `NOT_APPROVED` | mission 状态不是 `approved`/`merge_blocked`，没有可合并的 clean 审查（`review_failed`/`worker_failed`/`changes_requested` 都会落在这） | 走完 worker → reviewer 流程；失败重派见 3.7；返工则重派 worker |
 | `DEPENDENCIES_NOT_MERGED` | `depends_on` 中有 mission 未达终态 | 先推进/合并（或 `abandon`）依赖 mission |
 | `WORKTREE_REMOVED` | mission 的 worktree 已被 teardown 移除 | 终局状态：worktree 没了无法再合并；如仍需要该改动，新开 mission |
 | `BASE_DIRTY` | 主工作区有未提交/未跟踪文件（附 `entries`） | 在主工作区提交或清理；**不要**为了过 gate 把无关改动混进 base |
 | `BASE_MISMATCH` | 主工作区检出的不是 `state.baseBranch`（含 detached HEAD） | 检出 base 分支再 merge |
 | `WORKTREE_DIRTY` | mission worktree 有未提交/未跟踪文件（附 `entries`） | 派 worker 收尾（commit 或清理，3.7） |
 | `NO_CHANGE` | mission tip 与当前 base 相同 | 无可合并内容：要么 worker 实际没提交（重派），要么成果已被合入（对照 3.4） |
-| `STALE_BASE` | 当前 base 不是 mission tip 的祖先 | `tower({action:"rebase"})`，冲突则走 3.1；变基后必须重新审查 |
+| `STALE_BASE` | 当前 base 不是 mission tip 的祖先 | `tower({action:"rebase"})`，冲突则走 3.1；变基后必须重新审查（pending 首次派发时的同名错误见 §2.3，语义是"有独有提交，先显式变基"） |
 | `NO_CLEAN_REVIEW` | 没有 verdict=clean 且 merge=true 的审查记录（或 review 被清空） | `spawn` reviewer 获得有效审查 |
 | `REVIEW_TIP_STALE` | 审查绑定的 tip ≠ 当前 tip（审查后又出现提交） | 对新 tip 重新 `spawn` reviewer（3.6） |
-| `REVIEW_BASE_STALE` | 审查绑定的 base ≠ 当前 base（审查后 base 前进） | `rebase` 后重新审查（3.6） |
+| `REVIEW_BASE_STALE` | 审查绑定的 base ≠ 当前 base（审查后 base 前进） | `rebase` 后重新审查（3.6；即使 tip 未变，base 变化也使审查失效） |
 | `OUT_OF_SCOPE` | 变更触及 scope 之外的文件（附 `files`） | 派 worker 把越界改动撤回/移入合规路径；确属任务必需则用 `edit` 扩 scope（仅 `pending` 可改——已派生的 mission 只能让 worker 收敛改动） |
 | （非 block）`alreadyMerged:true` | 被审 SHA 已在 base 且仍等于 mission tip | 不是故障：直接 `merge` 走记账式对账（3.4） |
 
 ## 5. 风险与禁令
 
-1. **禁止手工编辑 `.dsh-tower/state.json`。** `lib/store.js` 的 `TowerStore` 是唯一写入方（校验 + 原子替换）。手工拼 state 会绕过所有一致性检查，制造出工具永远无法推导的僵尸状态；损坏走 3.11。
-2. **禁止两个 Host 进程同时充当同一仓库的控制器。** 归属仲裁（`lib/runtime.js` `claimWorkspace`，`WORKSPACE_BUSY`）与 store 的串行队列都是**单进程内**的机制，不是跨进程 Git 锁（README "Deliberate limits" 明示）。双进程并发会产生真正的写写竞态。
+1. **禁止手工编辑 `.dsh-tower/state.json`。** [lib/store.js](../lib/store.js) 的 `TowerStore` 是唯一写入方（校验 + 临时文件 + 原子替换 + 失败清理本次临时文件）。手工拼 state 会绕过所有一致性检查，制造出工具永远无法推导的僵尸状态；损坏走 3.11。
+2. **禁止两个 Host 进程同时充当同一仓库的控制器。** 归属仲裁（[lib/runtime.js](../lib/runtime.js) `claimWorkspace`，`WORKSPACE_BUSY`）与 store 的串行队列都是**单进程内**的机制，不是跨进程 Git 锁（README "Deliberate limits" 明示）。双进程并发会产生真正的写写竞态。
 3. **不要在 dirty base 上 merge。** gate 的 `BASE_DIRTY` 是保护而非障碍：merge 会移动 base 分支，脏主工作区会让后果不可逆。先提交或清理主工作区。
 4. **不要绕过 gate 手工 `git merge` mission 分支。** 绕过会破坏「审查绑定精确 SHA」的对账模型（`alreadyMerged` 判定、merge 记账、依赖解锁全部依赖它）。需要紧急合入时，也先让 tower 完成 gate → merge；事后对账按 3.4。
-5. **reviewer 的只读是约定不是沙箱。** 任务简报要求 reviewer 只读（`lib/runtime.js` `reviewerBrief`），但没有进程级隔离；不要把敏感仓库的审查交给不受信路由（配合 `allowedModels` 收紧）。
+5. **reviewer 的只读是约定不是沙箱。** 任务简报要求 reviewer 只读（[lib/runtime.js](../lib/runtime.js) `reviewerBrief`），但没有进程级隔离；不要把敏感仓库的审查交给不受信路由（配合 `allowedModels` 收紧）。
 6. **不要手工删除 worktree 目录或 `tower/*` 分支来"清理"。** teardown 的保守判定（注册、终态、干净、路径前缀校验）就是为了安全清理；手工删除会把 state 与 git 事实撕开，制造 3.10 的孤儿场景。唯一例外见 3.10 的独有提交分支人工处置。
 7. **不要在 mission 中途切换/重置 base 分支。** tower 锚定 init 时的 base 分支（`BASE_CONFLICT`）；中途换 base 等于让所有审查绑定与依赖图失效。
 
 ## 附录 A：只读诊断命令清单
 
-与 `lib/git.js` 各 helper 的探测逻辑一一对应（`status`/`currentBranch`/`isAncestor`/`changedFiles`/`rebaseInProgress`，以及 `lib/core.js` `recoverMergeFailure` 对 `MERGE_HEAD` 的探测）：
+与 [lib/git.js](../lib/git.js) 各 helper 的探测逻辑一一对应（`status`/`currentBranch`/`isAncestor`/`changedFiles`/`rebaseInProgress`，以及 [lib/core.js](../lib/core.js) `recoverMergeFailure` 对 `MERGE_HEAD` 的探测）：
 
 ```bash
 # base 侧
@@ -334,18 +353,19 @@ git -C <worktree> rev-parse --git-path rebase-merge         # rebase 中间态�
 
 # state 侧（只读）
 python3 -m json.tool <repo>/.dsh-tower/state.json           # 语法/结构检查（STATE_INVALID 复现）
+node scripts/tower-doctor.mjs [--repo <repo>] [--json]      # state ↔ git 对账体检（附录 C）
 ```
 
-## 附录 B：`state.events` 事件类型（`lib/core.js` `appendEvent`）
+## 附录 B：`state.events` 事件类型（[lib/core.js](../lib/core.js) `appendEvent`）
 
-`status` 返回最近 20 条，按时间排序，用于还原「最后一次成功落账到哪一步」：
+state 内保留最近 200 条，`status` 返回最近 20 条，按时间排序，用于还原「最后一次成功落账到哪一步」：
 
 | 事件 | 触发 |
 |---|---|
 | `initialized` | `init` 建立新 state |
 | `mission-added` / `mission-edited` | `add` / `edit` |
 | `mission-artifacts-reconciled` | `add` 重试收编既有分支/worktree（3.10） |
-| `spawn-started` / `spawn-attached` / `spawn-failed` / `spawn-completed` | 子代理生命周期（`spawn-completed` 带 mission 落定状态） |
+| `spawn-started` / `spawn-attached` / `spawn-failed` / `spawn-completed` | 子代理生命周期（`spawn-failed` 覆盖启动失败与 `worker_failed`/`review_failed` 落定，带 mission 落定状态；`spawn-completed` 带 mission 落定状态） |
 | `activation-recovered` | `recover` 标记僵尸激活（3.8） |
 | `mission-rebased` / `rebase-failed` | `rebase` 成功 / 失败（3.1，失败带 `recoveryRequired`） |
 | `mission-merged` | merge 成功落账 |
@@ -355,3 +375,32 @@ python3 -m json.tool <repo>/.dsh-tower/state.json           # 语法/结构检�
 | `merge-accounting-required` / `merge-verification-failed` | 合并后核对/落账失败（3.3） |
 | `mission-abandoned` | `abandon` |
 | `worktree-removed` / `worktree-remove-reconciled` | `teardown` 移除 / 对账补记（3.9） |
+
+## 附录 C：`scripts/tower-doctor.mjs` 速查
+
+只读体检脚本（[scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs)），对账 state 与 git 事实，**不做任何写入**（不改 state、不动 git）。
+
+```bash
+node scripts/tower-doctor.mjs                     # 体检当前工作目录所在仓库
+node scripts/tower-doctor.mjs --repo <path>       # 指定仓库
+node scripts/tower-doctor.mjs --state <file>      # 指定 state 文件（默认 <repo>/.dsh-tower/state.json）
+node scripts/tower-doctor.mjs --json              # 机器可读输出（findings + summary）
+node scripts/tower-doctor.mjs --help              # 用法
+```
+
+- 退出码：`0` = 全部检查通过；`1` = 有 warning；`2` = 有 error（或参数用法错误）。人类可读输出逐行列出 `[severity] code: message` 并汇总 `N checks passed, X warning(s), Y error(s)`。
+- 检查范围：state 结构（镜像 [lib/store.js](../lib/store.js) 规则）、repo 一致性、base 分支与 `baseCommit` 关系、每个 mission 的分支存在性 / worktree 注册与磁盘存在性 / 检出分支、已合并 mission 的 `mergeCommit` 是否可达自 base、teardown 一致性、悬置的 running 记录，以及 `.dsh-tower/worktrees/` 下的孤儿目录。
+- 常见 finding 与处置：
+
+| code（severity） | 含义 | 处置 |
+|---|---|---|
+| `STATE_CORRUPT` / `STATE_VERSION` / `STATE_MISSING`（error） | state 非法 JSON / 版本不支持 / 文件缺失 | 3.11（缺失则先 `init`） |
+| `REPO_MISMATCH`（warning） | `state.repoRoot` 与当前仓库不一致 | 确认是否在错误的仓库里跑 tower |
+| `BASE_COMMIT_DRIFT`（warning） | base 分支已超过记录的 `baseCommit` | 正常漂移；下次 merge/rebase 会用到新 tip |
+| `BASE_COMMIT_DIVERGED` / `BASE_BRANCH_MISSING`（error） | base 被重置/分叉或消失 | 禁令 7 场景，人工评估，勿盲目重试 |
+| `MISSION_BRANCH_MISSING` / `WORKTREE_DIR_MISSING`（active 时 error） | 非终态 mission 的分支/worktree 消失 | 3.10 / 3.11 排查 |
+| `WORKTREE_UNREGISTERED` / `WORKTREE_BRANCH_MISMATCH`（warning） | 目录存在但未注册 / 检出分支不对 | 3.10；`WORKTREE_BRANCH_MISMATCH` 也见 §2.3 |
+| `ORPHAN_WORKTREE`（warning） | worktree 目录无 mission 引用 | 3.10 |
+| `TEARDOWN_INCOMPLETE` / `WORKTREE_STILL_REGISTERED`（error） | `worktreeRemoved:true` 但目录/注册仍在 | 复核后人工清理（3.10 惟一例外） |
+| `MERGE_RECORD_MISSING` / `MERGE_COMMIT_NOT_IN_BASE`（error） | `merged` mission 记账不完整或不在 base | 3.4 / 3.5 对账 |
+| `RUNNING_RECORD_MISSING`（error）/ `RUNNING_RECORD_FINISHED`（warning） | running 状态但记录缺失 / 记录已结束 | 后者按提示执行 `tower action=recover`（3.8） |
