@@ -298,7 +298,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 - 安全处理：
   - **先备份再谈修复**：`cp .dsh-tower/state.json state.json.bak.<时间戳>`（复制是只读于原文件的保险动作）。
   - 没有 state 修复工具，也**禁止手工编辑 state.json** 拼回一个"看起来对"的文件——半对的 state 比损坏的 state 更难排查。
-  - 重建的唯一受支持路径是让 tower 自己写 state：把损坏文件移出 `.dsh-tower/`（保留备份），`tower({action:"init"})` 建立全新 state，再用**同 id** 逐个 `add`——满足收编条件的分支/worktree 会被 `mission-artifacts-reconciled` 重新登记；已合并过的 mission 收编后状态为 `pending`，将其 `abandon`（其提交已在 base 中，无需重做）或按需重走审查。独有提交的分支不会被收编，按 3.10 人工处置。
+  - 重建的唯一受支持路径是让 tower 自己写 state：把损坏文件移出 `.dsh-tower/`（保留备份），`tower({action:"init"})` 建立全新 state，再用**同 id** 逐个 `add`——满足收编条件的分支/worktree 会被 `mission-artifacts-reconciled` 重新登记；已合并过的 mission 收编后状态为 `pending`，将其 `abandon`（其提交已在 base 中，无需重做）或按需重走审查。独有提交的分支不会被收编，按 3.10 人工处置。完整步骤清单、代价与「能恢复什么 / 不能恢复什么」边界见 3.14。
   - 此流程属于灾难恢复，执行前与仓库 owner 确认，全程对照第一步的 git 事实清单。
 - 何时不应重试：损坏原因未查明（例如磁盘满、并发写入）之前不要急着重建，否则新 state 可能再次损坏；注意 `lib/store.js` 的写入是临时文件 + 原子 rename 且失败即清理本次临时文件，正常单控制器使用不应产生语法损坏——若反复出现，先排查是否存在双进程控制（见 §5 禁令 2）。
 
@@ -409,6 +409,59 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
   - **CHANGELOG 已有目标版本段**：`VERSION_ALREADY_RELEASED` 是重复发布保护。先核对目标段与 package 版本是否一致、是否属于历史发布；不一致时先人工修正状态，不要靠重跑覆盖。
   - **Git 检查失败或锁仍有效**：先修复 `GIT_CHECK_FAILED` 的根因，或等待有效锁释放。未改变根因的重试没有意义。
 
+### 3.14 状态恢复：state 损坏 / 误删后的重建与清理总入口
+
+`.dsh-tower/state.json` 是 tower 的唯一持久化账本（[lib/store.js](../lib/store.js) `TowerStore`）。本节是「state 坏了 / 没了 / 留下残留工件」后的总入口，按症状 → 诊断 → 安全处理 → 清理组织；细节语义在 3.5（写入失败对账）、3.8（`recover`）、3.9（`teardown`）、3.10（孤儿工件）、3.11（损坏的只读诊断），本节只补它们未覆盖的部分。
+
+- 症状（tower 动作与 doctor 的 code 是**两套**，按来源对号，不要混用关键词）：
+
+  | 场景 | tower 动作侧 | doctor 侧（[scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs)） |
+  |---|---|---|
+  | state 文件缺失 | `TOWER_NOT_INITIALIZED` | `STATE_MISSING`（error） |
+  | 非法 JSON / 顶层不是对象 | `STATE_INVALID`（消息形如 `could not parse ...state.json: ...`） | `STATE_CORRUPT`（error） |
+  | 结构校验失败 | `STATE_INVALID`（`validateState`：version=1、字段类型、status 枚举、revision 正整数、id 去重） | `STATE_VERSION` / `STATE_FIELD_INVALID` / `MISSION_FIELD_INVALID` / `MISSION_DUPLICATE`（error，规则镜像 store） |
+  | 文件存在但读不出（典型为权限） | 原样抛出底层 fs 错误（如 `EACCES`，store 只把 ENOENT 翻译成 `TOWER_NOT_INITIALIZED`） | `STATE_READ_FAILED`（error，配合 3.12 排查属主/权限） |
+
+  注意症状形态：store 的 `read` 先解析再校验（[lib/store.js](../lib/store.js)）。**文件缺失**时，除 `init`（幂等分支会新建 state）外的所有动作抛 `TOWER_NOT_INITIALIZED`；**文件损坏**时连 `init` 也一起失败——它的幂等分支同样要先读旧文件（[lib/core.js](../lib/core.js) `TowerCore.init`），读到坏文件照样抛 `STATE_INVALID`。诊断细节与只读命令见 3.11。
+
+- 诊断：
+  - **state 路径来源**：tower 动作固定使用仓库根下 `<stateDir>/state.json`（`stateDir` 是运行时配置，默认 `.dsh-tower`，工具调用参数**不能**覆盖）；doctor 默认取 `<repo>/.dsh-tower/state.json`，但可用 `--repo <path>` 与 `--state <file>` 检查任意位置（`--state` 指向 **state 文件本身**，不是目录）。
+  - `node scripts/tower-doctor.mjs --json`：结构化输出 `{ repo, statePath, findings: [{ code, severity, message, ... }], summary: { checksPassed, warnings, errors, exitCode } }`，每条 finding 携带定位字段（如 `mission`、`path`、`statePath`）。**覆盖边界**：state 读不出（缺失/非法/结构不过）时 doctor 提前返回，只剩 git 元数据属主与可写性检查（它们在读取 state 之前执行）；孤儿 worktree、mission 分支等依赖 state 的检查**不会运行**——残留工件必须用下面的 git 命令人工盘点。
+  - **残留工件盘点**（只读，详见附录 A / 3.10）：`git -C <repo> worktree list --porcelain`（注册的 worktree）与 `git -C <repo> branch --list 'tower/*'`（分支快扫；等价于附录 A 的 `for-each-ref refs/heads/tower/` 形式）；再用 `git -C <repo> log --oneline --grep="Tower: " <baseBranch>` 从 merge commit 标题反推哪些 mission 已合入（3.11 同款命令）。
+
+- 安全处理：
+
+  1. **先备份再动手**：`cp <repo>/.dsh-tower/state.json <repo>/state.json.bak.<时间戳>`。store 只保证原子写（临时文件 + rename），**没有自动备份机制**；损坏现场一旦被覆盖就彻底丢失。备份与移出的旧文件放在 `.dsh-tower/` 之外，不要放进 `worktrees/` 子目录。
+  2. **先分类再决定**：用 `python3 -m json.tool` 与 doctor 区分「语法损坏 / 结构校验失败 / 文件缺失 / 读取失败」；读取失败（`STATE_READ_FAILED` / 原始 `EACCES`）先按 3.12 修属主权限。损坏根因未查明（磁盘满、双进程并发，见 §5 禁令 2）之前不要急着重建，否则新 state 可能再次损坏（3.11 同款告诫）。
+  3. **先明确能恢复什么**——只有 git 可推导的事实能回来，只存在于 state 里的数据删了就是删了：
+
+     | 事实 / 数据 | 误删或重建 state 后 |
+     |---|---|
+     | 分支与 worktree 的存在 | 可恢复：git 事实仍在；同 id `add` 满足收编条件时自动重新登记（`mission-artifacts-reconciled`，见 3.10） |
+     | 已合入 base 的提交 | 可恢复：提交在 base 历史里，merge commit 标题 `Tower: <title> (<id>)` 可反推归属 |
+     | worktree 里的未合并提交 | 可恢复：只要 `tower/<id>` 分支还在，提交就在；孤儿分支按 3.10 评估价值后收编或人工处置 |
+     | 审查结论（review 记录、verdict、SHA 绑定） | **不可恢复**：只存在于 state；重建后 mission 从 `pending` 起步，要合并必须重新走完整审查 |
+     | 事件时间线（`state.events`）、revision 计数、时间戳 | **不可恢复**：随 state 丢失，无法从 git 重建 |
+     | mission 元数据（title/description/scope/depends_on） | 需人工重新提供：不在 git 里，重建 `add` 时对照原 mission 简报重写 |
+     | 终态标记（`merged`/`abandoned` 等） | 重建后一律为 `pending`：已合并的收编后 `abandon` 对账（提交已在 base，无需重做，见 3.11） |
+
+  4. **删除损坏 state 后重新 init**（3.11 的灾难恢复路径，完整语义见该节）：
+
+     ```text
+     ① 备份后把损坏的 state.json 移出 .dsh-tower/（init 幂等：目录里还有 state 时直接返回旧文件，所以必须先移走）
+     ② 确认主工作区检出 base 分支且干净，然后 tower({action:"init"})（BASE_MISMATCH/BASE_DIRTY 见 §2.1）
+     ③ 用原 id 逐个 tower({action:"add", ...})，人工重新提供 title/description/scope/depends_on
+     ④ 满足收编条件的分支/worktree 自动重新登记；有独有提交的不会被收编，按 3.10 人工处置
+     ⑤ 已合并过的 mission 收编后 abandon；依赖关系按原 depends_on 重挂，再逐个推进
+     ```
+
+     **代价**：历史 mission 记录（审查结论、事件时间线、revision/时间戳、元数据原值）永久丢失，重新登记的 mission 从 `pending` 起步。若 state 损坏时仍有 worker/reviewer 在跑（`status` 已不可用，§2.10 的结算通知也不会再送达），先在进程/会话层面确认并停止它们再动手——重建后它们写的任何 state 都会被新账本覆盖语义。执行前与仓库 owner 确认（3.11）。
+
+- 清理（残留 worktree / 分支）：
+  - **前提：没有运行中的 activation**。state 可用时以 `tower({action:"status"})` 确认没有任何 mission 处于 `worker_running`/`review_running`；若有且属于已停止的旧控制器，先 `tower({action:"recover"})` 标记中断（3.8，前提是旧 Host 确已停止）。worker 仍在使用的 worktree 绝不清理。
+  - 路由：**已登记** mission 的 worktree → `teardown`（只删终态、干净、已注册的，对账式幂等见 3.9）；**未登记**的孤儿 worktree/分支 → 3.10：优先同 id `add` 收编，确认无用才由人工执行 `git worktree remove <path>` 与 `git branch -D tower/<id>`——这是全手册**唯一**允许 git 写命令清理的场景（§5 禁令 6 的例外），且仅当分支无独有提交、或其价值已另行保全（cherry-pick/merge 到正式分支）之后；动手前逐字核对路径与分支名。
+- **何时不要手改 state.json**：store 是唯一写入方——`write` 先 `validateState` 校验、写 `<state.json>.<pid>.<uuid>.tmp` 再原子 rename、失败清理本次临时文件（3.5），`read` 读回时再次校验。手改没有任何校验器把关，两种结局都更糟：语法/结构非法 → 下一次任何动作的 `read()`（含 `init` 的幂等分支）直接抛 `STATE_INVALID`，全部动作瘫痪（即本节症状）；语法结构碰巧合法但语义错误 → 制造出工具永远无法推导的僵尸状态（§5 禁令 1）。替代做法全部走 tower 动作、由 store 统一写入与校验：改 mission 元数据 → `edit`（仅 `pending`）；悬置的 running 记录 → `recover`；清理已登记 worktree → `teardown`；state 损坏/误删 → 本节与 3.11 的重建流程。**没有任何场景需要用编辑器打开 state.json。**
+
 ## 4. Merge gate block code 速查表
 
 block 由 [lib/core.js](../lib/core.js) `TowerCore.evaluateMergeGate` 产生；`message`/`entries`/`files` 字段给出细节。按「先修 base 环境，再修 mission 工件，再修审查绑定」的顺序排查通常最快。
@@ -502,7 +555,8 @@ node scripts/tower-doctor.mjs --help              # 用法
 
 | code（severity） | 含义 | 处置 |
 |---|---|---|
-| `STATE_CORRUPT` / `STATE_VERSION` / `STATE_MISSING`（error） | state 非法 JSON / 版本不支持 / 文件缺失 | 3.11（缺失则先 `init`） |
+| `STATE_CORRUPT` / `STATE_VERSION` / `STATE_MISSING`（error） | state 非法 JSON / 版本不支持 / 文件缺失 | 3.11 / 3.14（缺失则先 `init`） |
+| `STATE_READ_FAILED`（error） | state 文件存在但读取失败（典型为权限，store 侧对应原始 fs 错误） | 3.14；属主/权限先按 3.12 排查 |
 | `REPO_MISMATCH`（warning） | `state.repoRoot` 与当前仓库不一致 | 确认是否在错误的仓库里跑 tower |
 | `BASE_COMMIT_DRIFT`（warning） | base 分支已超过记录的 `baseCommit` | 正常漂移；下次 merge/rebase 会用到新 tip |
 | `BASE_COMMIT_DIVERGED` / `BASE_BRANCH_MISSING`（error） | base 被重置/分叉或消失 | 禁令 7 场景，人工评估，勿盲目重试 |
