@@ -381,3 +381,164 @@ test('mission view unblocks when the dependency merges and stays empty without m
   assert.equal(missionCards(tree).length, 0);
   assert.match(textOf(tree), /还没有任务/);
 });
+
+test('missionDependencyDepths walks unfinished chains, ignores resolved links, and never loops', () => {
+  const { missionDependencyDepths } = harness().module;
+  // Results come from the vm realm, so collect entries into host structures.
+  const depthsOf = (missions) => Object.fromEntries(Object.entries(missionDependencyDepths(missions)));
+  const mission = (over = {}) => ({ id: 'X', title: 'task', status: 'pending', dependsOn: [], ...over });
+  // each unfinished link deepens by one; merged/abandoned and absent deps do not
+  assert.deepEqual(depthsOf([
+    mission({ id: 'A', status: 'worker_running' }),
+    mission({ id: 'B', dependsOn: ['A'] }),
+    mission({ id: 'C', dependsOn: ['B'] }),
+    mission({ id: 'R', status: 'merged' }),
+    mission({ id: 'K', status: 'abandoned' }),
+    mission({ id: 'Q', dependsOn: ['R', 'K'] }),
+    mission({ id: 'Z', dependsOn: ['gone'] }),
+    mission({ id: 'N', dependsOn: undefined }),
+  ]), { A: 0, B: 1, C: 2, R: 0, K: 0, Q: 0, Z: 1, N: 0 });
+  // a mission keeps the deepest of several unfinished branches
+  const diamond = depthsOf([
+    mission({ id: 'A', status: 'worker_running' }),
+    mission({ id: 'LEFT', dependsOn: ['A'] }),
+    mission({ id: 'MID', dependsOn: ['LEFT'] }),
+    mission({ id: 'TOP', dependsOn: ['MID', 'A'] }),
+  ]);
+  assert.deepEqual([diamond.LEFT, diamond.MID, diamond.TOP], [1, 2, 3]);
+  // cycles and self-references terminate deterministically with bounded values
+  const cyclic = [
+    mission({ id: 'P', dependsOn: ['Q'] }),
+    mission({ id: 'Q', dependsOn: ['P'] }),
+    mission({ id: 'S', dependsOn: ['S', 'P'] }),
+  ];
+  const first = depthsOf(cyclic);
+  assert.deepEqual(depthsOf(cyclic), first);
+  for (const value of Object.values(first)) assert.ok(Number.isInteger(value) && value >= 0 && value <= 8);
+  // depth stops growing at 8 even along a long fresh chain
+  const chain = [];
+  for (let i = 0; i <= 10; i += 1) {
+    chain.push(mission({ id: `D${i}`, dependsOn: i ? [`D${i - 1}`] : [], status: i ? 'pending' : 'worker_running' }));
+  }
+  const capped = depthsOf(chain);
+  assert.deepEqual([capped.D6, capped.D7, capped.D8, capped.D9, capped.D10], [6, 7, 8, 8, 8]);
+  // degenerate inputs stay safe
+  assert.deepEqual(depthsOf([]), {});
+  assert.deepEqual(Object.entries(missionDependencyDepths(undefined)), []);
+});
+
+// A tower whose missions form known dependency shapes for depth assertions.
+function chainTower() {
+  const tower = sampleTowerState();
+  const template = tower.missions[0];
+  const node = (id, dependsOn, over = {}) => ({
+    ...template, id, title: `Mission ${id}`, branch: `tower/${id.toLowerCase()}`, dependsOn,
+    status: 'pending', worker: undefined, review: undefined, merge: undefined, ...over,
+  });
+  tower.missions = [
+    node('M1', [], { status: 'merged' }), // merged template mission, no deps
+    node('ROOT', [], { status: 'worker_running' }),
+    node('L1', ['ROOT']),
+    node('L2', ['L1']),
+    node('DONE', [], { status: 'merged' }),
+    node('AFTERDONE', ['DONE']), // resolved dependency does not indent
+    node('MISSING', ['gone']), // missing dependency still blocks one level
+  ];
+  return tower;
+}
+
+function missionsView(harnessInstance) {
+  let tree = harnessInstance.render();
+  findAll(tree, has('data-tower-view-button', 'missions'))[0].props.onClick();
+  return harnessInstance.render();
+}
+
+test('mission view indents cards by unfinished dependency depth with guide rails', () => {
+  const tree = missionsView(harness(chainTower()));
+  const depth = (id) => cardOf(tree, id).props['data-mission-depth'];
+  assert.deepEqual(
+    ['M1', 'ROOT', 'L1', 'L2', 'AFTERDONE', 'MISSING'].map(depth),
+    [0, 0, 1, 2, 0, 1],
+  );
+  // depth 0 cards render no rail at all
+  assert.equal(findAll(cardOf(tree, 'ROOT'), (node) => node.props != null && 'data-mission-indent' in node.props).length, 0);
+  // each level contributes exactly one guide segment
+  const rail1 = findAll(cardOf(tree, 'L1'), has('data-mission-indent', 1))[0];
+  assert.equal(rail1.props.children.length, 1);
+  const rail2 = findAll(cardOf(tree, 'L2'), has('data-mission-indent', 2))[0];
+  assert.deepEqual([...rail2.props.children].map((guide) => guide.props['data-guide-level']), [1, 2]);
+});
+
+test('mission view caps indentation at eight levels however deep the chain', () => {
+  const tower = sampleTowerState();
+  const template = tower.missions[0];
+  tower.missions = [];
+  for (let i = 0; i <= 9; i += 1) {
+    tower.missions.push({
+      ...template, id: `D${i}`, title: `Mission D${i}`, branch: `tower/d${i}`,
+      dependsOn: i ? [`D${i - 1}`] : [], status: i ? 'pending' : 'worker_running',
+      worker: undefined, review: undefined, merge: undefined,
+    });
+  }
+  const tree = missionsView(harness(tower));
+  const depth = (id) => cardOf(tree, id).props['data-mission-depth'];
+  assert.deepEqual([depth('D7'), depth('D8'), depth('D9')], [7, 8, 8]);
+  const rail = findAll(cardOf(tree, 'D9'), has('data-mission-indent', 8))[0];
+  assert.equal(rail.props.children.length, 8);
+  assert.equal(rail.props.children[7].props['data-guide-level'], 8);
+});
+
+test('mission view survives dependency cycles and self-references without hanging', () => {
+  const tower = sampleTowerState();
+  const template = tower.missions[0];
+  tower.missions = [
+    { ...template, id: 'X', dependsOn: ['Y'], status: 'pending' },
+    { ...template, id: 'Y', dependsOn: ['X', 'SELF'], status: 'pending' },
+    { ...template, id: 'SELF', dependsOn: ['SELF'], status: 'pending' },
+  ];
+  const tree = missionsView(harness(tower));
+  for (const id of ['X', 'Y', 'SELF']) {
+    const card = cardOf(tree, id);
+    const depth = card.props['data-mission-depth'];
+    assert.ok(Number.isInteger(depth) && depth >= 0 && depth <= 8, `${id} depth ${depth}`);
+    assert.equal(findAll(card, (node) => node.props != null && 'data-mission-indent' in node.props).length, depth > 0 ? 1 : 0);
+  }
+});
+
+test('mission cards offer per-role session links only with a recorded controller session', () => {
+  const openButtons = (node) => findAll(node, (candidate) => candidate.props != null && 'data-open-agent' in candidate.props);
+  // childIds alone are not enough: the default tower records no controller session
+  const plain = missionsView(harness(sampleTowerState()));
+  assert.equal(findAll(plain, (candidate) => candidate.props != null && 'data-open-agent' in candidate.props).length, 0);
+  assert.equal(findAll(cardOf(plain, 'M1'), has('data-mission-role', 'worker'))[0].props['data-spawned'], true);
+
+  const tower = multiMissionTower();
+  const merged = tower.missions.find((mission) => mission.id === 'M1');
+  merged.worker.controllerSessionId = 'tower-controller';
+  merged.review.controllerSessionId = 'tower-controller';
+  const h = harness(tower);
+  // without listed rows the recorded controller is the only lineage source
+  delete h.rows['worker-child'];
+  delete h.rows['review-child'];
+  const tree = missionsView(h);
+  const card = cardOf(tree, 'M1');
+  assert.deepEqual(openButtons(card).map((button) => button.props['data-open-agent']), ['worker', 'reviewer']);
+  assert.match(textOf(openButtons(card)[0]), /打开会话/);
+  // other missions hold real child sessions but no recorded controller
+  for (const id of ['M2', 'M3', 'M4', 'M5', 'M6']) assert.equal(openButtons(cardOf(tree, id)).length, 0);
+  assert.equal(findAll(cardOf(tree, 'M3'), has('data-mission-role', 'worker'))[0].props['data-spawned'], true);
+
+  // clicking opens that role's subagent chat under the recorded controller
+  openButtons(card)[0].props.onClick();
+  assert.equal(h.opened.length, 1);
+  assert.match(h.opened[0].address, /subagentchat\/session\/worker-child\?parent=tower-controller&mode=continuable/);
+  // an unresolvable lineage fails loudly through the shared hint, per role
+  h.rows['review-child'] = { parentId: '' };
+  findAll(card, has('data-open-agent', 'reviewer'))[0].props.onClick();
+  assert.equal(h.opened.length, 1);
+  const after = missionsView(h);
+  const failure = findAll(cardOf(after, 'M1'), has('data-open-error', 'reviewer'))[0];
+  assert.equal(failure.props.role, 'alert');
+  assert.match(textOf(failure), /无法确认这个子代理的归属/);
+  assert.equal(findAll(cardOf(after, 'M1'), has('data-open-error', 'worker')).length, 0);
+});
