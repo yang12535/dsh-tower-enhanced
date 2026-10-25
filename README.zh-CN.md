@@ -150,12 +150,12 @@ config:
 在源码仓库中运行以下脚本：
 
 ```bash
-node scripts/tower-doctor.mjs [--repo <路径>] [--json]
+node scripts/tower-doctor.mjs [--repo <路径>] [--json] [--fail-on-warning]
 node scripts/release.mjs --version <semver> [--date <YYYY-MM-DD>]
 node scripts/release.mjs --version <semver> --apply
 ```
 
-- `scripts/tower-doctor.mjs` 对账 Tower 状态与仓库、worktree 的实际事实，不修改状态或 Git。退出码为 `0`（全部检查通过）、`1`（有 warning）或 `2`（有 error 或参数用法错误）；`--json` 输出机器可读的 findings 与汇总。
+- `scripts/tower-doctor.mjs` 对账 Tower 状态与仓库、worktree 的实际事实，不修改状态或 Git。退出码为 `0`（全部检查通过）、`1`（有 warning）或 `2`（有 error 或参数用法错误）；`--fail-on-warning` 会把仅有 warning 的运行升级为退出码 `2`（clean 仍为 `0`，error 仍为 `2`），默认行为不变，用于发布检查 / CI 严格守门。`--json` 输出机器可读的 findings 与汇总，仅在同时给出 `--fail-on-warning` 时才额外携带 `failOnWarning: true`。
 - `scripts/release.mjs` 默认执行不写入文件的 dry-run，只打印计划 diff。`--apply` 会在写入前校验版本、日期与 changelog，要求 worktree 干净，并以原子方式更新 `package.json` 与 `CHANGELOG.md`。它绝不会 commit、tag、push，也不访问网络。
 
 诊断 finding、恢复步骤与脚本详情见[运维手册](docs/operations.md)。

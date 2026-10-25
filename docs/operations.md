@@ -307,7 +307,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 另一个用户（尤其 root）曾向仓库写入对象或元数据时，当前用户后续的 `git rebase`、`merge`、提交或 state 写入可能报权限错误。[scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs) 用两类 finding 区分「发现其他属主」与「关键路径已确认不可写」；它只报告，不修复。
 
 - 症状：
-  - `GIT_METADATA_FOREIGN_OWNER` 是 **warning**。若没有其它 error，doctor 退出码为 `1`；输出形如（路径、uid 与计数随环境变化）：
+  - `GIT_METADATA_FOREIGN_OWNER` 是 **warning**。若没有其它 error，doctor 默认退出码为 `1`（加 `--fail-on-warning` 则升级为 `2`，见附录 C，可让 CI / 发布门禁在 warning 即失败）；输出形如（路径、uid 与计数随环境变化）：
 
     ```text
     [warning] GIT_METADATA_FOREIGN_OWNER: 2 repo/git metadata entries are owned by another user (current uid 1000): e.g. /srv/repo/.git/index, /srv/repo/.git/objects/ab; suggested fix to run manually (doctor never executes it): sudo chown -R $(id -u):$(id -g) /srv/repo/.git
@@ -321,7 +321,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
     24 checks passed, 0 warning(s), 1 error(s)
     ```
 
-    检查目标是现存的对象库、refs、index 与 Tower state 目录；不存在的路径会跳过（例如首次提交前没有 index），缺失 state 由其它检查报告。可用 `node scripts/tower-doctor.mjs --json` 读取结构化 `findings` 与 `summary.exitCode`。
+    检查目标是现存的对象库、refs、index 与 Tower state 目录；不存在的路径会跳过（例如首次提交前没有 index），缺失 state 由其它检查报告。可用 `node scripts/tower-doctor.mjs --json` 读取结构化 `findings` 与 `summary.exitCode`；再叠加 `--fail-on-warning` 时 payload 会多出 `failOnWarning: true`（默认输出不含该键，既有键集不变）。
 - 常见成因：另一个 agent 或人工用 root/`sudo` 在该仓库运行 git；同一 checkout 被多个系统用户共享；CI 容器以一种 uid 写入挂载目录，本地用户再以另一 uid 操作；或一次 `sudo git ...`/`sudo` 运行的 Tower 留下 root 属主的 index、对象、refs 或日志。`GIT_METADATA_FOREIGN_OWNER` 也可能是共享仓库的预期属主布局，须结合样例路径和当前 uid 判断，不能看到 warning 就递归改整个仓库。
 - 诊断（先停止该仓库的写入，再从**主仓库根目录**执行只读命令）：
 
@@ -460,7 +460,7 @@ git -C <worktree> rev-parse --git-path rebase-merge         # rebase 中间态�
 
 # state 侧（只读）
 python3 -m json.tool <repo>/.dsh-tower/state.json           # 语法/结构检查（STATE_INVALID 复现）
-node scripts/tower-doctor.mjs [--repo <repo>] [--json]      # state ↔ git 对账体检（附录 C）
+node scripts/tower-doctor.mjs [--repo <repo>] [--json] [--fail-on-warning]   # state ↔ git 对账体检（附录 C）
 ```
 
 ## 附录 B：`state.events` 事件类型（[lib/core.js](../lib/core.js) `appendEvent`）
@@ -492,10 +492,11 @@ node scripts/tower-doctor.mjs                     # 体检当前工作目录所�
 node scripts/tower-doctor.mjs --repo <path>       # 指定仓库
 node scripts/tower-doctor.mjs --state <file>      # 指定 state 文件（默认 <repo>/.dsh-tower/state.json）
 node scripts/tower-doctor.mjs --json              # 机器可读输出（findings + summary）
+node scripts/tower-doctor.mjs --fail-on-warning   # 严格守门：有 warning 也退出 2（发布检查 / CI 门禁）
 node scripts/tower-doctor.mjs --help              # 用法
 ```
 
-- 退出码：`0` = 全部检查通过；`1` = 有 warning；`2` = 有 error（或参数用法错误）。人类可读输出逐行列出 `[severity] code: message` 并汇总 `N checks passed, X warning(s), Y error(s)`。
+- 退出码：`0` = 全部检查通过；`1` = 有 warning；`2` = 有 error（或参数用法错误）。加 `--fail-on-warning` 后，仅有 warning 的运行也退出 `2`（clean 仍为 `0`，error 仍为 `2`），默认行为不变，适合发布检查 / CI 严格守门；与 `--json` 同用时 payload 额外携带 `failOnWarning: true`（默认输出不含该键，既有键集不变）。人类可读输出逐行列出 `[severity] code: message` 并汇总 `N checks passed, X warning(s), Y error(s)`。
 - 检查范围：state 结构（镜像 [lib/store.js](../lib/store.js) 规则）、repo 一致性、base 分支与 `baseCommit` 关系、每个 mission 的分支存在性 / worktree 注册与磁盘存在性 / 检出分支、已合并 mission 的 `mergeCommit` 是否可达自 base、teardown 一致性、悬置的 running 记录、`.dsh-tower/worktrees/` 下的孤儿目录，以及 git 元数据属主（仅 POSIX）与对象库 / refs / index / Tower state 目录的可写性。属主扫描的样例上限、扫描预算与非 POSIX 行为见 3.12。
 - 常见 finding 与处置：
 
