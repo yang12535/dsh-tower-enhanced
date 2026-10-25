@@ -5,13 +5,14 @@
  * Cross-checks the Tower state file against the actual Git repository using
  * read-only git commands (`worktree list`, `rev-parse`, `log`) plus filesystem
  * presence tests. It performs no writes of any kind: no state edits, no git
- * mutations. Problems are only reported.
+ * mutations, and no chown/chmod of anything. Problems are only reported; fix
+ * suggestions printed in messages are for the human to run manually.
  *
  * Exit codes: 0 = all checks passed, 1 = warnings found, 2 = errors found.
  */
 
 import { execFile } from 'node:child_process';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { access, constants, lstat, readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -44,6 +45,15 @@ const ACTIVE_STATUSES = new Set([
   'merge_blocked',
 ]);
 
+/** Upper bound on lstat calls for the git-metadata ownership scan. */
+const GIT_METADATA_SCAN_LIMIT = 5000;
+
+/** How many foreign-owned path samples to embed in the finding. */
+const FOREIGN_OWNER_SAMPLE_LIMIT = 10;
+
+/** Entry names never scanned at any level (huge dependency trees). */
+const GIT_METADATA_SKIP_NAMES = new Set(['node_modules']);
+
 const USAGE = `Usage: node scripts/tower-doctor.mjs [options]
 
 Read-only diagnostics for Tower state (.dsh-tower/state.json) vs the repository.
@@ -57,8 +67,11 @@ Options:
 Checks: state structure (version, required fields, missions), repo identity,
 base branch vs recorded baseCommit, mission branches, worktree registration
 and existence, orphan worktrees, merged missions' mergeCommit ancestry on the
-base branch, teardown consistency, and running activations whose records look
-finished (reported only — the doctor never repairs anything).
+base branch, teardown consistency, running activations whose records look
+finished, and git metadata health (entries owned by another user — POSIX
+only, skipped on platforms without process.getuid — plus writability of the
+git object store, refs, index, and the tower state directory). Everything is
+reported only — the doctor never repairs anything.
 
 Exit codes: 0 = all checks passed, 1 = warnings found, 2 = errors found
 (or invalid usage). This tool performs no writes of any kind.`;
@@ -247,13 +260,166 @@ export function parseWorktreeList(text) {
 }
 
 /**
+ * Depth-limited, budgeted scan for repo/git-metadata entries whose owner uid
+ * differs from the current process uid. Purely read-only: readdir + lstat.
+ * `roots` is a list of { dir, depth } where depth is how many levels to
+ * descend below dir (0 = the entries of dir itself only). Huge dependency
+ * trees (node_modules, the tower worktrees directory) are skipped so they can
+ * never produce noise, and the total number of lstat calls is capped at
+ * `limit` — exceeding it sets `truncated` instead of scanning further.
+ */
+async function scanForeignOwners(roots, currentUid, limit, stateDir) {
+  const foreign = [];
+  const ownerUids = new Set();
+  let scanned = 0;
+  let truncated = false;
+
+  const skip = (parentDir, name) =>
+    GIT_METADATA_SKIP_NAMES.has(name) ||
+    // <stateDir>/worktrees holds one full checkout per mission: out of scope.
+    (parentDir === stateDir && name === 'worktrees');
+
+  const walk = async (dir, depth) => {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return; // Unreadable directory: ownership of its children is unknowable.
+    }
+    for (const entry of entries) {
+      if (scanned >= limit) {
+        truncated = true;
+        return;
+      }
+      if (skip(dir, entry.name)) continue;
+      const entryPath = path.join(dir, entry.name);
+      let info;
+      try {
+        info = await lstat(entryPath); // lstat: never follow symlinks out of scope
+      } catch {
+        scanned += 1;
+        continue;
+      }
+      scanned += 1;
+      if (info.uid !== currentUid) {
+        foreign.push(entryPath);
+        ownerUids.add(info.uid);
+      }
+      if (depth > 0 && entry.isDirectory()) {
+        await walk(entryPath, depth - 1);
+      }
+    }
+  };
+
+  for (const root of roots) {
+    if (scanned >= limit) {
+      truncated = true;
+      break;
+    }
+    await walk(root.dir, root.depth);
+  }
+  return { foreign, ownerUids: [...ownerUids].sort((a, b) => a - b), scanned, truncated };
+}
+
+/**
+ * Read-only git-metadata health checks: entries owned by another user (the
+ * classic post-crash pollution where a different agent — often root — wrote
+ * into `.git`, breaking later `git write` operations for this user) and
+ * writability of the paths git/Tower must write to. Suggested fix commands in
+ * the messages are never executed by this tool.
+ */
+async function checkGitMetadata({ execGit, repoRoot, statePath, findings, currentUid, scanLimit }) {
+  const gitDirResult = await execGit(repoRoot, ['rev-parse', '--absolute-git-dir']);
+  const gitDir = gitDirResult.code === 0 && gitDirResult.stdout.trim().length > 0
+    ? gitDirResult.stdout.trim()
+    : path.join(repoRoot, '.git');
+  const stateDir = path.dirname(statePath);
+  const uidNote = currentUid === undefined ? '' : ` (current uid ${currentUid})`;
+
+  // Ownership scan: POSIX only — without process.getuid() there is no uid to
+  // compare against, so the scan is skipped on non-POSIX platforms.
+  if (currentUid !== undefined) {
+    let gitDirExists = false;
+    try {
+      gitDirExists = (await stat(gitDir)).isDirectory();
+    } catch {
+      gitDirExists = false;
+    }
+    const roots = [{ dir: repoRoot, depth: 0 }];
+    if (gitDirExists) {
+      roots.push(
+        { dir: gitDir, depth: 0 },
+        { dir: path.join(gitDir, 'refs'), depth: 8 },
+        { dir: path.join(gitDir, 'objects'), depth: 0 },
+        { dir: path.join(gitDir, 'worktrees'), depth: 2 },
+        { dir: path.join(gitDir, 'logs'), depth: 4 },
+      );
+    }
+    if (stateDir !== repoRoot) roots.push({ dir: stateDir, depth: 0 });
+    const scan = await scanForeignOwners(roots, currentUid, scanLimit, stateDir);
+    if (scan.foreign.length > 0) {
+      const sample = scan.foreign.slice(0, FOREIGN_OWNER_SAMPLE_LIMIT);
+      const more = scan.foreign.length - sample.length;
+      findings.push(finding(
+        'GIT_METADATA_FOREIGN_OWNER',
+        'warning',
+        `${scan.foreign.length} repo/git metadata ${scan.foreign.length === 1 ? 'entry is' : 'entries are'} owned by another user${uidNote}: `
+          + `e.g. ${sample.join(', ')}${more > 0 ? ` … and ${more} more` : ''}`
+          + `${scan.truncated ? ` (scan truncated after ${scanLimit} entries)` : ''}`
+          + `; suggested fix to run manually (doctor never executes it): sudo chown -R $(id -u):$(id -g) ${gitDir}`,
+        { count: scan.foreign.length, sample, ownerUids: scan.ownerUids, truncated: scan.truncated, currentUid },
+      ));
+    }
+  }
+
+  // Writability of the key paths git/Tower must be able to write to. Absent
+  // paths are skipped: their absence is either normal (no index before the
+  // first commit) or reported by other checks (missing state).
+  const writableTargets = [
+    ['git object store', path.join(gitDir, 'objects')],
+    ['git refs store', path.join(gitDir, 'refs')],
+    ['git index', path.join(gitDir, 'index')],
+    ['tower state directory', stateDir],
+  ];
+  for (const [label, target] of writableTargets) {
+    try {
+      await stat(target);
+    } catch {
+      continue;
+    }
+    try {
+      await access(target, constants.W_OK);
+    } catch (error) {
+      findings.push(finding(
+        'GIT_METADATA_NOT_WRITABLE',
+        'error',
+        `${label} ${target} is not writable by the current user${uidNote} `
+          + `(${error?.code ?? 'EACCES'}): git operations writing here will fail `
+          + `(e.g. "insufficient permission for adding an object to repository database"); `
+          + `suggested fixes to run manually (doctor never executes them): `
+          + `sudo chown -R $(id -u):$(id -g) ${gitDir} or chmod u+w ${target}`,
+        { path: target, label },
+      ));
+    }
+  }
+}
+
+/**
  * Collect all diagnostic findings for one repository + state file.
  * Read-only: runs `git rev-parse`, `git worktree list`, and `git log`
- * (all query-only) plus fs reads. Returns a report object:
- * { repo, statePath, baseBranch?, baseTip?, checksPassed, findings }.
+ * (all query-only) plus fs reads (readdir/stat/lstat/access). Returns a
+ * report object: { repo, statePath, baseBranch?, baseTip?, checksPassed,
+ * findings }. `options.currentUid` overrides the uid foreign-owner entries
+ * are compared against (defaults to process.getuid(); the ownership scan is
+ * skipped on non-POSIX platforms) and `options.gitMetadataScanLimit`
+ * overrides the ownership scan budget (test seams only).
  */
 export async function collectFindings(options = {}) {
   const execGit = options.execGit ?? runGitCapture;
+  const currentUid = options.currentUid ?? (typeof process.getuid === 'function' ? process.getuid() : undefined);
+  const scanLimit = Number.isSafeInteger(options.gitMetadataScanLimit) && options.gitMetadataScanLimit > 0
+    ? options.gitMetadataScanLimit
+    : GIT_METADATA_SCAN_LIMIT;
   const findings = [];
   const report = { repo: undefined, statePath: undefined, baseBranch: undefined, baseTip: undefined, checksPassed: 0, findings };
 
@@ -267,6 +433,13 @@ export async function collectFindings(options = {}) {
   report.repo = repoRoot;
   const statePath = path.resolve(options.statePath ?? path.join(repoRoot, '.dsh-tower', 'state.json'));
   report.statePath = statePath;
+
+  // Git metadata health runs before the state is even read: a polluted or
+  // read-only `.git` is exactly the environment problem that gets missed
+  // after a crash, and it also affects repos with a missing/corrupt state.
+  const findingsBefore = findings.length;
+  await checkGitMetadata({ execGit, repoRoot, statePath, findings, currentUid, scanLimit });
+  if (findings.length === findingsBefore) report.checksPassed += 1;
 
   let raw;
   try {
@@ -470,8 +643,10 @@ function renderHuman(report, summary) {
  * Full doctor run for an argv. Returns
  * { exitCode, usageError, findings, summary, text, output, json }.
  * `output` is what the CLI should print (JSON text when --json was given).
+ * The optional `options` object is forwarded to collectFindings (test seam
+ * for injecting the uid used by the ownership scan; the CLI never sets it).
  */
-export async function runDoctor(argv = process.argv.slice(2)) {
+export async function runDoctor(argv = process.argv.slice(2), options = {}) {
   const parsed = parseArgs(argv);
   if (parsed.error !== undefined) {
     const text = `${USAGE}\n\nerror: ${parsed.error}\n`;
@@ -480,7 +655,7 @@ export async function runDoctor(argv = process.argv.slice(2)) {
   if (parsed.help) {
     return { exitCode: 0, usageError: false, findings: [], summary: { checksPassed: 0, warnings: 0, errors: 0, exitCode: 0 }, text: USAGE, output: `${USAGE}\n`, json: null };
   }
-  const report = await collectFindings({ repo: parsed.repo, statePath: parsed.state });
+  const report = await collectFindings({ repo: parsed.repo, statePath: parsed.state, ...options });
   const errors = report.findings.filter((item) => item.severity === 'error').length;
   const warnings = report.findings.filter((item) => item.severity === 'warning').length;
   const exitCode = errors > 0 ? 2 : warnings > 0 ? 1 : 0;
