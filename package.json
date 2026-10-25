@@ -1,7 +1,16 @@
 {
   "name": "dsh-tower-enhanced",
   "description": "Experimental Tower-lite missions with isolated Git worktrees, independent reviews, merge gates, and per-agent model routes",
-  "version": "0.1.0",
+  "keywords": [
+    "deepseek",
+    "dsh",
+    "cordis",
+    "plugin",
+    "tower",
+    "orchestration",
+    "subagent"
+  ],
+  "version": "0.2.0",
   "icon": "./icon.svg",
   "type": "module",
   "main": "lib/index.js",
