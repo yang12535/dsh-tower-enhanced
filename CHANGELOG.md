@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-26
+
+### Added
+
+- `edit` and `summary` Tower actions across `lib/index.js`, `lib/runtime.js`, and `lib/core.js`: pending missions can correct their title, description, scope, and dependencies with add-equivalent validation, while `summary` provides a read-only compact overview with global counts, one-line mission entries, and optional `mission_id` filtering.
+- Explicit `review_failed` state handling in `lib/core.js`, `lib/store.js`, and `lib/client.js`: failed reviewer launches and runs remain retryable by a fresh reviewer or a worker for direct rework, with failure details and next-step guidance exposed in Tower cards.
+- Guaranteed settlement notices in `lib/runtime.js`: every settled worker or reviewer steers the controller with its outcome, a bounded reason for failures/interruptions/stale reviews, and the next action; state, projection, and notification failures are contained so one failing step does not silence the others.
+- Restart recovery warnings in `lib/runtime.js`: newly created agents proactively report persisted running activations left by a previous controller process once per run and direct the controller to `recover` instead of waiting for zombies that can never settle.
+- Read-only diagnostics in `scripts/tower-doctor.mjs`, cross-checking `.dsh-tower/state.json` against repository and worktree facts, reporting activation and Git metadata health, and returning structured findings without repairing state or mutating Git.
+- Local release automation in `scripts/release.mjs`, with validated semver/date inputs, non-writing dry runs by default, clean-worktree enforcement for `--apply`, atomic `package.json` and `CHANGELOG.md` updates, and best-effort rollback; the script never commits, tags, pushes, or uses the network.
+- CI smoke coverage in `.github/workflows/ci.yml` for both script entry points, including successful `--help` invocation, read-only doctor behavior on a fresh checkout, and rejection of a non-incrementing release version.
+- Documentation and release consistency guards in `test/docs-consistency.test.js` and `test/version-consistency.test.js`, keeping documented action inventories aligned with the tool schema and enforcing `package.json`/changelog version, date, ordering, and section structure invariants.
+
+### Changed
+
+- Expanded `README.md`, `README.zh-CN.md`, `docs/architecture.md`, `docs/operations.md`, and `docs/security-model.md` to document the new actions, explicit failure and recovery states, operational diagnostics, and their underlying trust and state-machine semantics.
+
 ### Fixed
 
 - Refresh untouched pending mission worktrees to the current base before their first worker starts, making merged dependencies available without overwriting local or ignored files or rebasing unique commits automatically.
