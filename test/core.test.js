@@ -327,3 +327,96 @@ test('teardown refuses live missions', async (t) => {
   assert.equal(result.results[0].reason, 'status-worker_running');
   assert.equal(existsSync(mission.worktree), true);
 });
+
+test('editing a pending mission updates metadata, records the event, and bumps the revision', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const first = await core.addMission({ title: 'First', description: 'First mission' });
+  const second = await core.addMission({ title: 'Second', description: 'Second mission', scope: ['docs/**'] });
+  const edited = await core.editMission({ missionId: second.id, title: 'Second revised', scope: ['lib/**', 'test/**'], dependsOn: [first.id] });
+  assert.equal(edited.id, second.id);
+  assert.equal(edited.status, 'pending');
+  assert.equal(edited.title, 'Second revised');
+  assert.equal(edited.description, 'Second mission', 'unedited fields stay untouched');
+  assert.deepEqual(edited.scope, ['lib/**', 'test/**']);
+  assert.deepEqual(edited.dependsOn, [first.id]);
+  assert.equal(edited.revision, second.revision + 1);
+  const state = await core.status();
+  assert.deepEqual(state.missions.find((mission) => mission.id === second.id), edited);
+  const event = state.events.at(-1);
+  assert.equal(event.type, 'mission-edited');
+  assert.equal(event.mission, second.id);
+  assert.deepEqual(event.fields, ['title', 'scope', 'dependsOn']);
+});
+
+test('missions that already spawned or settled are not editable', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const spawned = await core.addMission({ title: 'Spawned', description: 'Worker already started' });
+  await core.beginSpawn({ missionId: spawned.id, role: 'worker' });
+  await assert.rejects(core.editMission({ missionId: spawned.id, title: 'Too late' }), (error) => {
+    assert.equal(error.code, 'MISSION_NOT_EDITABLE');
+    assert.match(error.message, /worker_running/);
+    return true;
+  });
+  const abandoned = await core.addMission({ title: 'Abandoned', description: 'Already abandoned' });
+  await core.abandon(abandoned.id);
+  await assert.rejects(core.editMission({ missionId: abandoned.id, title: 'Too late' }), (error) => {
+    assert.equal(error.code, 'MISSION_NOT_EDITABLE');
+    return true;
+  });
+});
+
+test('edit rejects unknown dependencies, duplicate input, self-references, and cycles without mutating state', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const first = await core.addMission({ title: 'First', description: 'First mission' });
+  const second = await core.addMission({ title: 'Second', description: 'Second mission', dependsOn: [first.id] });
+  const third = await core.addMission({ title: 'Third', description: 'Third mission', dependsOn: [second.id] });
+  await assert.rejects(core.editMission({ missionId: third.id, dependsOn: ['NOPE'] }), (error) => {
+    assert.equal(error.code, 'MISSION_NOT_FOUND');
+    return true;
+  });
+  await assert.rejects(core.editMission({ missionId: third.id, dependsOn: [first.id, first.id] }), (error) => {
+    assert.equal(error.code, 'DEPENDENCY_INVALID');
+    return true;
+  });
+  await assert.rejects(core.editMission({ missionId: third.id, dependsOn: [third.id] }), (error) => {
+    assert.equal(error.code, 'DEPENDENCY_CYCLE');
+    return true;
+  });
+  await assert.rejects(core.editMission({ missionId: first.id, dependsOn: [third.id] }), (error) => {
+    assert.equal(error.code, 'DEPENDENCY_CYCLE');
+    assert.match(error.message, /M1 -> M3 -> M2 -> M1/);
+    return true;
+  });
+  const state = await core.status();
+  assert.deepEqual(state.missions.map((mission) => mission.dependsOn), [[], [first.id], [second.id]]);
+  assert.deepEqual(state.missions.map((mission) => mission.revision), [first.revision, second.revision, third.revision]);
+});
+
+test('edit validates field types before touching the mission', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const mission = await core.addMission({ title: 'Validated', description: 'Check edit arguments' });
+  await assert.rejects(core.editMission({ missionId: mission.id, title: '   ' }), /title must be a non-empty string/);
+  await assert.rejects(core.editMission({ missionId: mission.id, description: 42 }), /description must be a non-empty string/);
+  await assert.rejects(core.editMission({ missionId: mission.id, scope: [''] }), /scope patterns must be non-empty strings/);
+  await assert.rejects(core.editMission({ missionId: mission.id, scope: 'lib/**' }), /scope must be an array/);
+  await assert.rejects(core.editMission({ missionId: mission.id, dependsOn: 'M1' }), /dependsOn must be a string array/);
+  await assert.rejects(core.editMission({ missionId: 'NOPE', title: 'Missing' }), /mission NOPE does not exist/);
+  const untouched = (await core.status()).missions[0];
+  assert.equal(untouched.revision, mission.revision);
+});
+
+test('an edited dependency list gates worker startup', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const blocker = await core.addMission({ title: 'Blocker', description: 'Not merged yet' });
+  const mission = await core.addMission({ title: 'Gated', description: 'Depends after edit' });
+  await core.editMission({ missionId: mission.id, dependsOn: [blocker.id] });
+  await assert.rejects(core.beginSpawn({ missionId: mission.id, role: 'worker' }), /unmerged dependencies/);
+  await core.abandon(blocker.id);
+  const begun = await core.beginSpawn({ missionId: mission.id, role: 'worker' });
+  assert.equal(begun.mission.status, 'worker_running');
+});
