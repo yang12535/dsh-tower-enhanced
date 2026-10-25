@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { apply, inject, name } from '../lib/index.js';
 import { TowerRuntime } from '../lib/runtime.js';
+import { TowerError } from '../lib/errors.js';
 import { initializedCore, makeRepo } from './helpers.js';
 
 function routeContext(resolved = {}) {
@@ -435,4 +436,75 @@ test('a refused call finishes without touching repository state', async (t) => {
   const core = await runtime.coreAt(repo, new AbortController().signal);
   const state = await core.status({ observe: false });
   assert.deepEqual(state.missions.map((mission) => mission.id), []);
+});
+
+/**
+ * Minimal core double for the edit dispatch path: seeded into
+ * `runtime.cores` so `coreAt` reuses it instead of constructing a real
+ * TowerCore, while `resolveRoot` still resolves the real temporary repo.
+ */
+function editHarness(repo, editMission) {
+  const calls = { edit: [], status: 0 };
+  const core = {
+    async open() {},
+    async editMission(args) {
+      calls.edit.push(args);
+      return await editMission(args);
+    },
+    async status() {
+      calls.status += 1;
+      return { baseBranch: 'main', missions: [] };
+    },
+  };
+  const { runtime } = executeHarness(repo);
+  runtime.cores.set(repo, core);
+  return { calls, runtime };
+}
+
+function runEdit(runtime, args) {
+  return runtime.execute({ action: 'edit', ...args }, { agent: sessionAgent('controller-session'), signal: new AbortController().signal });
+}
+
+test('edit maps tool arguments onto core.editMission and returns the mission', async (t) => {
+  const repo = makeRepo(t);
+  const mission = { id: 'M2', title: 'Edited title', description: 'Edited objective', scope: ['lib/', 'test/'], dependsOn: ['M1'], status: 'pending', revision: 2 };
+  const { calls, runtime } = editHarness(repo, async () => mission);
+  const result = await runEdit(runtime, { mission_id: ' M2 ', title: 'Edited title', description: 'Edited objective', scope: ['lib/', 'test/'], depends_on: ['M1'] });
+  assert.deepEqual(result, { mission });
+  assert.deepEqual(calls.edit, [{ missionId: 'M2', title: 'Edited title', description: 'Edited objective', scope: ['lib/', 'test/'], dependsOn: ['M1'] }]);
+  // edit is a mutating action: the projection is published and the workspace claim is released.
+  assert.equal(calls.status, 1);
+  assert.equal(runtime.inFlight.has(repo), false);
+});
+
+test('edit forwards only the fields the caller supplied', async (t) => {
+  const repo = makeRepo(t);
+  const { calls, runtime } = editHarness(repo, async (args) => ({ id: args.missionId, title: 'kept', scope: [], dependsOn: [], revision: 3, status: 'pending' }));
+  const result = await runEdit(runtime, { mission_id: 'M1', depends_on: [] });
+  assert.deepEqual(calls.edit, [{ missionId: 'M1', dependsOn: [] }]);
+  assert.equal(result.mission.title, 'kept');
+  assert.equal(result.mission.revision, 3);
+});
+
+test('edit rejects a missing or blank mission_id before reaching the core', async (t) => {
+  const repo = makeRepo(t);
+  const { calls, runtime } = editHarness(repo, async () => { throw new Error('core.editMission must not run'); });
+  await assert.rejects(
+    runEdit(runtime, { title: 'orphan edit' }),
+    (error) => error instanceof TowerError && error.code === 'ARGUMENT_INVALID' && error.message === 'mission_id must be a non-empty string',
+  );
+  await assert.rejects(runEdit(runtime, { mission_id: '   ' }), /mission_id must be a non-empty string/);
+  assert.deepEqual(calls.edit, []);
+});
+
+test('edit propagates core rejections such as MISSION_NOT_EDITABLE to the tool layer', async (t) => {
+  const repo = makeRepo(t);
+  const { runtime } = editHarness(repo, () => {
+    throw new TowerError('MISSION_NOT_EDITABLE', 'mission M2 is worker_running; only a pending mission can be edited');
+  });
+  await assert.rejects(
+    runEdit(runtime, { mission_id: 'M2', title: 'too late' }),
+    (error) => error instanceof TowerError && error.code === 'MISSION_NOT_EDITABLE' && /only a pending mission can be edited/.test(error.message),
+  );
+  assert.equal(runtime.inFlight.has(repo), false);
 });
