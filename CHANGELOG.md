@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recognize `review_failed` in the read-only doctor and continue checking its required Git artifacts instead of reporting valid state as corrupt.
 - Locate restart-recovery warnings from the current working directory and Git root rather than only the session's creation-time directory.
 - Show failed reviews, stale-review retry guidance, and bounded plain-text errors in Tower cards; failed launches without a child Session no longer appear to be starting indefinitely.
+- Reject non-array mission scopes consistently in add/edit, including explicit `null` instead of silently creating an unrestricted mission; preserve literal whitespace in glob patterns.
 
 ## [0.2.0] - 2026-10-25
 

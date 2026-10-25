@@ -117,7 +117,7 @@ config:
 
 1. 把 Session 的工作目录切换到目标仓库（`working_directory` 支持 `cd`），检出本地 base 分支，并确保主 worktree 干净。
 2. `tower({action:"init"})`。
-3. 用完整的描述添加任务，可选 `depends_on`/`scope`。
+3. 用完整的描述添加任务，可选 `depends_on`/`scope`。`scope` 必须是仓库相对 glob 字符串的数组；创建时省略或传 `[]` 表示不限制范围，显式 `null`、字符串及其他非数组值均会被拒绝。pattern 保留空白字面量，包括文件名首尾的空格。`edit` 时省略 scope 保持原限制，传 `[]` 才会清除限制。
 4. `spawn` 一个 worker。pending 任务首次启动前，会把尚未改动且干净的 worktree 快进到当前 base，确保已合并的依赖文件可用。如果存在本地改动、被忽略文件的覆盖冲突或分叉提交，会拒绝刷新而非覆盖数据；应保留本地文件，对分叉的工作显式执行 `rebase`。worker 结束前必须提交。重新启动已有 worker 不会自动 rebase 它的工作树。
 5. 任务变为 `worker_completed` 后，`spawn` 一个 reviewer。reviewer 返回结构化的结论（`clean` 或 `changes_requested`，附 merge 建议）；如果 review 失败（限流、崩溃或没有结构化结论），任务会进入 `review_failed` —— 可以重新 spawn reviewer，也可以直接另派 worker 返工。
 6. `status`/`gate` 检查状态。`approved` 的任务可以合并；`changes_requested` 需要再跑一轮 worker；`review_failed` 既非运行中也非终态，因此既可以从中重新 spawn reviewer，也可以直接重新 spawn worker。

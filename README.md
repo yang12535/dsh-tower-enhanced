@@ -112,7 +112,7 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 
 1. Make the Session's working directory the intended repository (`working_directory` supports `cd`), check out the local base branch, and ensure the main worktree is clean.
 2. `tower({action:"init"})`.
-3. Add missions with complete descriptions and optional `depends_on`/`scope`.
+3. Add missions with complete descriptions and optional `depends_on`/`scope`. `scope` must be an array of repository-relative glob strings; omit it or use `[]` for unrestricted changes. Explicit `null`, strings, and other non-array values are rejected. Patterns preserve literal whitespace, including leading/trailing spaces in file names. For `edit`, omitted scope keeps the existing restriction; `[]` clears it.
 4. `spawn` a worker. Before a pending mission first starts, its untouched, clean worktree fast-forwards to the current base so merged dependencies are available. Local changes, ignored-file collisions, or divergent commits block that refresh rather than being overwritten; preserve local files and explicitly `rebase` divergent work. The worker must commit before finishing. Restarting an existing worker does not automatically rebase its worktree.
 5. When the mission becomes `worker_completed`, `spawn` a reviewer. The reviewer returns a structured verdict; if it fails (rate limit, crash, or no structured verdict) the mission moves to `review_failed` — spawn the reviewer again, or a worker for direct rework.
 6. `status`/`gate` inspect state. An `approved` mission can be merged; `changes_requested` needs another worker round; `review_failed` is neither running nor terminal, so both a fresh reviewer and a fresh worker can start from it.
