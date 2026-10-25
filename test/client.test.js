@@ -18,6 +18,9 @@ function findAll(node, predicate) {
 }
 const has = (name, value) => (node) => node.props?.[name] === value;
 const agents = (tree) => findAll(tree, (node) => node.props?.['data-tower-agent']).map((node) => node.props['data-tower-agent']);
+const missionCards = (tree) => findAll(tree, (node) => node.props?.['data-mission-id']);
+const cardOf = (tree, id) => missionCards(tree).find((node) => node.props['data-mission-id'] === id);
+const nextOf = (card) => card && findAll(card, (node) => 'data-mission-next' in (node.props ?? {}))[0];
 
 // Preserve hook state across renders to exercise real scope/filter/click transitions.
 function harness(tower = sampleTowerState()) {
@@ -91,7 +94,7 @@ function harness(tower = sampleTowerState()) {
     };
     return expand(element(slot.component, props), `${surface}:${sessionId}`);
   }
-  return { render, opened, rows, catalog, projections, slots, services };
+  return { render, opened, rows, catalog, projections, slots, services, module: exported };
 }
 
 test('only review belonging to this controller is shown, workspace retains both real sessions', () => {
@@ -220,4 +223,161 @@ test('newest workspace snapshot wins; unrelated and null projections stay separa
   assert.doesNotMatch(textOf(h.render()), /unrelated/);
   h.projections.empty = { values: { tower: null } };
   assert.match(textOf(h.render('empty')), /还没有 Tower 状态/);
+});
+
+test('missionNextStep derives the next step from status, dependencies, and review verdict', () => {
+  const { missionNextStep, missionDependencyState } = harness().module;
+  // Results come from the vm realm, so compare field-wise (prototypes differ).
+  const sameNext = (actual, key, ids = [], blocked = false) => {
+    assert.equal(actual?.key, key);
+    assert.deepEqual([...(actual?.ids ?? [])], ids);
+    assert.equal(actual?.blocked, blocked);
+  };
+  const mission = (over = {}) => ({ id: 'M2', title: 'task', status: 'pending', dependsOn: [], ...over });
+  const siblings = [
+    mission({ id: 'M1', status: 'merged' }),
+    mission({ id: 'M3', status: 'worker_running' }),
+    mission({ id: 'M4', status: 'abandoned' }),
+  ];
+  // pending + unmet dependency points at the id that must merge first
+  sameNext(missionNextStep(mission({ dependsOn: ['M3'] }), siblings), 'next.waitDeps', ['M3'], true);
+  sameNext(missionNextStep(mission({ dependsOn: ['gone', 'M3'] }), siblings), 'next.waitDeps', ['gone', 'M3'], true);
+  assert.deepEqual([...missionDependencyState(mission({ dependsOn: ['gone', 'M3', 'M1'] }), siblings).map((dep) => ({ ...dep }))], [
+    { id: 'gone', status: 'missing', met: false },
+    { id: 'M3', status: 'worker_running', met: false },
+    { id: 'M1', status: 'merged', met: true },
+  ]);
+  // pending + merged or abandoned dependency → spawn the worker
+  sameNext(missionNextStep(mission({ dependsOn: ['M1'] }), siblings), 'next.spawnWorker');
+  assert.equal(missionNextStep(mission({ dependsOn: ['M4'] }), siblings).key, 'next.spawnWorker');
+  sameNext(missionNextStep(mission(), siblings), 'next.spawnWorker');
+  // active stages are in progress
+  assert.equal(missionNextStep(mission({ status: 'worker_running' }), siblings).key, 'next.workerRunning');
+  assert.equal(missionNextStep(mission({ status: 'review_running' }), siblings).key, 'next.reviewRunning');
+  // completed worker without a clean review awaits review
+  assert.equal(missionNextStep(mission({ status: 'worker_completed' }), siblings).key, 'next.awaitReview');
+  assert.equal(missionNextStep(mission({ status: 'worker_completed', review: { verdict: 'clean' } }), siblings).key, 'next.awaitReview');
+  // a rejected verdict demands rework even if the status label lags behind
+  assert.equal(missionNextStep(mission({ status: 'worker_completed', review: { verdict: 'changes_requested', merge: false } }), siblings).key, 'next.rework');
+  assert.equal(missionNextStep(mission({ status: 'changes_requested' }), siblings).key, 'next.rework');
+  // only a clean merge-approved review unlocks merging
+  assert.equal(missionNextStep(mission({ status: 'worker_completed', review: { verdict: 'clean', merge: true } }), siblings).key, 'next.canMerge');
+  assert.equal(missionNextStep(mission({ status: 'approved' }), siblings).key, 'next.canMerge');
+  // terminal and manual states
+  assert.equal(missionNextStep(mission({ status: 'merged' }), siblings).key, 'next.merged');
+  assert.equal(missionNextStep(mission({ status: 'abandoned' }), siblings).key, 'next.abandoned');
+  assert.equal(missionNextStep(mission({ status: 'worker_failed' }), siblings).key, 'next.workerFailed');
+  sameNext(missionNextStep(mission({ status: 'rebase_blocked' }), siblings), 'next.rebaseManual', [], true);
+  sameNext(missionNextStep(mission({ status: 'merge_blocked' }), siblings), 'next.mergeManual', [], true);
+  assert.equal(missionNextStep(mission({ status: 'surprise' }), siblings).key, 'next.unknown');
+  assert.equal(missionNextStep(undefined, siblings).key, 'next.unknown');
+});
+
+// One repo-wide snapshot covering every interesting stage at once.
+function multiMissionTower() {
+  const tower = sampleTowerState();
+  const done = (over = {}) => ({ startedAt: '2026-01-01T00:00:10.000Z', completedAt: '2026-01-01T00:00:40.000Z', stopReason: 'completed', ...over });
+  const template = tower.missions[0];
+  tower.missions[0] = {
+    ...template,
+    worker: { ...template.worker, ...done() },
+    review: { ...template.review, ...done() },
+  };
+  const extra = (over) => ({
+    ...template, branch: `tower/${over.id.toLowerCase()}`, worktree: `${template.worktree}-${over.id}`,
+    revision: 1, dependsOn: [], worker: undefined, review: undefined, merge: undefined, ...over,
+  });
+  tower.missions.push(
+    extra({ id: 'M2', title: 'Blocked by dependency', status: 'pending', dependsOn: ['M3'] }),
+    extra({ id: 'M3', title: 'Under work', status: 'worker_running', worker: { runId: 'w3', provider: 'deepseek-official', model: 'deepseek-flash', childId: 'm3-worker', startedAt: new Date().toISOString() } }),
+    extra({
+      id: 'M4', title: 'Needs rework', status: 'changes_requested',
+      worker: { runId: 'w4', provider: 'deepseek-official', model: 'deepseek-flash', childId: 'm4-worker', ...done() },
+      review: { runId: 'r4', provider: 'deepseek-official', model: 'deepseek-reasoner', childId: 'm4-review', verdict: 'changes_requested', merge: false, ...done() },
+    }),
+    extra({
+      id: 'M5', title: 'Ready to merge', status: 'approved', dependsOn: ['M1'],
+      worker: { runId: 'w5', provider: 'deepseek-official', model: 'deepseek-flash', childId: 'm5-worker', ...done() },
+      review: { runId: 'r5', provider: 'deepseek-official', model: 'deepseek-reasoner', childId: 'm5-review', verdict: 'clean', merge: true, ...done() },
+    }),
+    extra({ id: 'M6', title: 'Conflicted', status: 'rebase_blocked' }),
+  );
+  return tower;
+}
+
+test('mission view shows stage, dependencies, roles, and merge commit per mission', () => {
+  const h = harness(multiMissionTower());
+  let tree = h.render();
+  // agents view stays the default; the mission list is one toggle away
+  assert.equal(missionCards(tree).length, 0);
+  assert.ok(agents(tree).length > 0);
+  findAll(tree, has('data-tower-view-button', 'missions'))[0].props.onClick();
+  tree = h.render();
+  assert.ok(findAll(tree, has('data-tower-mission-view', true)).length > 0);
+  assert.deepEqual(missionCards(tree).map((node) => node.props['data-mission-id']), ['M1', 'M2', 'M3', 'M4', 'M5', 'M6']);
+  assert.match(textOf(tree), /6 个任务/);
+  // merged mission exposes its merge commit and both spawned roles
+  const m1 = cardOf(tree, 'M1');
+  assert.equal(m1.props['data-mission-status'], 'merged');
+  assert.equal(nextOf(m1).props['data-mission-next'], 'next.merged');
+  assert.match(textOf(m1), /已合并/);
+  assert.match(textOf(m1), /merge-sha/);
+  assert.match(textOf(findAll(m1, has('data-mission-role', 'worker'))[0]), /deepseek-official \/ deepseek-flash/);
+  assert.match(textOf(findAll(m1, has('data-mission-role', 'reviewer'))[0]), /审查通过/);
+  // pending mission blocked by an unmerged dependency
+  const m2 = cardOf(tree, 'M2');
+  const m2next = nextOf(m2);
+  assert.equal(m2next.props['data-mission-next'], 'next.waitDeps');
+  assert.equal(m2next.props['data-blocked'], true);
+  assert.match(textOf(m2next), /等待依赖 M3 合并/);
+  const chip = findAll(m2, has('data-dep-id', 'M3'))[0];
+  assert.equal(chip.props['data-dep-met'], false);
+  assert.match(textOf(chip), /Worker 运行中/);
+  assert.equal(findAll(m2, has('data-mission-role', 'worker'))[0].props['data-spawned'], false);
+  assert.match(textOf(findAll(m2, has('data-mission-role', 'worker'))[0]), /尚未派生/);
+  // running, rework, mergeable, and manual stages each get their own hint
+  assert.equal(nextOf(cardOf(tree, 'M3')).props['data-mission-next'], 'next.workerRunning');
+  assert.match(textOf(cardOf(tree, 'M3')), /进行中/);
+  assert.match(textOf(findAll(cardOf(tree, 'M3'), has('data-mission-role', 'worker'))[0]), /运行中/);
+  const m4 = cardOf(tree, 'M4');
+  assert.equal(nextOf(m4).props['data-mission-next'], 'next.rework');
+  assert.match(textOf(m4), /需返工并重新审查/);
+  assert.match(textOf(findAll(m4, has('data-mission-role', 'reviewer'))[0]), /需要修改/);
+  const m5 = cardOf(tree, 'M5');
+  assert.equal(nextOf(m5).props['data-mission-next'], 'next.canMerge');
+  assert.match(textOf(m5), /可合并/);
+  assert.equal(findAll(m5, has('data-dep-id', 'M1'))[0].props['data-dep-met'], true);
+  const m6 = cardOf(tree, 'M6');
+  assert.equal(nextOf(m6).props['data-mission-next'], 'next.rebaseManual');
+  assert.equal(nextOf(m6).props['data-blocked'], true);
+  assert.match(textOf(m6), /需人工处理/);
+  // toggling back restores the agents view untouched
+  findAll(tree, has('data-tower-view-button', 'agents'))[0].props.onClick();
+  tree = h.render();
+  assert.equal(missionCards(tree).length, 0);
+  assert.ok(agents(tree).length > 0);
+  assert.match(textOf(tree), /个子代理/);
+});
+
+test('mission view unblocks when the dependency merges and stays empty without missions', () => {
+  const tower = multiMissionTower();
+  const h = harness(tower);
+  let tree = h.render();
+  findAll(tree, has('data-tower-view-button', 'missions'))[0].props.onClick();
+  tree = h.render();
+  assert.match(textOf(nextOf(cardOf(tree, 'M2'))), /等待依赖 M3 合并/);
+  tower.missions.find((mission) => mission.id === 'M3').status = 'merged';
+  tree = h.render();
+  assert.equal(nextOf(cardOf(tree, 'M2')).props['data-mission-next'], 'next.spawnWorker');
+  assert.match(textOf(nextOf(cardOf(tree, 'M2'))), /待派生 worker/);
+  assert.equal(findAll(cardOf(tree, 'M2'), has('data-dep-id', 'M3'))[0].props['data-dep-met'], true);
+  // a tower state without missions explains itself instead of rendering nothing
+  const empty = sampleTowerState();
+  empty.missions = [];
+  const bare = harness(empty);
+  tree = bare.render();
+  findAll(tree, has('data-tower-view-button', 'missions'))[0].props.onClick();
+  tree = bare.render();
+  assert.equal(missionCards(tree).length, 0);
+  assert.match(textOf(tree), /还没有任务/);
 });
