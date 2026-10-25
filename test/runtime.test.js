@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import { apply, inject, name } from '../lib/index.js';
 import { TowerRuntime } from '../lib/runtime.js';
@@ -353,6 +355,205 @@ test('settled activation records completion, cleans up, and emits a runtime noti
   assert.match(notices[0].source.summary, /worker_completed/);
 });
 
+/**
+ * Track-focused harness: one fake activation whose settlement the test
+ * controls (resolve or reject), a configurable core double, a steer-collecting
+ * parent agent, and a logging spy so containment guarantees are assertable.
+ */
+function trackHarness() {
+  const lifecycle = { disposeCalls: 0, failCalls: 0, logs: { warn: [], error: [] }, settle: undefined, reject: undefined };
+  const activation = {
+    childId: 'child-run',
+    result: new Promise((resolve, reject) => { lifecycle.settle = resolve; lifecycle.reject = reject; }),
+    async dispose() { lifecycle.disposeCalls += 1; },
+  };
+  const notices = [];
+  const core = {
+    async mission() { return { id: 'M1', title: 'Mission', description: 'Work', scope: [] }; },
+    async beginSpawn(args = {}) {
+      return {
+        runId: 'run-1',
+        mission: {
+          id: 'M1',
+          title: 'Mission',
+          description: 'Work',
+          scope: [],
+          worktree: '/tmp',
+          status: args.role === 'reviewer' ? 'review_running' : 'worker_running',
+          review: { baseCommit: 'base-1', reviewedCommit: 'tip-1' },
+        },
+      };
+    },
+    async attachSpawn() {},
+    async completeSpawn() { return { id: 'M1', status: 'worker_completed' }; },
+    async failSpawn() { lifecycle.failCalls += 1; return { id: 'M1', status: 'worker_failed' }; },
+    async status() { return { baseBranch: 'main', missions: [] }; },
+  };
+  const ctx = {
+    llm: { async resolveCallConfig(config) { return config; } },
+    subagents: { startActivation: async () => activation },
+    sessions: { async flush() {} },
+    logger: {
+      warn(message) { lifecycle.logs.warn.push(String(message)); },
+      error(message) { lifecycle.logs.error.push(String(message)); },
+    },
+  };
+  const agent = {
+    ...parent,
+    id: 'parent',
+    session: { header: {}, requestHeader: () => undefined },
+    steer: (message) => notices.push(message),
+  };
+  return { runtime: new TowerRuntime(ctx, {}), core, agent, lifecycle, notices };
+}
+
+function runTrackedSpawn(harness, role = 'worker') {
+  return harness.runtime.spawn(harness.core, harness.agent, { role, mission_id: 'M1' }, new AbortController().signal);
+}
+
+test('a failed reviewer activation notifies review_failed with a bounded reason and next action', async () => {
+  const harness = trackHarness();
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'review_failed', review: { stopReason: 'error', error: '429 rate limited' } });
+  const started = await runTrackedSpawn(harness, 'reviewer');
+  const entry = harness.runtime.active.get(started.runId);
+  harness.lifecycle.settle({ stopReason: 'error', diagnostic: '429 rate limited' });
+  await entry.done;
+  assert.equal(harness.notices.length, 1, 'the failure notice must reach the controller');
+  const notice = harness.notices[0];
+  assert.equal(notice.source.kind, 'subagent-settled');
+  assert.equal(notice.source.senderSessionId, 'child-run');
+  assert.equal(notice.source.summary, 'Tower reviewer for M1 failed: mission status review_failed');
+  const text = notice.content[0].text;
+  assert.match(text, /^Tower reviewer for M1 failed: mission status review_failed/);
+  assert.match(text, /reason: 429 rate limited/);
+  assert.match(text, /spawn a fresh reviewer/);
+  assert.equal(harness.runtime.active.size, 0);
+  assert.equal(harness.lifecycle.disposeCalls, 1);
+});
+
+test('an interrupted reviewer run reports interrupted with its reason and next action', async () => {
+  const harness = trackHarness();
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'review_failed', review: { stopReason: 'aborted', error: 'activation is not owned by this runtime' } });
+  await runTrackedSpawn(harness, 'reviewer');
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'aborted', diagnostic: 'activation is not owned by this runtime' });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  assert.equal(harness.notices[0].source.summary, 'Tower reviewer for M1 interrupted: mission status review_failed');
+  const text = harness.notices[0].content[0].text;
+  assert.match(text, /reason: activation is not owned by this runtime/);
+  assert.match(text, /spawn a fresh reviewer/);
+});
+
+test('a completeSpawn failure still steers a notice carrying the recorded error', async () => {
+  const harness = trackHarness();
+  harness.core.completeSpawn = async () => { throw new Error('state write failed'); };
+  harness.core.failSpawn = async () => ({ id: 'M1', status: 'worker_failed', worker: { error: 'state write failed' } });
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'completed', output: [{ type: 'text', text: 'done' }] });
+  await entry.done;
+  assert.equal(harness.notices.length, 1, 'recording failure must not silence the notice');
+  const text = harness.notices[0].content[0].text;
+  assert.match(text, /^Tower worker for M1 failed: mission status worker_failed/);
+  assert.match(text, /reason: state write failed/);
+  assert.match(text, /spawn a fresh worker/);
+});
+
+test('an unrecordable run still notifies with role, mission, run, and error', async () => {
+  const harness = trackHarness();
+  harness.core.completeSpawn = async () => { throw new Error('state store unavailable'); };
+  harness.core.failSpawn = async () => { throw new Error('state store unavailable'); };
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  const longError = `activation transport crashed ${'x'.repeat(600)}`;
+  harness.lifecycle.reject(new Error(longError));
+  await entry.done;
+  assert.equal(harness.notices.length, 1, 'even a doubly-failing settlement must notify');
+  const text = harness.notices[0].content[0].text;
+  assert.match(text, /^Tower worker for M1 failed: mission status unknown/);
+  assert.match(text, /run run-1 could not be recorded in Tower state/);
+  assert.match(text, /tower action=status/);
+  const reason = text.split('\n').find((line) => line.startsWith('reason: '));
+  assert.ok(reason, 'the fallback notice carries a reason line');
+  assert.ok(reason.length <= 'reason: '.length + 500, 'the reason is truncated to 500 characters');
+  assert.ok(reason.endsWith('…'));
+  assert.ok(harness.lifecycle.logs.error.some((line) => /could not record failed worker run run-1/.test(line)));
+});
+
+test('a failing projection publication never blocks the settlement notice', async () => {
+  const harness = trackHarness();
+  harness.core.status = async () => { throw new Error('projection publish failed'); };
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'completed', output: [{ type: 'text', text: 'done' }] });
+  await entry.done;
+  assert.equal(harness.notices.length, 1, 'publication failure must not block the steer');
+  assert.equal(harness.notices[0].source.summary, 'Tower worker for M1 completed: mission status worker_completed');
+  assert.ok(harness.lifecycle.logs.warn.some((line) => /projection publication failed/i.test(line)));
+});
+
+test('a failing steer is logged as an error and still settles the run', async () => {
+  const harness = trackHarness();
+  harness.agent.steer = () => { throw new Error('steer rejected'); };
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'completed', output: [{ type: 'text', text: 'done' }] });
+  await entry.done;
+  assert.equal(harness.runtime.active.size, 0);
+  assert.ok(harness.lifecycle.logs.error.some((line) => /settlement notification failed for run-1/.test(line)));
+});
+
+test('agent/created steers one stale-run notice per persisted run and dedupes repeats', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const zombie = await core.addMission({ title: 'Zombie', description: 'Stale after restart' });
+  await core.beginSpawn({ missionId: zombie.id, role: 'worker', controllerSessionId: 'controller-session' });
+  const live = await core.addMission({ title: 'Live', description: 'Owned by this runtime' });
+  const liveRun = await core.beginSpawn({ missionId: live.id, role: 'worker', controllerSessionId: 'controller-session' });
+  const zombieStartedAt = (await core.mission(zombie.id)).worker.startedAt;
+  const harness = trackHarness();
+  harness.runtime.active.set(liveRun.runId, {});
+  const steered = [];
+  const controllerAgent = (id) => ({ session: { id, header: { cwd: repo } }, steer: (message) => steered.push(message) });
+  await harness.runtime.onAgentCreated({ agent: controllerAgent('controller-session') });
+  assert.equal(steered.length, 1);
+  const notice = steered[0];
+  assert.equal(notice.source.form, 'notice');
+  assert.equal(notice.source.summary, 'Tower restart left 1 run(s) recorded as running');
+  const text = notice.content[0].text;
+  assert.match(text, new RegExp(`- ${zombie.id} worker started ${zombieStartedAt}`));
+  assert.match(text, /tower action=recover/);
+  assert.ok(!text.includes(live.id), 'runs owned by this runtime are not stale');
+  // A repeat creation for the same run steers nothing more.
+  await harness.runtime.onAgentCreated({ agent: controllerAgent('controller-session') });
+  assert.equal(steered.length, 1);
+  // A different session never receives the zombie notice.
+  await harness.runtime.onAgentCreated({ agent: controllerAgent('someone-else') });
+  assert.equal(steered.length, 1);
+});
+
+test('agent/created stays silent without tower state and only warns on unreadable state', async (t) => {
+  const harness = trackHarness();
+  const steered = [];
+  const agent = (overrides = {}) => ({ session: { id: 'session', header: {}, ...overrides.header }, steer: (message) => steered.push(message), ...overrides });
+  // A repository without tower state steers nothing.
+  const bare = makeRepo(t);
+  await harness.runtime.onAgentCreated({ agent: agent({ header: { cwd: bare } }) });
+  assert.equal(steered.length, 0);
+  // Missing cwd or a missing session is silently ignored.
+  await harness.runtime.onAgentCreated({ agent: agent() });
+  await harness.runtime.onAgentCreated({});
+  assert.equal(steered.length, 0);
+  // Unparseable state only warns and never throws into agent creation.
+  const broken = makeRepo(t);
+  await initializedCore(broken);
+  writeFileSync(path.join(broken, '.dsh-tower', 'state.json'), '{not json');
+  await harness.runtime.onAgentCreated({ agent: agent({ header: { cwd: broken } }) });
+  assert.equal(steered.length, 0);
+  assert.ok(harness.lifecycle.logs.warn.some((line) => /could not read tower state/.test(line)));
+});
+
 test('bundle registers the tower tool and owned runtime effect', () => {
   const registrations = [];
   const effects = [];
@@ -369,6 +570,23 @@ test('bundle registers the tower tool and owned runtime effect', () => {
   assert.equal(registrations[0].parameters.properties.action.enum.includes('spawn'), true);
   assert.equal(effects.length, 1);
   assert.equal(effects[0].label, 'tower-enhanced.runtime');
+});
+
+test('bundle subscribes the runtime to agent/created without letting probe failures escape', async () => {
+  const listeners = new Map();
+  const ctx = {
+    root: { sessionProjections: { register: () => () => undefined } },
+    tools: { register: () => () => undefined },
+    effect: () => undefined,
+    on(name, listener) { listeners.set(name, listener); return () => listeners.delete(name); },
+  };
+  apply(ctx, {});
+  const handler = listeners.get('agent/created');
+  assert.ok(typeof handler === 'function', 'the bundle must subscribe to agent/created');
+  // An agent without a usable cwd is silently ignored; the serial listener never throws.
+  await handler({ agent: { session: { id: 'session' } } });
+  await handler({});
+  assert.equal(listeners.has('agent/created'), true);
 });
 
 function executeHarness(repo) {

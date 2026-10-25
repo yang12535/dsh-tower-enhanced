@@ -115,8 +115,8 @@ config:
 2. `tower({action:"init"})`。
 3. 用完整的描述添加任务，可选 `depends_on`/`scope`。
 4. `spawn` 一个 worker。它在任务 worktree 中工作，结束前必须提交。
-5. 任务变为 `worker_completed` 后，`spawn` 一个 reviewer。reviewer 返回结构化的结论（`clean` 或 `changes_requested`，附 merge 建议）。
-6. `status`/`gate` 检查状态。`approved` 的任务可以合并；`changes_requested` 需要再跑一轮 worker。
+5. 任务变为 `worker_completed` 后，`spawn` 一个 reviewer。reviewer 返回结构化的结论（`clean` 或 `changes_requested`，附 merge 建议）；如果 review 失败（限流、崩溃或没有结构化结论），任务会进入 `review_failed` —— 可以重新 spawn reviewer，也可以直接另派 worker 返工。
+6. `status`/`gate` 检查状态。`approved` 的任务可以合并；`changes_requested` 需要再跑一轮 worker；`review_failed` 既非运行中也非终态，因此既可以从中重新 spawn reviewer，也可以直接重新 spawn worker。
 7. 如果 base 发生了移动，先 `rebase`，然后在合并前获得新的 review。
 8. `merge` 会评估门禁并合并被审查的精确 SHA。`teardown` 稍后只移除符合条件的 worktree。
 
@@ -124,7 +124,10 @@ config:
 
 ## 失败恢复
 
-- `recover` 是显式的，绝不接管旧进程。确认上一个控制器停止后，它把持久化的运行中激活标记为 interrupted，让新代理可以启动。
+- 失败一定会通知控制器：每个结束的 worker/reviewer 都会向控制器 Session steer 一条形如 `Tower <role> for <mission> <outcome>: mission status <status>` 的通知；失败/被中断/过期（stale）的结果会附带截断到 500 字符以内的 `reason`（来自记录的 error 或 diagnostic）以及下一步操作提示 —— 即使状态记录或投影发布失败，通知也仍会发出（最坏情况下退化为一条包含 role、mission、run 与错误文本的兜底通知）。
+- review 失败是显式状态：reviewer 出错、没有返回结构化结论、或根本没有启动成功时，任务进入 `review_failed`（记录 `error`、`stopReason`、`completedAt`，并写入 `spawn-failed` 事件），而不会再退回难以区分的 `worker_completed`。可以从中重新 spawn reviewer，或直接另派 worker 返工；在干净的 review 批准之前，合并门禁会给出 `NOT_APPROVED`。
+- 宿主进程重启后，运行时会监听在 tower 工作区上新创建的 agent，并就持久化的 `worker_running`/`review_running` 激活向控制器主动 steer 一次僵尸告警（列出 mission/role/启动时间），提示执行 `tower action=recover` —— 重启遗留的僵尸不会再无声地停留在「运行中」。
+- `recover` 是显式的，绝不接管旧进程。确认上一个控制器停止后，它把持久化的运行中激活标记为 interrupted（worker 运行变为 `worker_failed`，reviewer 运行变为 `review_failed`），让新代理可以启动。
 - 用相同的任务 id 重试 `add` 只会对分支/worktree 产物完全匹配且没有独立提交的情况做调和。有冲突的产物需要人工检查，绝不会自动删除。
 - 当被干净审查过的精确 SHA 已经包含在 base 中、且仍是任务 tip 时，`gate` 会报告 `alreadyMerged`；随后的 `merge` 只做账目调和，不会再次合并。
 - `merge` 区分 Git 完成与状态记账，当后续观察或持久化需要关注时返回 `postMerge`/`recoveryRequired`。观察失败时返回 `mergeAttempted: true`、`merged: false`、`verified: false`；只有精确 SHA 验证或后续调和才会产生 `merged: true`。
