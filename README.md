@@ -110,8 +110,8 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 2. `tower({action:"init"})`.
 3. Add missions with complete descriptions and optional `depends_on`/`scope`.
 4. `spawn` a worker. It works in the mission worktree and must commit before finishing.
-5. When the mission becomes `worker_completed`, `spawn` a reviewer. The reviewer returns a structured verdict.
-6. `status`/`gate` inspect state. An `approved` mission can be merged; `changes_requested` needs another worker round.
+5. When the mission becomes `worker_completed`, `spawn` a reviewer. The reviewer returns a structured verdict; if it fails (rate limit, crash, or no structured verdict) the mission moves to `review_failed` — spawn the reviewer again, or a worker for direct rework.
+6. `status`/`gate` inspect state. An `approved` mission can be merged; `changes_requested` needs another worker round; `review_failed` is neither running nor terminal, so both a fresh reviewer and a fresh worker can start from it.
 7. If the base moved, `rebase`, then obtain a fresh review before merging.
 8. `merge` evaluates the gate and merges the exact reviewed SHA. `teardown` later removes eligible worktrees only.
 
@@ -119,7 +119,10 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 
 ## Failure recovery
 
-- `recover` is explicit and never adopts old processes. After confirming the previous controller stopped, it marks persisted running activations interrupted so fresh agents can start.
+- Failure always reaches the controller: every settled worker/reviewer steers the controller Session a notice shaped `Tower <role> for <mission> <outcome>: mission status <status>`, and failure/interrupted/stale outcomes add a bounded `reason` (≤500 characters from the recorded error or diagnostic) plus the next action — even when state recording or projection publishing fails, the notice still goes out (at worst as a fallback naming role, mission, run, and error).
+- A failed review is explicit: a reviewer that errors out, returns no structured verdict, or never starts moves the mission to `review_failed` (recorded with `error`, `stopReason`, and `completedAt`, and a `spawn-failed` event) instead of collapsing back into `worker_completed`. Spawn a fresh reviewer from it, or a worker for direct rework; the merge gate reports `NOT_APPROVED` until a clean review approves the mission.
+- After a host restart, the runtime watches for agents recreated over a tower workspace and proactively steers the controller one stale-run warning per persisted `worker_running`/`review_running` activation (mission/role/start time), suggesting `tower action=recover` — persisted zombies never sit silently as "running".
+- `recover` is explicit and never adopts old processes. After confirming the previous controller stopped, it marks persisted running activations interrupted (worker runs become `worker_failed`, reviewer runs `review_failed`) so fresh agents can start.
 - Retrying `add` with the same mission id reconciles only exactly matching branch/worktree artifacts with no unique commits. Conflicting artifacts require manual inspection and are never deleted automatically.
 - `gate` reports `alreadyMerged` when the exact clean-reviewed SHA is already contained in the base and still matches the mission tip. `merge` then performs accounting-only reconciliation instead of merging again.
 - `merge` distinguishes Git completion from state accounting and returns `postMerge`/`recoveryRequired` when later observation or persistence needs attention. Inspection failure is `mergeAttempted: true`, `merged: false`, `verified: false`; only exact-SHA verification or later reconciliation produces `merged: true`.

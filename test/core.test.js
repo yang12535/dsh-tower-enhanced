@@ -116,6 +116,69 @@ test('dirty worker output cannot enter review', async (t) => {
   await assert.rejects(core.beginSpawn({ missionId: mission.id, role: 'reviewer' }), /must complete a worker/);
 });
 
+test('reviewer failure moves the mission to review_failed and keeps it retryable', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const { mission } = await addAndRunWorker(core);
+  const revisionBefore = mission.revision;
+  // Path 1: the reviewer activation ended with an error stop reason.
+  const errored = await core.beginSpawn({ missionId: mission.id, role: 'reviewer' });
+  const failed = await core.completeSpawn(errored.runId, { stopReason: 'error', diagnostic: '429 rate limited' });
+  assert.equal(failed.status, 'review_failed');
+  assert.equal(failed.review.stopReason, 'error');
+  assert.equal(failed.review.error, '429 rate limited');
+  assert.ok(failed.review.completedAt, 'the failed review records when it settled');
+  assert.equal(failed.revision, revisionBefore + 2, 'beginSpawn and completeSpawn each bump the revision');
+  const state = await core.status();
+  const event = state.events.at(-1);
+  assert.equal(event.type, 'spawn-failed');
+  assert.equal(event.mission, mission.id);
+  assert.equal(event.role, 'reviewer');
+  assert.equal(event.status, 'review_failed');
+  assert.equal(event.error, '429 rate limited');
+  // The gate must refuse it as NOT_APPROVED without crashing.
+  const gate = await core.mergeGate(mission.id);
+  assert.equal(gate.ready, false);
+  assert.ok(gate.blocks.some((block) => block.code === 'NOT_APPROVED'));
+  // review_failed is not pending (editing stays blocked) and not active:
+  // the reviewer retry below starts directly without an AGENT_BUSY barrier.
+  await assert.rejects(core.editMission({ missionId: mission.id, title: 'Too late' }), /only a pending mission/);
+  // A reviewer may be retried directly from review_failed.
+  const retried = await core.beginSpawn({ missionId: mission.id, role: 'reviewer' });
+  assert.equal(retried.mission.status, 'review_running');
+  // Path 2: the reviewer completed but returned no structured verdict.
+  const unstructured = await core.completeSpawn(retried.runId, { stopReason: 'completed', output: 'no verdict payload' });
+  assert.equal(unstructured.status, 'review_failed');
+  assert.equal(unstructured.review.error, 'reviewer did not return a structured verdict');
+  // Path 3: the activation never started, so failSpawn records it.
+  const refused = await core.beginSpawn({ missionId: mission.id, role: 'reviewer' });
+  const failedStart = await core.failSpawn(refused.runId, new Error('activation start refused'));
+  assert.equal(failedStart.status, 'review_failed');
+  assert.match(failedStart.review.error, /activation start refused/);
+  assert.ok(failedStart.review.completedAt);
+  // A worker may also be respawned directly from review_failed for rework.
+  const rework = await core.beginSpawn({ missionId: mission.id, role: 'worker' });
+  assert.equal(rework.mission.status, 'worker_running');
+  assert.equal(rework.mission.review, undefined, 'a fresh worker round discards the failed review record');
+});
+
+test('recovery marks a stale reviewer run as review_failed', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const { mission } = await addAndRunWorker(core);
+  await core.beginSpawn({ missionId: mission.id, role: 'reviewer' });
+  const reopened = new TowerCore({ cwd: repo });
+  await reopened.open();
+  const recovered = await reopened.recover();
+  assert.equal(recovered.recovered.length, 1);
+  assert.equal(recovered.recovered[0].role, 'reviewer');
+  assert.equal(recovered.state.missions[0].status, 'review_failed');
+  assert.equal(recovered.state.missions[0].review.stale, true);
+  assert.equal(recovered.state.missions[0].review.stopReason, 'aborted');
+  const retried = await reopened.beginSpawn({ missionId: mission.id, role: 'reviewer' });
+  assert.equal(retried.mission.status, 'review_running');
+});
+
 test('dependencies gate worker startup and abandoned dependencies are explicit', async (t) => {
   const repo = makeRepo(t);
   const core = await initializedCore(repo);
@@ -187,7 +250,7 @@ test('a no-op rebase preserves a changes-requested verdict', async (t) => {
   assert.equal(result.mission.review.merge, false);
 });
 
-test('a no-op rebase keeps a failed review in worker_completed', async (t) => {
+test('a no-op rebase preserves a failed review as review_failed', async (t) => {
   const repo = makeRepo(t);
   const core = await initializedCore(repo);
   const { mission } = await addAndRunWorker(core);
@@ -195,7 +258,7 @@ test('a no-op rebase keeps a failed review in worker_completed', async (t) => {
   await core.completeSpawn(begun.runId, { stopReason: 'error', diagnostic: 'review transport failed' });
   const result = await core.rebase(mission.id);
   assert.equal(result.rebased, true);
-  assert.equal(result.mission.status, 'worker_completed');
+  assert.equal(result.mission.status, 'review_failed');
   assert.equal(result.mission.review.verdict, undefined);
 });
 
