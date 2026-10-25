@@ -420,3 +420,128 @@ test('an edited dependency list gates worker startup', async (t) => {
   const begun = await core.beginSpawn({ missionId: mission.id, role: 'worker' });
   assert.equal(begun.mission.status, 'worker_running');
 });
+
+test('summary reports compact counts and one-line entries without mutating state', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const running = await core.addMission({ title: 'Running', description: 'Worker in flight with a very long description that must not leak into the summary' });
+  await core.beginSpawn({ missionId: running.id, role: 'worker', provider: 'prov-a', model: 'model-a', reasoningEffort: 'low' });
+  await core.addMission({ title: 'Gated', description: 'Waits for the running mission', dependsOn: [running.id] });
+  const { mission: reviewing } = await addAndRunWorker(core, { title: 'Under review' });
+  await core.beginSpawn({ missionId: reviewing.id, role: 'reviewer', provider: 'prov-b', model: 'model-b' });
+  const { mission: approved } = await addAndRunWorker(core, { title: 'Approve me' });
+  const approvedRun = await core.beginSpawn({ missionId: approved.id, role: 'reviewer', provider: 'prov-c', model: 'model-c' });
+  await core.completeSpawn(approvedRun.runId, {
+    stopReason: 'completed',
+    structured: { verdict: 'clean', merge: true, summary: 'clean', findings: [], checks: [] },
+  });
+  const { mission: merged } = await addAndRunWorker(core, { title: 'Merge me' });
+  await approve(core, merged.id);
+  const mergeResult = await core.merge(merged.id);
+  const { mission: blocked } = await addAndRunWorker(core, { title: 'Blocked', file: 'README.md', content: '# worker version\n' });
+  await approve(core, blocked.id);
+  commitFile(repo, 'README.md', '# conflicting base\n', 'conflicting base change');
+  await core.rebase(blocked.id);
+  const abandoned = await core.addMission({ title: 'Abandoned', description: 'Dropped from the plan' });
+  await core.abandon(abandoned.id);
+
+  const before = await core.store.read();
+  const summary = await core.summary();
+  assert.equal(summary.version, 1);
+  assert.equal(summary.repoRoot, repo);
+  assert.equal(summary.baseBranch, 'main');
+  // After the merge, the conflicting commit moved main and the 'Abandoned' add
+  // re-recorded that tip as the base, so the recorded base is the final main head.
+  assert.equal(summary.baseCommit, git(repo, 'rev-parse', 'main'), 'summary mirrors the recorded base tip');
+  assert.deepEqual(summary.counts, { missions: 7, workerRunning: 1, reviewRunning: 1, approved: 1, merged: 1, blocked: 1, abandoned: 1 });
+  const entries = new Map(summary.missions.map((entry) => [entry.id, entry]));
+  assert.deepEqual(entries.get(running.id), {
+    id: running.id,
+    title: 'Running',
+    status: 'worker_running',
+    dependsOn: [],
+    worker: { provider: 'prov-a', model: 'model-a', reasoningEffort: 'low' },
+    review: null,
+    mergeCommit: null,
+  });
+  assert.deepEqual(entries.get('M2'), {
+    id: 'M2',
+    title: 'Gated',
+    status: 'pending',
+    dependsOn: [running.id],
+    worker: null,
+    review: null,
+    mergeCommit: null,
+  });
+  assert.deepEqual(entries.get(reviewing.id), {
+    id: reviewing.id,
+    title: 'Under review',
+    status: 'review_running',
+    dependsOn: [],
+    worker: { stopReason: 'completed' },
+    review: { provider: 'prov-b', model: 'model-b' },
+    mergeCommit: null,
+  });
+  assert.deepEqual(entries.get(approved.id), {
+    id: approved.id,
+    title: 'Approve me',
+    status: 'approved',
+    dependsOn: [],
+    worker: { stopReason: 'completed' },
+    review: { provider: 'prov-c', model: 'model-c', verdict: 'clean', merge: true },
+    mergeCommit: null,
+  });
+  assert.deepEqual(entries.get(merged.id), {
+    id: merged.id,
+    title: 'Merge me',
+    status: 'merged',
+    dependsOn: [],
+    worker: { stopReason: 'completed' },
+    review: { verdict: 'clean', merge: true },
+    mergeCommit: mergeResult.mergeCommit,
+  });
+  assert.deepEqual(entries.get(blocked.id), {
+    id: blocked.id,
+    title: 'Blocked',
+    status: 'rebase_blocked',
+    dependsOn: [],
+    worker: { stopReason: 'completed' },
+    review: null,
+    mergeCommit: null,
+  });
+  assert.deepEqual(entries.get(abandoned.id), {
+    id: abandoned.id,
+    title: 'Abandoned',
+    status: 'abandoned',
+    dependsOn: [],
+    worker: null,
+    review: null,
+    mergeCommit: null,
+  });
+  for (const entry of summary.missions) {
+    for (const field of ['description', 'scope', 'branch', 'worktree', 'revision', 'createdAt', 'events', 'observations']) {
+      assert.equal(Object.hasOwn(entry, field), false, `summary entry ${entry.id} must not carry ${field}`);
+    }
+  }
+  assert.deepEqual(await core.store.read(), before, 'summary must not touch revisions, events, or updatedAt');
+
+  const filtered = await core.summary({ missionId: 'M2' });
+  assert.equal(filtered.missions.length, 1);
+  assert.deepEqual(filtered.missions[0], entries.get('M2'));
+  assert.deepEqual(filtered.counts, summary.counts, 'mission_id narrows entries but counts stay global');
+  await assert.rejects(core.summary({ missionId: 'NOPE' }), (error) => {
+    assert.equal(error.code, 'MISSION_NOT_FOUND');
+    return true;
+  });
+  assert.deepEqual(await core.store.read(), before, 'filtering and failures stay read-only too');
+
+  assert.deepEqual(JSON.parse(JSON.stringify(summary)), summary);
+  assert.deepEqual(validateJsonSchemaValue({}, summary), []);
+  assert.deepEqual(validateJsonSchemaValue({}, filtered), []);
+});
+
+test('summary requires an initialized tower', async (t) => {
+  const repo = makeRepo(t);
+  const core = new TowerCore({ cwd: repo });
+  await assert.rejects(core.summary(), /run tower with action init first/);
+});
