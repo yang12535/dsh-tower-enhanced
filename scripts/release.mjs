@@ -10,7 +10,7 @@
 // commits, tags, pushes, or touches the network.
 
 import { spawnSync } from 'node:child_process';
-import { closeSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, linkSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -308,6 +308,18 @@ function resolveGitDirectory(repo) {
   return result.stdout.trim();
 }
 
+function newLockToken() {
+  return `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function lockToken(raw) {
+  try {
+    return JSON.parse(raw).token;
+  } catch {
+    return null;
+  }
+}
+
 function lockedError(lockPath, raw, modifiedAt) {
   let holder = null;
   try {
@@ -319,12 +331,18 @@ function lockedError(lockPath, raw, modifiedAt) {
   const owner = holder === null ? 'an unknown pid' : `pid ${holder}`;
   return new ReleaseError(
     'RELEASE_LOCKED',
-    `RELEASE_LOCKED: another release apply is in progress (${owner}); lock: ${lockPath} (modified ${new Date(modifiedAt).toISOString()}). Wait for that process to finish before retrying. Do not remove a live lock; if the holder is gone and automatic stale-lock takeover did not resolve it, inspect the process and remove this lock manually.`,
+    `RELEASE_LOCKED: another release apply or stale-lock recovery is in progress (${owner}); lock: ${lockPath} (modified ${new Date(modifiedAt).toISOString()}). Wait for that process to finish before retrying; never wait or retry automatically. Do not remove a live lock; if the holder is gone and automatic stale-lock takeover did not resolve it, inspect the process and remove this lock manually.`,
+  );
+}
+
+function lockChangedError(lockPath) {
+  return new ReleaseError(
+    'RELEASE_LOCKED',
+    `RELEASE_LOCKED: lock ${lockPath} changed or was claimed by another process during acquisition. Retry after the other release process finishes; inspect the lock and its pid before considering manual cleanup.`,
   );
 }
 
 function inspectStaleLock(lockPath) {
-  // Stat before reading so the contents can be compared again before unlinking.
   const lockStat = statSync(lockPath);
   const raw = readFileSync(lockPath, 'utf8');
   let data = null;
@@ -357,69 +375,198 @@ function inspectStaleLock(lockPath) {
   return { raw, notice: `Taking over stale release lock ${lockPath}: ${reason}.` };
 }
 
-export function acquireReleaseLock(repo) {
-  // Keep the lock in the actual Git directory (which also handles linked
-  // worktrees), never in the work tree: it must not dirty `git status`, which
-  // --apply checks, and no .gitignore change is needed.
-  const lockPath = path.join(resolveGitDirectory(repo), 'release-apply.lock');
+function createLock(lockPath) {
+  // EEXIST is deliberately left unwrapped so callers can distinguish normal
+  // contention from an actual filesystem failure.
+  let handle;
+  try {
+    handle = openSync(lockPath, 'wx', 0o600);
+  } catch (error) {
+    if (error.code === 'EEXIST') throw error;
+    throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot create release lock ${lockPath}: ${error.message}`, { cause: error });
+  }
+  const token = newLockToken();
+  try {
+    writeFileSync(handle, `${JSON.stringify({ pid: process.pid, timestamp: Date.now(), token })}\n`, 'utf8');
+  } catch (error) {
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      // Preserve the original write error.
+    }
+    throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot initialize release lock ${lockPath}: ${error.message}`, { cause: error });
+  } finally {
+    closeSync(handle);
+  }
+  return token;
+}
+
+function currentLockedError(lockPath) {
+  try {
+    return lockedError(lockPath, readFileSync(lockPath, 'utf8'), statSync(lockPath).mtimeMs);
+  } catch {
+    return lockChangedError(lockPath);
+  }
+}
+
+function restoreQuarantinedLock(quarantinePath, lockPath) {
+  // A hard link restores only if the destination is absent; rename() could
+  // overwrite a third process's newer lock. The unique quarantine is removed
+  // either way, and the current path remains the authority if linking loses.
+  try {
+    linkSync(quarantinePath, lockPath);
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  } finally {
+    rmSync(quarantinePath, { force: true });
+  }
+}
+
+function quarantineStaleLock(lockPath, stale) {
+  // rename() atomically removes exactly one directory entry. Verifying the
+  // moved bytes before deleting them closes the old read/check/unlink TOCTOU:
+  // if a newer lock was moved instead, restore it and do not create a main lock.
+  const quarantinePath = `${lockPath}.reclaim-${newLockToken()}`;
+  try {
+    renameSync(lockPath, quarantinePath);
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot quarantine stale lock ${lockPath}: ${error.message}`, { cause: error });
+  }
+  let movedRaw;
+  try {
+    movedRaw = readFileSync(quarantinePath, 'utf8');
+  } catch (error) {
+    try {
+      restoreQuarantinedLock(quarantinePath, lockPath);
+    } catch {
+      // Preserve the original read error.
+    }
+    throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot verify quarantined lock ${lockPath}: ${error.message}`, { cause: error });
+  }
+  if (movedRaw !== stale.raw) {
+    restoreQuarantinedLock(quarantinePath, lockPath);
+    throw lockChangedError(lockPath);
+  }
+  rmSync(quarantinePath);
+  return true;
+}
+
+function releaseOwnedLock(lockPath, token) {
+  try {
+    // Rename rather than check-then-unlink: the moved file is authoritative.
+    // If a stale holder was replaced, a different token is restored, never
+    // deleted. Only this process's own token is finally removed.
+    const currentRaw = readFileSync(lockPath, 'utf8');
+    if (lockToken(currentRaw) !== token) return;
+    const quarantinePath = `${lockPath}.release-${token}`;
+    try {
+      renameSync(lockPath, quarantinePath);
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    if (lockToken(readFileSync(quarantinePath, 'utf8')) !== token) {
+      restoreQuarantinedLock(quarantinePath, lockPath);
+      return;
+    }
+    rmSync(quarantinePath);
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw new ReleaseError('RELEASE_UNLOCK_FAILED', `cannot release lock ${lockPath}: ${error.message}`, { cause: error });
+  }
+}
+
+function acquireReclaimLock(reclaimPath) {
   let notice = null;
-
-  // These are immediate race/stale-lock retries, never waiting for a live lock.
-  for (let attempt = 0; attempt < 4; attempt++) {
-    let handle;
-    try {
-      handle = openSync(lockPath, 'wx', 0o600);
-    } catch (error) {
-      if (error.code !== 'EEXIST') {
-        throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot create release lock ${lockPath}: ${error.message}`, { cause: error });
-      }
-      let stale;
-      try {
-        stale = inspectStaleLock(lockPath);
-        // Never unlink a lock whose contents changed after inspection: a new
-        // holder may have replaced the stale lock in the meantime.
-        if (readFileSync(lockPath, 'utf8') !== stale.raw) continue;
-        rmSync(lockPath);
-        notice = stale.notice;
-        continue;
-      } catch (lockError) {
-        if (lockError.code === 'ENOENT') continue;
-        if (lockError instanceof ReleaseError) throw lockError;
-        throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot inspect or replace release lock ${lockPath}: ${lockError.message}`, { cause: lockError });
-      }
-    }
-
-    const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    try {
-      writeFileSync(handle, `${JSON.stringify({ pid: process.pid, timestamp: Date.now(), token })}\n`, 'utf8');
-    } catch (error) {
-      try {
-        rmSync(lockPath, { force: true });
-      } catch {
-        // Preserve the original write error.
-      }
-      throw new ReleaseError('RELEASE_LOCK_FAILED', `cannot initialize release lock ${lockPath}: ${error.message}`, { cause: error });
-    } finally {
-      closeSync(handle);
-    }
-
-    return {
-      notice,
-      release() {
-        try {
-          const current = JSON.parse(readFileSync(lockPath, 'utf8'));
-          // If somebody manually replaced our lock, never delete the new one.
-          if (current.token === token) rmSync(lockPath);
-        } catch (error) {
-          if (error.code !== 'ENOENT') {
-            throw new ReleaseError('RELEASE_UNLOCK_FAILED', `cannot release lock ${lockPath}: ${error.message}`, { cause: error });
-          }
-        }
-      },
-    };
+  try {
+    return { token: createLock(reclaimPath), notice };
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
   }
 
-  throw new ReleaseError('RELEASE_LOCKED', `RELEASE_LOCKED: release lock ${lockPath} kept changing during acquisition. Retry after the other release process finishes; inspect the lock and its pid before considering manual cleanup.`);
+  let stale;
+  try {
+    stale = inspectStaleLock(reclaimPath);
+  } catch (error) {
+    if (error.code === 'ENOENT') throw lockChangedError(reclaimPath);
+    throw error;
+  }
+  notice = stale.notice;
+  // A stale reclaim lock is itself claimed by an atomic rename to a unique
+  // path. If a delayed reclaimer moves a newer reclaim lock, the token/content
+  // check above makes it restore that lock and abort before touching the main
+  // lock. If the old reclaim lock vanished, fail rather than race its reclaimer.
+  if (!quarantineStaleLock(reclaimPath, stale)) throw lockChangedError(reclaimPath);
+  try {
+    return { token: createLock(reclaimPath), notice };
+  } catch (error) {
+    if (error.code === 'EEXIST') throw currentLockedError(reclaimPath);
+    throw error;
+  }
+}
+
+function acquiredLock(lockPath, token, notice) {
+  return {
+    notice,
+    release() {
+      releaseOwnedLock(lockPath, token);
+    },
+  };
+}
+
+export function acquireReleaseLock(repo) {
+  // Keep both locks in the actual Git directory (which also handles linked
+  // worktrees), never in the work tree: they must not dirty `git status`, which
+  // --apply checks, and no .gitignore change is needed. R serializes stale-L
+  // recovery; L's final open('wx') remains the atomic ownership decision even
+  // if two processes race to recover R itself.
+  const gitDirectory = resolveGitDirectory(repo);
+  const lockPath = path.join(gitDirectory, 'release-apply.lock');
+  const reclaimPath = path.join(gitDirectory, 'release-apply.reclaim.lock');
+
+  try {
+    return acquiredLock(lockPath, createLock(lockPath), null);
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  }
+
+  let stale;
+  try {
+    stale = inspectStaleLock(lockPath);
+  } catch (error) {
+    if (error.code === 'ENOENT') throw lockChangedError(lockPath);
+    throw error;
+  }
+
+  const reclaim = acquireReclaimLock(reclaimPath);
+  try {
+    // Re-read only after owning R. Any replacement, even another stale-looking
+    // generation, belongs to another recovery and is refused rather than
+    // deleted. If L vanished, createLock('wx') below safely arbitrates the race.
+    let current = null;
+    try {
+      current = inspectStaleLock(lockPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (current !== null) {
+      if (current.raw !== stale.raw) throw lockChangedError(lockPath);
+      quarantineStaleLock(lockPath, current);
+    }
+
+    let token;
+    try {
+      token = createLock(lockPath);
+    } catch (error) {
+      if (error.code === 'EEXIST') throw currentLockedError(lockPath);
+      throw error;
+    }
+    const notice = [reclaim.notice, current?.notice ?? stale.notice].filter(Boolean).join(' ');
+    return acquiredLock(lockPath, token, notice);
+  } finally {
+    releaseOwnedLock(reclaimPath, reclaim.token);
+  }
 }
 
 // ---------------------------------------------------------------------------
