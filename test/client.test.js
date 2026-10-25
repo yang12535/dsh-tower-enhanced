@@ -23,8 +23,9 @@ const cardOf = (tree, id) => missionCards(tree).find((node) => node.props['data-
 const nextOf = (card) => card && findAll(card, (node) => 'data-mission-next' in (node.props ?? {}))[0];
 
 // Preserve hook state across renders to exercise real scope/filter/click transitions.
-function harness(tower = sampleTowerState(), { language = 'zh' } = {}) {
+function harness(tower = sampleTowerState(), { language = 'zh', now } = {}) {
   let definition, hookIndex, activeHooks;
+  const clock = { now };
   const hooks = new Map(), slots = new Map(), opened = [], catalog = new Map(), dictionaries = {};
   const rows = {
     root: { title: 'Controller A' },
@@ -53,6 +54,7 @@ function harness(tower = sampleTowerState(), { language = 'zh' } = {}) {
   vm.runInNewContext(readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'), {
     window: { __ModuleLoader__: { load: (value) => { definition = value; } } },
     document: { querySelector: () => ({}), body: {} }, URLSearchParams,
+    Date: class extends Date { static now() { return clock.now ?? super.now(); } },
   });
   const exported = definition.factory(require);
   const services = {
@@ -94,7 +96,7 @@ function harness(tower = sampleTowerState(), { language = 'zh' } = {}) {
     };
     return expand(element(slot.component, props), `${surface}:${sessionId}`);
   }
-  return { render, opened, rows, catalog, projections, slots, services, module: exported };
+  return { render, opened, rows, catalog, projections, slots, services, module: exported, clock };
 }
 
 test('only review belonging to this controller is shown, workspace retains both real sessions', () => {
@@ -545,6 +547,116 @@ test('mission cards offer per-role session links only with a recorded controller
 
 const roleRowOf = (card, role) => findAll(card, has('data-mission-role', role))[0];
 const errorNodes = (tree) => findAll(tree, (node) => node.props != null && 'data-agent-error' in node.props);
+
+test('mission role elapsed time formats second and minute boundaries and requires startedAt', () => {
+  for (const [seconds, expected] of [[45, '45s'], [59, '59s'], [60, '1m00s'], [200, '3m20s']]) {
+    const tower = sampleTowerState();
+    const started = Date.parse('2026-01-01T00:00:00.000Z');
+    tower.missions[0].worker = {
+      ...tower.missions[0].worker,
+      startedAt: new Date(started).toISOString(),
+      completedAt: new Date(started + seconds * 1000).toISOString(),
+      stopReason: 'completed',
+    };
+    tower.missions[0].review = undefined;
+    const row = roleRowOf(cardOf(missionsView(harness(tower)), 'M1'), 'worker');
+    const elapsed = findAll(row, has('data-agent-elapsed', 'worker'));
+    assert.equal(elapsed.length, 1);
+    assert.equal(textOf(elapsed[0]), expected, `${seconds} seconds`);
+  }
+
+  const tower = sampleTowerState();
+  tower.missions[0].worker = {
+    ...tower.missions[0].worker,
+    completedAt: '2026-01-01T00:00:45.000Z', stopReason: 'completed',
+  };
+  const card = cardOf(missionsView(harness(tower)), 'M1');
+  assert.equal(findAll(card, (node) => node.props != null && 'data-agent-elapsed' in node.props).length, 0);
+});
+
+test('running mission role elapsed time advances and becomes fixed on completion', () => {
+  const tower = sampleTowerState();
+  tower.missions[0].status = 'worker_running';
+  tower.missions[0].worker = {
+    ...tower.missions[0].worker, startedAt: '2026-01-01T00:00:00.000Z',
+  };
+  tower.missions[0].review = undefined;
+  const h = harness(tower, { now: Date.parse('2026-01-01T00:00:45.000Z') });
+  const elapsed = () => findAll(
+    roleRowOf(cardOf(h.render(), 'M1'), 'worker'), has('data-agent-elapsed', 'worker'),
+  )[0];
+  missionsView(h);
+  assert.equal(textOf(elapsed()), '45s');
+  h.clock.now += 15_000;
+  assert.equal(textOf(elapsed()), '1m00s');
+
+  tower.missions[0].status = 'worker_completed';
+  tower.missions[0].worker.completedAt = '2026-01-01T00:01:20.000Z';
+  tower.missions[0].worker.stopReason = 'completed';
+  assert.equal(textOf(elapsed()), '1m20s');
+  h.clock.now += 60_000;
+  assert.equal(textOf(elapsed()), '1m20s');
+});
+
+test('mission stop-reason badges are localized and use semantic or neutral dots', () => {
+  for (const [language, reason, label, dataState, dot] of [
+    ['zh', 'completed', '已完成', 'completed', 'done'],
+    ['zh', 'error', '错误', 'error', 'error'],
+    ['zh', 'aborted', '已中止', 'aborted', 'warning'],
+    ['zh', 'crash-loop', 'crash-loop', 'unknown', 'idle'],
+    ['en', 'completed', 'Completed', 'completed', 'done'],
+    ['en', 'error', 'Error', 'error', 'error'],
+    ['en', 'aborted', 'Aborted', 'aborted', 'warning'],
+  ]) {
+    const tower = sampleTowerState();
+    tower.missions[0].worker = {
+      ...tower.missions[0].worker,
+      startedAt: '2026-01-01T00:00:00.000Z', completedAt: '2026-01-01T00:00:45.000Z', stopReason: reason,
+    };
+    tower.missions[0].review = undefined;
+    const row = roleRowOf(cardOf(missionsView(harness(tower, { language })), 'M1'), 'worker');
+    const badges = findAll(row, has('data-agent-stop-reason', reason));
+    assert.equal(badges.length, 1, `${language}:${reason}`);
+    assert.equal(badges[0].props['data-state'], dataState);
+    assert.equal(findAll(badges[0], (node) => node.type === 'StateDot')[0].props.state, dot);
+    assert.equal(textOf(badges[0]).trim(), label);
+  }
+});
+
+test('mission cards retain distinct review_failed, interrupted, and stale markers and next steps', () => {
+  const tower = sampleTowerState();
+  tower.missions[0].status = 'review_failed';
+  tower.missions[0].review = {
+    ...tower.missions[0].review, completedAt: '2026-01-01T00:00:30.000Z', error: 'review transport failed',
+  };
+  let card = cardOf(missionsView(harness(tower)), 'M1');
+  const missionStatus = findAll(card, has('data-state', 'review_failed'))[0];
+  assert.equal(findAll(missionStatus, (node) => node.type === 'StateDot')[0].props.state, 'error');
+  assert.match(textOf(roleRowOf(card, 'reviewer')), /失败/);
+  assert.equal(nextOf(card).props['data-mission-next'], 'next.reviewFailed');
+
+  tower.missions[0].status = 'review_running';
+  tower.missions[0].review = {
+    ...tower.missions[0].review, startedAt: '2026-01-01T00:00:00.000Z', completedAt: undefined,
+    error: undefined, stopReason: 'aborted', verdict: undefined, merge: undefined,
+  };
+  card = cardOf(missionsView(harness(tower)), 'M1');
+  const interrupted = findAll(roleRowOf(card, 'reviewer'), has('data-state', 'interrupted'))[0];
+  assert.equal(findAll(interrupted, (node) => node.type === 'StateDot')[0].props.state, 'warning');
+  assert.match(textOf(interrupted), /已中断/);
+  assert.equal(nextOf(card).props['data-mission-next'], 'next.reviewRunning');
+
+  tower.missions[0].status = 'worker_completed';
+  tower.missions[0].review = {
+    ...tower.missions[0].review, completedAt: '2026-01-01T00:00:30.000Z', stopReason: undefined,
+    stale: true, error: 'binding stale', verdict: 'clean', merge: true,
+  };
+  card = cardOf(missionsView(harness(tower)), 'M1');
+  const stale = findAll(roleRowOf(card, 'reviewer'), has('data-state', 'stale'))[0];
+  assert.equal(findAll(stale, (node) => node.type === 'StateDot')[0].props.state, 'warning');
+  assert.match(textOf(stale), /结果已过期/);
+  assert.equal(nextOf(card).props['data-mission-next'], 'next.reviewStale');
+});
 
 test('review_failed is a localized error mission with a respawn next step', () => {
   for (const [language, statusLabel, hint] of [
