@@ -289,9 +289,9 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 5. running 状态的 run 记录是否缺失或看似已经结束；
 6. Git 元数据健康：POSIX 下的异属主扫描，以及现存 objects、refs、index 和 Tower state 目录的可写性。
 
-脚本只执行查询型 Git 命令与 `readFile/readdir/stat/lstat/access` 等读取，不改 state、不改 Git、不执行修复建议中的 `chown` / `chmod`。退出码为 `0`（无 finding）、`1`（有 warning 且无 error）、`2`（任一 error，或参数用法错误）；error 优先于 warning。
+脚本只执行查询型 Git 命令与 `readFile/readdir/stat/lstat/access` 等读取，不改 state、不改 Git、不执行修复建议中的 `chown` / `chmod`。退出码默认为 `0`（无 finding）、`1`（有 warning 且无 error）、`2`（任一 error，或参数用法错误）；error 优先于 warning。可选 `--fail-on-warning` 提供严格守门：仅有 warning 的运行退出码由 `1` 升级为 `2`，clean 仍为 `0`、error 仍为 `2`，默认策略不变，适合发布检查 / CI 门禁在 warning 即失败（用法速查见 [operations.md](operations.md) 附录 C）。
 
-有效参数的 `--json` 诊断运行把**唯一一个 JSON 对象写入 stdout**，人类可读诊断不混入 stdout，stderr 为空。对象含 `repo / statePath / findings / summary`，state 结构可用时另含 `baseBranch / baseTip`；早期失败无法解析的字段用 `null` 或省略可选 base 字段。`summary` 固定为 `checksPassed / warnings / errors / exitCode`；finding 至少有 `code / severity / message`，再按类别附 `mission / role / path / sample` 等上下文。用法错误以退出码 2 输出到 stderr，不属于上述有效诊断 JSON 形态。
+有效参数的 `--json` 诊断运行把**唯一一个 JSON 对象写入 stdout**，人类可读诊断不混入 stdout，stderr 为空。对象含 `repo / statePath / findings / summary`，state 结构可用时另含 `baseBranch / baseTip`；仅在显式给出 `--fail-on-warning` 时额外携带 `failOnWarning: true`，默认输出的键集与类型保持不变（向后兼容的可选增键）；早期失败无法解析的字段用 `null` 或省略可选 base 字段。`summary` 固定为 `checksPassed / warnings / errors / exitCode`；finding 至少有 `code / severity / message`，再按类别附 `mission / role / path / sample` 等上下文。用法错误以退出码 2 输出到 stderr，不属于上述有效诊断 JSON 形态。
 
 当前共有 **32 个 finding code**，分类如下（测试用白名单封闭集合，新增 code 必须同步契约测试）：
 
@@ -307,7 +307,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 异属主 finding 的 `sample` 最多 **10 条**，`count` 只表示本次实际扫描发现的数量。扫描默认最多执行 **5000 次 `lstat`**，达到预算即停止并置 `truncated:true`，所以结果不是完整仓库属主审计；`node_modules` 与 Tower worktrees 目录始终跳过，符号链接不跟随。无 `process.getuid()` 的平台跳过异属主扫描，可写性检查仍执行。
 
-[../test/doctor-json-schema.test.js](../test/doctor-json-schema.test.js) 是输出与退出码的可执行契约，并验证重复运行输出逐字节稳定、state 不变；[../test/doctor.test.js](../test/doctor.test.js) 固定 10 条样例上限、扫描预算和 `truncated` 行为；[../test/doctor-tower.test.js](../test/doctor-tower.test.js) 另以真实 `TowerCore` 生命周期（真实 worktree / commit / merge / teardown，Git 不 mock）产出的 state 做集成对账，仅人为改写 state.json 模拟健康生命周期不会自行产生的崩溃/伪造场景。
+[../test/doctor-json-schema.test.js](../test/doctor-json-schema.test.js) 是输出与退出码的可执行契约，并验证重复运行输出逐字节稳定、state 不变；[../test/doctor.test.js](../test/doctor.test.js) 固定 10 条样例上限、扫描预算和 `truncated` 行为，以及 `--fail-on-warning` 的退出码策略（含 `--json` 的向后兼容增键）；[../test/doctor-tower.test.js](../test/doctor-tower.test.js) 另以真实 `TowerCore` 生命周期（真实 worktree / commit / merge / teardown，Git 不 mock）产出的 state 做集成对账，仅人为改写 state.json 模拟健康生命周期不会自行产生的崩溃/伪造场景。
 
 ### 8.2 `release`：plan/apply 分离、双层锁与回滚
 
