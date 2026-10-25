@@ -726,3 +726,81 @@ test('edit propagates core rejections such as MISSION_NOT_EDITABLE to the tool l
   );
   assert.equal(runtime.inFlight.has(repo), false);
 });
+
+/**
+ * Minimal core double for the summary dispatch path: seeded into
+ * `runtime.cores` so `coreAt` reuses it instead of constructing a real
+ * TowerCore, mirroring editHarness above.
+ */
+function summaryHarness(repo, summary) {
+  const calls = { summary: [], status: 0 };
+  const core = {
+    async open() {},
+    async summary(args) {
+      calls.summary.push(args);
+      return await summary(args);
+    },
+    async status() {
+      calls.status += 1;
+      return { baseBranch: 'main', missions: [] };
+    },
+  };
+  const { runtime } = executeHarness(repo);
+  runtime.cores.set(repo, core);
+  return { calls, runtime };
+}
+
+function runSummary(runtime, args = {}) {
+  return runtime.execute({ action: 'summary', ...args }, { agent: sessionAgent('controller-session'), signal: new AbortController().signal });
+}
+
+test('summary maps tool arguments onto core.summary and returns the payload', async (t) => {
+  const repo = makeRepo(t);
+  const overview = {
+    version: 3,
+    baseBranch: 'main',
+    counts: { missions: 2, workerRunning: 1, reviewRunning: 0, approved: 0, merged: 0, blocked: 0, abandoned: 1 },
+    missions: [{ id: 'M1', title: 'First', status: 'worker_running' }],
+  };
+  const { calls, runtime } = summaryHarness(repo, async () => overview);
+  const result = await runSummary(runtime);
+  assert.deepEqual(result, { summary: overview });
+  // An omitted mission_id must reach the core as undefined (report every mission).
+  assert.deepEqual(calls.summary.map((args) => args.missionId), [undefined]);
+  const narrowed = await runSummary(runtime, { mission_id: 'M2' });
+  assert.deepEqual(narrowed, { summary: overview });
+  assert.deepEqual(calls.summary.map((args) => args.missionId), [undefined, 'M2']);
+  // summary is read-only like status: a projection publication would have called
+  // core.status here, the way the edit test above observes exactly one such call.
+  assert.equal(calls.status, 0);
+  assert.equal(runtime.inFlight.has(repo), false);
+});
+
+test('summary propagates core rejections such as MISSION_NOT_FOUND to the tool layer', async (t) => {
+  const repo = makeRepo(t);
+  const { runtime } = summaryHarness(repo, () => {
+    throw new TowerError('MISSION_NOT_FOUND', 'mission NOPE does not exist');
+  });
+  await assert.rejects(
+    runSummary(runtime, { mission_id: 'NOPE' }),
+    (error) => error instanceof TowerError && error.code === 'MISSION_NOT_FOUND' && /does not exist/.test(error.message),
+  );
+  assert.equal(runtime.inFlight.has(repo), false);
+});
+
+test('summary runs end-to-end against a real tower without touching state', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ title: 'First mission', description: 'Implement the first feature.' });
+  await core.addMission({ title: 'Second mission', description: 'Implement the second feature.' });
+  const { runtime } = executeHarness(repo);
+  const before = await core.store.read();
+  const result = await runSummary(runtime);
+  assert.equal(result.summary.baseBranch, 'main');
+  assert.deepEqual(result.summary.counts, { missions: 2, workerRunning: 0, reviewRunning: 0, approved: 0, merged: 0, blocked: 0, abandoned: 0 });
+  assert.deepEqual(result.summary.missions.map((entry) => entry.id), ['M1', 'M2']);
+  const narrowed = await runSummary(runtime, { mission_id: 'M2' });
+  assert.deepEqual(narrowed.summary.missions.map((entry) => entry.id), ['M2'], 'mission_id narrows the entries while counts stay global');
+  assert.equal(narrowed.summary.counts.missions, 2);
+  assert.deepEqual(await core.store.read(), before, 'summary must not touch revisions, events, or updatedAt');
+});
