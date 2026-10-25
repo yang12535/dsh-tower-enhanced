@@ -4,6 +4,8 @@ Experimental **Tower-lite** bundle for DeepSeek Harness. It adds a controller `t
 
 This is an independently maintained prototype, not Kimi Tower and not an official DeepSeek bundle.
 
+[中文文档](README.zh-CN.md)
+
 ## Features
 
 - One branch and worktree per mission under `.dsh-tower/`.
