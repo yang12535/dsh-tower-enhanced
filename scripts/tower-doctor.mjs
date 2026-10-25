@@ -9,6 +9,8 @@
  * suggestions printed in messages are for the human to run manually.
  *
  * Exit codes: 0 = all checks passed, 1 = warnings found, 2 = errors found.
+ * With --fail-on-warning, warnings are escalated to exit 2 (strict gating
+ * mode for release checks / CI guard jobs); clean runs still exit 0.
  */
 
 import { execFile } from 'node:child_process';
@@ -62,6 +64,9 @@ Options:
   --repo <path>    Repository to inspect (default: current working directory)
   --state <path>   Tower state file (default: <repo>/.dsh-tower/state.json)
   --json           Print machine-readable JSON instead of human-readable text
+  --fail-on-warning  Strict gating: exit 2 when any warning or error is found
+                   (default: warnings exit 1); with --json the payload also
+                   reports failOnWarning: true
   --help, -h       Show this help
 
 Checks: state structure (version, required fields, missions), repo identity,
@@ -74,7 +79,9 @@ git object store, refs, index, and the tower state directory). Everything is
 reported only — the doctor never repairs anything.
 
 Exit codes: 0 = all checks passed, 1 = warnings found, 2 = errors found
-(or invalid usage). This tool performs no writes of any kind.`;
+(or invalid usage). With --fail-on-warning warnings are escalated to exit 2
+as well, so any non-clean run fails strict gating. This tool performs no
+writes of any kind.`;
 
 function finding(code, severity, message, extra = {}) {
   return { code, severity, message, ...extra };
@@ -132,6 +139,12 @@ export function parseArgs(argv) {
     const argument = argv[index];
     if (argument === '--json') {
       options.json = true;
+      continue;
+    }
+    // Key added only when the flag is given: the default options shape is
+    // pinned verbatim by tests, and --fail-on-warning changes no default.
+    if (argument === '--fail-on-warning') {
+      options.failOnWarning = true;
       continue;
     }
     if (argument === '--help' || argument === '-h') {
@@ -658,12 +671,18 @@ export async function runDoctor(argv = process.argv.slice(2), options = {}) {
   const report = await collectFindings({ repo: parsed.repo, statePath: parsed.state, ...options });
   const errors = report.findings.filter((item) => item.severity === 'error').length;
   const warnings = report.findings.filter((item) => item.severity === 'warning').length;
-  const exitCode = errors > 0 ? 2 : warnings > 0 ? 1 : 0;
+  // Default: 0 clean / 1 warning-only / 2 any error. --fail-on-warning keeps
+  // clean at 0 but escalates warning-only runs to 2 so strict gates fail.
+  const failOnWarning = parsed.failOnWarning === true;
+  const exitCode = errors > 0 ? 2 : warnings > 0 ? (failOnWarning ? 2 : 1) : 0;
   const summary = { checksPassed: report.checksPassed, warnings, errors, exitCode };
   const json = {
     repo: report.repo ?? null,
     statePath: report.statePath ?? null,
     ...(report.baseBranch === undefined ? {} : { baseBranch: report.baseBranch, baseTip: report.baseTip ?? null }),
+    // Backward-compatible addition: present only under --fail-on-warning, so
+    // default payloads keep their pinned exact key sets and types.
+    ...(failOnWarning ? { failOnWarning: true } : {}),
     findings: report.findings,
     summary,
   };
