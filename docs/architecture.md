@@ -33,7 +33,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 
 `apply` 注入 `tools`、`subagents`、`workingDirectory`、`llm`、`sessions`、`sessionProjections` 六个服务，注册名为 `tower` 的工具。工具的 action 枚举为 `init / add / edit / spawn / recover / send / interrupt / status / gate / merge / rebase / abandon / teardown / models`。所有动作都委托给 `TowerRuntime.execute`。
 
-> **接线状态（写文档时的现状）**：`edit` 已出现在工具参数枚举与描述中，core 层实现（`TowerCore.editMission`，见 §4）也有完整测试（[../test/core.test.js](../test/core.test.js)），但 [../lib/runtime.js](../lib/runtime.js) 的 `execute` dispatch **尚未接入 `edit` 分支**——当前通过 `tower` 工具调用 `edit` 会落入 `default` 分支并抛出 `unknown Tower action edit`。runtime 侧接线由并行的 mission 负责，接入前请以本段描述为准。
+`edit` 已可用：`execute` 的 `case 'edit'` 分支把 `mission_id / title / description / scope / depends_on` 映射到 `TowerCore.editMission`，且只转发调用方实际提供的字段（未提供的字段保持原值，不会被 `undefined` 覆盖）；仅 `pending` 状态的 mission 可编辑，其余状态抛 `MISSION_NOT_EDITABLE`（依赖校验的不变量见 §4.6；测试见 [../test/core.test.js](../test/core.test.js) 与 [../test/runtime.test.js](../test/runtime.test.js)）。
 
 ### 2.2 运行时（lib/runtime.js）
 
@@ -237,7 +237,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 ## 9. 测试与验证
 
-- `pnpm test`（[../package.json](../package.json)）：[../test/](../test) 下用真实临时 Git 仓库覆盖 core / runtime / store / git / projection / client 逻辑，仅 mock DSH 侧边界（subagents、llm、sessions 等）。
+- `pnpm test`（[../package.json](../package.json)）：[../test/](../test) 下用真实临时 Git 仓库覆盖 core / runtime / store / git / projection / client 逻辑，仅 mock DSH 侧边界（subagents、llm、sessions 等）；[../test/integration.test.js](../test/integration.test.js) 另以真实 worktree / commit / merge（不 mock git）覆盖完整 mission 生命周期的端到端集成测试。
 - `pnpm run check`：对 `lib/` 下全部模块做 `node --check` 语法检查。
 
-维护守则：任何触碰状态迁移、gate、review 绑定或 teardown 路径的改动，都应先在测试中固定住对应不变量（§4）再改实现；文档（本文与 [security-model.md](security-model.md)）需同步更新，特别是 §2.1 的接线状态说明。
+维护守则：任何触碰状态迁移、gate、review 绑定或 teardown 路径的改动，都应先在测试中固定住对应不变量（§4）再改实现；文档（本文与 [security-model.md](security-model.md)）需同步更新。
