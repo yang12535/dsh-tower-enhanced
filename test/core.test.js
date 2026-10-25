@@ -608,3 +608,155 @@ test('summary requires an initialized tower', async (t) => {
   const core = new TowerCore({ cwd: repo });
   await assert.rejects(core.summary(), /run tower with action init first/);
 });
+
+test('a pending worker starts with its merged dependency and completes the lifecycle', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const dependency = await core.addMission({ title: 'API', description: 'Provide an API', scope: ['src/api.txt'] });
+  const dependent = await core.addMission({ title: 'Client', description: 'Use the API', dependsOn: [dependency.id], scope: ['src/client.txt'] });
+  const first = await core.beginSpawn({ missionId: dependency.id, role: 'worker' });
+  commitFile(dependency.worktree, 'src/api.txt', 'required API\n');
+  await core.completeSpawn(first.runId, { stopReason: 'completed' });
+  await approve(core, dependency.id);
+  await core.merge(dependency.id);
+  const base = git(repo, 'rev-parse', 'HEAD');
+
+  const second = await core.beginSpawn({ missionId: dependent.id, role: 'worker' });
+  assert.equal(git(dependent.worktree, 'rev-parse', 'HEAD'), base);
+  assert.equal(second.mission.baseCommit, base);
+  assert.equal(git(dependent.worktree, 'show', 'HEAD:src/api.txt'), 'required API');
+  commitFile(dependent.worktree, 'src/client.txt', 'uses required API\n');
+  await core.completeSpawn(second.runId, { stopReason: 'completed' });
+  await approve(core, dependent.id);
+  assert.equal((await core.mergeGate(dependent.id)).ready, true);
+  assert.equal((await core.merge(dependent.id)).merged, true);
+  assert.equal(git(repo, 'show', 'HEAD:src/client.txt'), 'uses required API');
+  const removed = await core.teardown();
+  assert.ok(removed.results.every((result) => result.removed));
+});
+
+test('refreshing a pending worker refuses dirty files without changing state', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const mission = await core.addMission({ title: 'Dirty', description: 'Preserve local work' });
+  commitFile(repo, 'base.txt', 'new base\n');
+  writeDirty(mission.worktree, 'README.md', '# local changes\n');
+  const before = await core.store.read();
+  const tip = git(mission.worktree, 'rev-parse', 'HEAD');
+  const diff = git(mission.worktree, 'diff');
+  await assert.rejects(core.beginSpawn({ missionId: mission.id, role: 'worker' }), { code: 'WORKTREE_DIRTY' });
+  assert.deepEqual(await core.store.read(), before);
+  assert.equal(git(mission.worktree, 'rev-parse', 'HEAD'), tip);
+  assert.equal(git(mission.worktree, 'diff'), diff);
+});
+
+test('refreshing a pending worker preserves unique commits and requires explicit rebase', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const mission = await core.addMission({ title: 'Diverged', description: 'Preserve committed work' });
+  const tip = commitFile(mission.worktree, 'local.txt', 'unique commit\n');
+  commitFile(repo, 'base.txt', 'new base\n');
+  const before = await core.store.read();
+  await assert.rejects(core.beginSpawn({ missionId: mission.id, role: 'worker' }), { code: 'STALE_BASE' });
+  assert.deepEqual(await core.store.read(), before);
+  assert.equal(git(mission.worktree, 'rev-parse', 'HEAD'), tip);
+  assert.equal(git(mission.worktree, 'show', 'HEAD:local.txt'), 'unique commit');
+  assert.equal((await core.rebase(mission.id)).rebased, true);
+  assert.equal((await core.beginSpawn({ missionId: mission.id, role: 'worker' })).mission.status, 'worker_running');
+  assert.equal(git(mission.worktree, 'show', 'HEAD:base.txt'), 'new base');
+  assert.equal(git(mission.worktree, 'show', 'HEAD:local.txt'), 'unique commit');
+});
+
+test('refreshing a pending worker never overwrites ignored local files', async (t) => {
+  const repo = makeRepo(t);
+  commitFile(repo, '.gitignore', '*.cache\n');
+  const core = await initializedCore(repo);
+  const mission = await core.addMission({ title: 'Ignored', description: 'Preserve ignored artifacts' });
+  writeDirty(mission.worktree, 'data.cache', 'local artifact\n');
+  const localHash = git(mission.worktree, 'hash-object', 'data.cache');
+  writeDirty(repo, 'data.cache', 'incoming tracked artifact\n');
+  git(repo, 'add', '-f', 'data.cache');
+  git(repo, 'commit', '-m', 'track previously ignored file');
+  const before = await core.store.read();
+  const tip = git(mission.worktree, 'rev-parse', 'HEAD');
+  await assert.rejects(core.beginSpawn({ missionId: mission.id, role: 'worker' }), { code: 'GIT_FAILED' });
+  assert.deepEqual(await core.store.read(), before);
+  assert.equal(git(mission.worktree, 'rev-parse', 'HEAD'), tip);
+  assert.equal(git(mission.worktree, 'hash-object', 'data.cache'), localHash);
+});
+
+test('a no-op rebase invalidates review when the base advances within the reviewed history', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const { mission, worktree } = await addAndRunWorker(core);
+  const intermediate = git(worktree, 'rev-parse', 'HEAD');
+  commitFile(worktree, 'second.txt', 'second commit\n');
+  await approve(core, mission.id);
+  git(repo, 'merge', '--ff-only', intermediate);
+  assert.ok((await core.mergeGate(mission.id)).blocks.some((block) => block.code === 'REVIEW_BASE_STALE'));
+  const rebased = await core.rebase(mission.id);
+  assert.equal(rebased.previousTip, rebased.tip);
+  assert.equal(rebased.reviewRequired, true);
+  assert.equal(rebased.mission.status, 'worker_completed');
+  assert.equal(rebased.mission.review, undefined);
+  await approve(core, mission.id);
+  assert.equal((await core.mergeGate(mission.id)).ready, true);
+  assert.equal((await core.merge(mission.id)).merged, true);
+});
+
+test('a true no-op rebase preserves a current clean review', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const { mission } = await addAndRunWorker(core);
+  const approved = await approve(core, mission.id);
+  const result = await core.rebase(mission.id);
+  assert.equal(result.reviewRequired, false);
+  assert.equal(result.mission.status, 'approved');
+  assert.deepEqual(result.mission.review, approved.mission.review);
+  assert.equal((await core.mergeGate(mission.id)).ready, true);
+});
+
+test('pending refresh refuses an unexpected checked-out branch', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const mission = await core.addMission({ title: 'Branch identity', description: 'Do not move another branch' });
+  git(mission.worktree, 'checkout', '-b', 'unrelated');
+  const tip = git(mission.worktree, 'rev-parse', 'HEAD');
+  commitFile(repo, 'base.txt', 'new base\n');
+  const before = await core.store.read();
+  await assert.rejects(core.beginSpawn({ missionId: mission.id, role: 'worker' }), { code: 'WORKTREE_BRANCH_MISMATCH' });
+  assert.deepEqual(await core.store.read(), before);
+  assert.equal(git(mission.worktree, 'rev-parse', 'HEAD'), tip);
+  assert.equal(git(repo, 'rev-parse', mission.branch), tip);
+});
+
+test('pending refresh can retry after fast-forward succeeds but state recording fails', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const mission = await core.addMission({ title: 'Retry refresh', description: 'Recover a failed state write' });
+  const base = commitFile(repo, 'base.txt', 'new base\n');
+  const before = await core.store.read();
+  const original = core.store.write;
+  core.store.write = async () => { throw new Error('injected refresh write failure'); };
+  await assert.rejects(core.beginSpawn({ missionId: mission.id, role: 'worker' }), /injected refresh write failure/);
+  core.store.write = original;
+  assert.deepEqual(await core.store.read(), before);
+  assert.equal(git(mission.worktree, 'rev-parse', 'HEAD'), base);
+  const begun = await core.beginSpawn({ missionId: mission.id, role: 'worker' });
+  assert.equal(begun.mission.status, 'worker_running');
+  assert.equal(begun.mission.baseCommit, base);
+});
+
+test('restarting a failed worker leaves its dirty worktree available for repair', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  const { mission, worktree } = await addAndRunWorker(core, { dirty: 'unfinished.txt' });
+  assert.equal(mission.status, 'worker_failed');
+  const tip = git(worktree, 'rev-parse', 'HEAD');
+  const localHash = git(worktree, 'hash-object', 'unfinished.txt');
+  commitFile(repo, 'base.txt', 'new base\n');
+  const begun = await core.beginSpawn({ missionId: mission.id, role: 'worker' });
+  assert.equal(begun.mission.status, 'worker_running');
+  assert.equal(git(worktree, 'rev-parse', 'HEAD'), tip);
+  assert.equal(git(worktree, 'hash-object', 'unfinished.txt'), localHash);
+});

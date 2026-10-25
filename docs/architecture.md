@@ -98,14 +98,14 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 | 迁移 | 触发（函数） | 前置条件 / 说明 |
 | --- | --- | --- |
 | （新建）→ `pending` | `addMission` | id 合法且不重复；依赖存在且不重复；scope 校验通过；创建分支与 worktree（或安全对账已有 artifact，见 §7） |
-| `pending` 等 7 个可重启状态 → `worker_running` | `beginSpawn`（role=worker） | mission 非终态、非活跃、worktree 未移除；依赖全部终态（`DEPENDENCIES_NOT_MERGED`）；**同时清空既有 review 记录**（新一轮工作使旧审查失效） |
+| `pending` 等 8 个可重启状态 → `worker_running` | `beginSpawn`（role=worker） | mission 非终态、非活跃、worktree 未移除；依赖全部终态（`DEPENDENCIES_NOT_MERGED`）；pending 工作树若落后于当前 base，仅在干净、仍为创建时基线且可快进时刷新，拒绝覆盖忽略文件或自动变基独有提交；**同时清空既有 review 记录** |
 | `worker_running` → `worker_completed` | `completeSpawn` | 子代理 `stopReason === 'completed'` 且 worktree 干净（记录 `headCommit`）；否则见下一行 |
 | `worker_running` → `worker_failed` | `completeSpawn` / `failSpawn` | 非完成停止原因；或结束时 worktree 有未提交/未跟踪文件（记录最多 50 条 dirty entries）；或激活/启动失败 |
-| `worker_completed` / `approved` / `changes_requested` → `review_running` | `beginSpawn`（role=reviewer） | worktree 干净；tip ≠ 当前 base（`NO_CHANGE`）；当前 base 是 tip 祖先（`STALE_BASE`，需先 rebase）；**记录 review 绑定 `baseCommit` + `reviewedCommit`（exact SHA）** |
+| `worker_completed` / `review_failed` / `approved` / `changes_requested` → `review_running` | `beginSpawn`（role=reviewer） | worktree 干净；tip ≠ 当前 base（`NO_CHANGE`）；当前 base 是 tip 祖先（`STALE_BASE`，需先 rebase）；**记录 review 绑定 `baseCommit` + `reviewedCommit`（exact SHA）** |
 | `review_running` → `approved` | `completeSpawn` | 绑定仍匹配（见 §4.1）且 structured verdict 为 `verdict === 'clean' && merge === true` |
 | `review_running` → `changes_requested` | `completeSpawn` | 绑定匹配但有有效 verdict 不满足 clean+merge |
-| `review_running` → `worker_completed` | `completeSpawn` / `failSpawn` | 绑定在审查期间移动（review 记录标 `stale: true`，需重新派生 reviewer）；或 reviewer 未返回结构化 verdict；或激活失败 |
-| 任意非终态、非活跃 → `worker_completed`（tip 变化）或恢复 `approved` / `changes_requested` / `worker_completed`（tip 不变） | `rebase` | worktree 干净；成功且 tip 变化时**清空 review**（提交被改写，必须重新审查）；tip 不变时按既有 review 恢复阶段 |
+| `review_running` → `worker_completed` / `review_failed` | `completeSpawn` / `failSpawn` | 有效 verdict 的绑定在审查期间移动时回到 `worker_completed`（`stale: true`）；运行失败、缺少结构化 verdict 或启动失败则进入 `review_failed` |
+| 任意非终态、非活跃 → `worker_completed`（tip 或 review 绑定变化），否则保留失败审查或按既有 verdict 恢复阶段 | `rebase` | worktree 干净；成功后 tip 变化或 review 的 base/tip 绑定过期时**清空 review**并返回 `reviewRequired: true`；真正无变化时保留有效 verdict 或 `review_failed` |
 | 任意非终态、非活跃 → `rebase_blocked` | `rebase`（失败） | 自动 `rebase --abort` 并核对恢复状态（`recoverRebaseFailure`）；**清空 review**；冲突需人工解决后重试 |
 | `approved` / `merge_blocked` → `merged` | `merge` | gate 就绪（§5）；执行 `git merge --no-ff --no-edit -m "Tower: <title> (<id>)" <reviewedCommit>`；成功后验证 merge 结果包含 reviewed commit |
 | `approved` / `merge_blocked` → `merge_blocked` | `merge`（Git 失败） | 自动 `merge --abort` 并核对恢复状态（`recoverMergeFailure`）；排障后可重试 |

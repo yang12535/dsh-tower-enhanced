@@ -109,10 +109,10 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 1. Make the Session's working directory the intended repository (`working_directory` supports `cd`), check out the local base branch, and ensure the main worktree is clean.
 2. `tower({action:"init"})`.
 3. Add missions with complete descriptions and optional `depends_on`/`scope`.
-4. `spawn` a worker. It works in the mission worktree and must commit before finishing.
+4. `spawn` a worker. Before a pending mission first starts, its untouched, clean worktree fast-forwards to the current base so merged dependencies are available. Local changes, ignored-file collisions, or divergent commits block that refresh rather than being overwritten; preserve local files and explicitly `rebase` divergent work. The worker must commit before finishing. Restarting an existing worker does not automatically rebase its worktree.
 5. When the mission becomes `worker_completed`, `spawn` a reviewer. The reviewer returns a structured verdict; if it fails (rate limit, crash, or no structured verdict) the mission moves to `review_failed` — spawn the reviewer again, or a worker for direct rework.
 6. `status`/`gate` inspect state. An `approved` mission can be merged; `changes_requested` needs another worker round; `review_failed` is neither running nor terminal, so both a fresh reviewer and a fresh worker can start from it.
-7. If the base moved, `rebase`, then obtain a fresh review before merging.
+7. If the base moved, `rebase`, then obtain a fresh review before merging. A changed review base invalidates the verdict even when the mission tip stays unchanged; `reviewRequired` reports this too.
 8. `merge` evaluates the gate and merges the exact reviewed SHA. `teardown` later removes eligible worktrees only.
 
 `send` and `interrupt` address the currently active worker/reviewer. `models` lists a provider's catalog or resolves one exact route, including reasoning metadata when available. After a restart, persisted `worker_running`/`review_running` records intentionally block new work until the controller explicitly confirms the old runtime stopped and calls `recover`; this records stale activations as interrupted without adopting their processes.
