@@ -193,13 +193,24 @@ test('a dirty work tree is rejected with a structured error and zero writes', as
 test('a simultaneous dry run never writes or leaves a half-written release', async (t) => {
   const repo = makeRepo(t);
   const [dry, applied] = await Promise.all([runCli(repo, { apply: false }), runCli(repo)]);
-  assert.equal(dry.status, 0, dry.stderr);
   assert.equal(applied.status, 0, applied.stderr);
-  const dryPayload = JSON.parse(dry.stdout);
   const applyPayload = JSON.parse(applied.stdout);
-  assert.equal(dryPayload.ok, true);
-  assert.equal(dryPayload.dryRun, true);
   assert.equal(applyPayload.ok, true);
   assert.equal(applyPayload.dryRun, false);
+
+  if (dry.status === 0) {
+    const dryPayload = JSON.parse(dry.stdout);
+    assert.equal(dryPayload.ok, true);
+    assert.equal(dryPayload.dryRun, true);
+    assert.equal(dryPayload.currentVersion, '0.2.0');
+    assert.equal(dryPayload.nextVersion, VERSION);
+  } else {
+    // The scheduler may let apply finish before dry-run reads package.json.
+    // In that ordering VERSION_NOT_GREATER is the dry run's only valid failure.
+    const dryError = parseError(dry);
+    assert.equal(dryError.code, 'VERSION_NOT_GREATER');
+  }
+
+  // Only the apply process may write, regardless of the dry run's scheduling outcome.
   assertReleasedFiles(repo);
 });
