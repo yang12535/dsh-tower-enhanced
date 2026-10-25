@@ -1,0 +1,120 @@
+# dsh-tower-enhanced
+
+Experimental **Tower-lite** bundle for DeepSeek Harness. It adds a controller `tower` tool with isolated Git worktrees, worker/reviewer subagents, exact-SHA review bindings, merge gates, and per-spawn model routes.
+
+This is an independently maintained prototype, not Kimi Tower and not an official DeepSeek bundle.
+
+## Features
+
+- One branch and worktree per mission under `.dsh-tower/`.
+- Tower membership follows the workspace, like Kimi Code: any Session can own a repository's tower, and a second Session is refused only while one owns it (a call in flight, or a worker/reviewer it started still running). No root/leaf Session rule.
+- Background workers and structured independent reviews through DSH's in-process `spawn` provider.
+- Optional `provider + model + reasoning_effort + max_tokens` per spawn; role-specific defaults and an exact-route allowlist are configurable.
+- The conversation-header popover and right Sidebar **Tower** tab share one UI. **This session** shows only real child Sessions created by the current controller. In a worker/reviewer chat it shows only that agent's own record: a reviewer never gains a sibling worker record just because they share a mission. **Workspace** explicitly shows all recorded agents and identifies their originating controller.
+- Each real child Session appears once, grouped by its recorded role (`Work` or `Review`). A missing child Session produces no agent row or role placeholder. A review-only view has no Work group, and vice versa. Workspace tasks that have not created a child are listed separately from agents.
+- Cards show the task, role, outcome, elapsed time, and the provider/model/reasoning effort recorded at launch. They never substitute the main conversation's model selector. Clicking a card opens its native `subagentchat` transcript; **Task & result** expands the recorded output, review checks, branch, and commit information. Failed, interrupted, stale, and changes-requested outcomes remain distinct from completion. Filters select all, running, or attention-needed agents.
+- Chat links and session membership use the host's child catalog, then listed lineage, then the controller recorded at spawn. Unknown ownership is never guessed from the panel's current Session. Views use the newest available projection for the same repository; these are recorded Tower activations, not a live feed of every subsequent model change inside a child chat.
+- Review evidence binds both the current base SHA and reviewed tip SHA. Any rebase or relevant movement requires a fresh review.
+- Merge checks dependencies, scope, clean worktrees, checked-out base, current-base ancestry, and review binding. The merge consumes the exact reviewed SHA and verifies the result.
+- Conservative teardown: only clean, registered worktrees for merged or abandoned missions; branches and state remain.
+
+## Install
+
+The bundle has no build step and requires Node 22.5+ and DSH 0.2.1-rc.2.
+
+```bash
+dsh plugin --profile web add file:/home/yangtim/dsh-tower-enhanced
+```
+
+Or install the local directory through **Plugins** in the DSH Web/Desktop UI. Activation may require a restart or a new session depending on the host's HMR state. The bundle includes a Web client; after installing or upgrading, refresh the existing GUI. In a conversation that has run the controller, open either the **Tower** button in the conversation header or the **Tower** entry on the right Sidebar's start page. Both views are read-only and show model routes only after the controller publishes its first state. Click an agent to load its conversation in the Sidebar; `全部展开` / `全部收起` manage the role groups. Switch to **Workspace** to inspect agents created by earlier controllers.
+
+The bundle composes `subagents`, `workingDirectory`, `llm`, and `tools`; the normal DSH base already supplies them.
+
+## Configure
+
+Default bundle patch:
+
+```yaml
+- insert:
+    - id: tower-enhanced
+      name: dsh-tower-enhanced
+      config:
+        provider: spawn
+        stateDirectory: .dsh-tower
+        branchPrefix: tower
+```
+
+Optional model policy:
+
+```yaml
+config:
+  provider: spawn
+  stateDirectory: .dsh-tower
+  branchPrefix: tower
+  allowedModels:
+    - provider: deepseek-official
+      model: deepseek-flash
+    - provider: deepseek-official
+      model: deepseek-v4-pro
+  workerAgentOptions:
+    provider: deepseek-official
+    model: deepseek-flash
+  reviewerAgentOptions:
+    provider: deepseek-official
+    model: deepseek-v4-pro
+    reasoningEffort: high
+```
+
+Routes are ordinary LLM adapter routes, so different providers can be mixed per role. Any route the host can resolve works, for example a text-only worker and a vision-capable reviewer from another provider:
+
+```yaml
+config:
+  workerAgentOptions:
+    provider: zai-coding-cn
+    model: glm-5.3
+  reviewerAgentOptions:
+    provider: zai-coding-cn
+    model: glm-5.3-flash
+```
+
+The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1", role:"worker", provider:"...", model:"...", reasoning_effort:"...", max_tokens:...})`.
+
+`allowedModels` is optional. When present, every explicit/default override must resolve to one of those exact provider/model pairs. When absent, routes are validated against the live LLM adapter without a separate allowlist. With no role default or per-spawn override, the child inherits the controller's route.
+
+## Tool flow
+
+1. Make the Session's working directory the intended repository (`working_directory` supports `cd`), check out the local base branch, and ensure the main worktree is clean.
+2. `tower({action:"init"})`.
+3. Add missions with complete descriptions and optional `depends_on`/`scope`.
+4. `spawn` a worker. It works in the mission worktree and must commit before finishing.
+5. When the mission becomes `worker_completed`, `spawn` a reviewer. The reviewer returns a structured verdict.
+6. `status`/`gate` inspect state. An `approved` mission can be merged; `changes_requested` needs another worker round.
+7. If the base moved, `rebase`, then obtain a fresh review before merging.
+8. `merge` evaluates the gate and merges the exact reviewed SHA. `teardown` later removes eligible worktrees only.
+
+`send` and `interrupt` address the currently active worker/reviewer. `models` lists a provider's catalog or resolves one exact route, including reasoning metadata when available. After a restart, persisted `worker_running`/`review_running` records intentionally block new work until the controller explicitly confirms the old runtime stopped and calls `recover`; this records stale activations as interrupted without adopting their processes.
+
+## Failure recovery
+
+- `recover` is explicit and never adopts old processes. After confirming the previous controller stopped, it marks persisted running activations interrupted so fresh agents can start.
+- Retrying `add` with the same mission id reconciles only exactly matching branch/worktree artifacts with no unique commits. Conflicting artifacts require manual inspection and are never deleted automatically.
+- `gate` reports `alreadyMerged` when the exact clean-reviewed SHA is already contained in the base and still matches the mission tip. `merge` then performs accounting-only reconciliation instead of merging again.
+- `merge` distinguishes Git completion from state accounting and returns `postMerge`/`recoveryRequired` when later observation or persistence needs attention. Inspection failure is `mergeAttempted: true`, `merged: false`, `verified: false`; only exact-SHA verification or later reconciliation produces `merged: true`.
+- Retrying `teardown` reconciles a terminal mission when its recorded path is both absent on disk and absent from Git's registered worktrees. An existing unexpected path is never removed.
+
+## Deliberate limits
+
+- Experimental single-process controller: ownership is enforced per repository inside one Host process (a live in-flight call or worker/reviewer activation blocks other Sessions), but the operation queue is not a cross-process Git lock. Do not run two Host processes as controllers against the same repository state.
+- Reviewer read-only behavior is currently an instruction, not a restricted-preset security boundary. Worktrees isolate writes by convention, not by sandboxing.
+- The UI is intentionally small: a header popover plus one right Sidebar tab. No slash-mode injection, WIP snapshot commits, surveys, PR mode, cross-session adoption, automatic dependency inference, or clean-rebase review waiver.
+- A mission whose worker finishes dirty or without a structured review cannot pass the merge gate.
+- Git failures can leave artifacts for inspection. `merge` reports `recoveryRequired` when its cleanup cannot prove a clean restored base; inspect manually rather than retrying blindly.
+
+## Development
+
+```bash
+pnpm test
+pnpm run check
+```
+
+Tests use real temporary Git repositories and mock only the DSH-facing runtime boundaries.

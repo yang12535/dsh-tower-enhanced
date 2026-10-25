@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tower 增强",
+    "description": "实验性独立 worktree 任务、异构 worker/reviewer 模型、精确 SHA 审查与合并门禁。"
+  }
+}

@@ -1,0 +1,7 @@
+- insert:
+    - id: tower-enhanced
+      name: dsh-tower-enhanced
+      config:
+        provider: spawn
+        stateDirectory: .dsh-tower
+        branchPrefix: tower

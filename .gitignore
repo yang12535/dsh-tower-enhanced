@@ -1,0 +1,4 @@
+node_modules/
+.dsh-tower/
+*.log
+.DS_Store
