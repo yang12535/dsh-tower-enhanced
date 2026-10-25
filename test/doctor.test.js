@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -552,4 +552,107 @@ test('a real review_failed mission is recognized and fully Git-checked (exit 0)'
   assert.equal(missing.exitCode, 2);
   assert.deepEqual(codes(missing.findings), ['WORKTREE_DIR_MISSING']);
   assert.equal(missing.findings[0].mission, 'M1');
+});
+
+// —— git metadata ownership / writability (GIT_METADATA_*) ——
+
+/** POSIX uid of the test process, or undefined on platforms without one. */
+function currentUid() {
+  return typeof process.getuid === 'function' ? process.getuid() : undefined;
+}
+
+test('repo with consistent owners and writable metadata produces no GIT_METADATA findings', async (t) => {
+  const repo = makeRepo(t);
+  writeState(repo, healthyState(repo));
+  const result = await runDoctor(['--repo', repo]);
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.findings, []);
+  assert.ok(result.findings.every((item) => !item.code.startsWith('GIT_METADATA_')));
+  assert.ok(result.summary.checksPassed > 0);
+
+  // Also clean next to an unrelated warning: metadata checks stay silent.
+  git(repo, 'worktree', 'add', '-b', 'tower/orphan', path.join(repo, '.dsh-tower', 'worktrees', 'orphan'), git(repo, 'rev-parse', 'HEAD'));
+  const warned = await runDoctor(['--repo', repo]);
+  assert.equal(warned.exitCode, 1);
+  assert.deepEqual(codes(warned.findings), ['ORPHAN_WORKTREE']);
+  assert.ok(warned.findings.every((item) => !item.code.startsWith('GIT_METADATA_')));
+});
+
+test('foreign-owned git metadata entries are a GIT_METADATA_FOREIGN_OWNER warning (exit 1)', async (t) => {
+  // Skipped on non-POSIX platforms: without process.getuid() the doctor
+  // cannot compare owners and skips the ownership scan entirely.
+  const uid = currentUid();
+  if (uid === undefined) return;
+
+  const repo = makeRepo(t);
+  writeState(repo, healthyState(repo));
+  // chown to another user needs root, so simulate by injecting the uid the
+  // scan compares against: with uid+1 every real entry counts as foreign.
+  const result = await runDoctor(['--repo', repo], { currentUid: uid + 1 });
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(codes(result.findings), ['GIT_METADATA_FOREIGN_OWNER']);
+  const item = result.findings[0];
+  assert.equal(item.severity, 'warning');
+  assert.ok(item.count > 0);
+  assert.ok(item.sample.length <= 10);
+  assert.equal(item.sample.length, Math.min(item.count, 10));
+  assert.ok(item.sample.every((sample) => path.isAbsolute(sample) && sample.startsWith(repo)));
+  assert.deepEqual(item.ownerUids, [uid]);
+  assert.equal(item.truncated, false);
+  assert.match(item.message, /sudo chown -R \$\(id -u\):\$\(id -g\)/);
+  assert.match(item.message, new RegExp(`\\b${item.count}\\b`));
+
+  // Real (non-injected) run stays clean: the entries are truly ours.
+  const real = await runDoctor(['--repo', repo]);
+  assert.equal(real.exitCode, 0);
+  assert.deepEqual(real.findings, []);
+});
+
+test('unwritable .git/objects is a GIT_METADATA_NOT_WRITABLE error (exit 2)', async (t) => {
+  // Skipped on non-POSIX platforms (chmod semantics differ) and under root
+  // (uid 0): root bypasses permission checks, so 0o500 still looks writable.
+  const uid = currentUid();
+  if (uid === undefined || uid === 0) return;
+
+  const repo = makeRepo(t);
+  writeState(repo, healthyState(repo));
+  const objects = path.join(repo, '.git', 'objects');
+  chmodSync(objects, 0o500);
+  try {
+    const result = await runDoctor(['--repo', repo]);
+    assert.equal(result.exitCode, 2);
+    assert.deepEqual(codes(result.findings), ['GIT_METADATA_NOT_WRITABLE']);
+    const item = result.findings[0];
+    assert.equal(item.severity, 'error');
+    assert.equal(item.path, objects);
+    assert.equal(item.label, 'git object store');
+    assert.match(item.message, /sudo chown -R \$\(id -u\):\$\(id -g\)/);
+    assert.match(item.message, /chmod u\+w/);
+    assert.equal(result.summary.errors, 1);
+    assert.equal(result.summary.warnings, 0);
+
+    // The doctor never "fixes" anything: the mode we broke is still broken.
+    assert.equal(statSync(objects).mode & 0o777, 0o500);
+  } finally {
+    chmodSync(objects, 0o755); // restore so the tmpdir cleanup can unlink
+  }
+});
+
+test('ownership scan caps its budget and reports truncation', async (t) => {
+  // Skipped on non-POSIX platforms (see the foreign-owner test above).
+  const uid = currentUid();
+  if (uid === undefined) return;
+
+  const repo = makeRepo(t);
+  writeState(repo, healthyState(repo));
+  const result = await runDoctor(['--repo', repo], { currentUid: uid + 1, gitMetadataScanLimit: 3 });
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(codes(result.findings), ['GIT_METADATA_FOREIGN_OWNER']);
+  const item = result.findings[0];
+  assert.equal(item.count, 3);
+  assert.equal(item.sample.length, 3);
+  assert.equal(item.truncated, true);
+  assert.match(item.message, /truncated after 3 entries/);
+  assert.equal(result.summary.warnings, 1);
+  assert.equal(result.summary.errors, 0);
 });
