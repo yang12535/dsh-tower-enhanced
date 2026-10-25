@@ -30,6 +30,27 @@ Or install the local directory through **Plugins** in the DSH Web/Desktop UI. Ac
 
 The bundle composes `subagents`, `workingDirectory`, `llm`, and `tools`; the normal DSH base already supplies them.
 
+## Quick start
+
+One minimal closed loop: initialize a tower, add a mission, run one worker and one reviewer, then gate, merge, and tear down the worktree. Each line below is one `tower` tool call from the controller Session, with the repository's base branch checked out and the main worktree clean:
+
+```text
+tower({action:"init"})
+tower({action:"add", id:"M1", title:"Docs pass", description:"Proofread the README and commit.", scope:["README.md"]})
+tower({action:"spawn", mission_id:"M1", role:"worker", provider:"zai-coding-cn", model:"glm-5.3"})
+tower({action:"status", mission_id:"M1"})            // wait for worker_completed (the worker must commit first)
+tower({action:"spawn", mission_id:"M1", role:"reviewer", provider:"zai-coding-cn", model:"glm-5.3-flash"})
+tower({action:"gate", mission_id:"M1"})              // approved before merging
+tower({action:"merge", mission_id:"M1"})
+tower({action:"teardown", mission_id:"M1"})
+```
+
+Notes:
+
+- The example routes the worker to `zai-coding-cn`/`glm-5.3` and the reviewer to the lighter `zai-coding-cn`/`glm-5.3-flash`. Any provider/model pair the host can resolve works, including mixing providers between the two roles.
+- `gate` explains what blocks a merge; a `changes_requested` verdict needs another worker round and a fresh review before `merge`.
+- `merge` consumes the exact reviewed SHA; `teardown` then removes only the clean, registered worktree — the mission branch and state remain.
+
 ## Configure
 
 Default bundle patch:
