@@ -147,12 +147,12 @@ Available actions: `init`, `add`, `edit`, `spawn`, `recover`, `send`, `interrupt
 Run these repository-local scripts from the checkout:
 
 ```bash
-node scripts/tower-doctor.mjs [--repo <path>] [--json]
+node scripts/tower-doctor.mjs [--repo <path>] [--json] [--fail-on-warning]
 node scripts/release.mjs --version <semver> [--date <YYYY-MM-DD>]
 node scripts/release.mjs --version <semver> --apply
 ```
 
-- `scripts/tower-doctor.mjs` cross-checks Tower state against repository and worktree facts without modifying state or Git. Exit codes are `0` for all checks passed, `1` for warnings, and `2` for errors or invalid usage; `--json` emits machine-readable findings and a summary.
+- `scripts/tower-doctor.mjs` cross-checks Tower state against repository and worktree facts without modifying state or Git. Exit codes are `0` for all checks passed, `1` for warnings, and `2` for errors or invalid usage; `--fail-on-warning` escalates warning-only runs to exit `2` (clean runs still exit `0`, errors stay `2`) for strict release/CI gating without changing the default. `--json` emits machine-readable findings and a summary, adding `failOnWarning: true` only when `--fail-on-warning` is given.
 - `scripts/release.mjs` defaults to a non-writing dry run that prints the planned diff. `--apply` validates the version, date, and changelog before writing, requires a clean worktree, and atomically updates `package.json` and `CHANGELOG.md`. It never commits, tags, pushes, or uses the network.
 
 See the [operations runbook](docs/operations.md) for diagnostic findings, recovery procedures, and script details.
