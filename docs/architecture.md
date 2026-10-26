@@ -311,18 +311,22 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 ### 8.2 `release`：plan/apply 分离、双层锁与回滚
 
-[../scripts/release.mjs](../scripts/release.mjs) 只准备本地版本变更，不 commit、tag、push 或访问网络。`computePlan` 读取并校验 semver、日期、`package.json` 与 `CHANGELOG.md`，生成包含每份文件 `before/after` 的计划；默认 dry-run 只渲染计划 diff，**不取锁、不写文件**。`--apply` 把整个操作——重新执行 `computePlan`、要求 `git status --porcelain` 为空、写入——都放进锁的临界区内，竞争者不可能使用持锁者写入前算出的旧计划；缺失 CHANGELOG 只有显式 `--create-changelog` 才允许创建。成功输出后文件保持 dirty，交由人工复核与提交；若本次接管了陈旧锁，输出附 `lockNotice` 说明接管原因。
+[../scripts/release.mjs](../scripts/release.mjs) 只准备本地版本变更，不 commit、tag、push 或访问网络。`computePlan` 读取并校验 semver、日期、`package.json` 与 `CHANGELOG.md`，生成包含每份文件 `before/after` 的计划；默认 dry-run 只渲染计划 diff，**不取锁、不写文件**。`runRelease` 在 `--apply` 时先取锁，再执行 `computePlan`、要求 `git status --porcelain` 为空，最后调用 `applyPlan` 复核计划并写入。缺失 CHANGELOG 只有显式 `--create-changelog` 才允许创建。成功输出后文件保持 dirty，交由人工复核与提交；若本次接管了陈旧锁，输出附 `lockNotice` 说明接管原因。
 
-为避免两个进程同时依据同一旧版本完成计划并互相覆盖，`--apply` 使用**双层跨进程锁**（下称主锁 L 与回收锁 R），而不是复用 §6 的 Tower 单进程机制：
+为避免两个遵循协议的进程同时依据同一旧版本完成计划并互相覆盖，`--apply` 使用**双层跨进程锁**（下称主锁 L 与回收锁 R），而不是复用 §6 的 Tower 单进程机制：
 
 - 两把锁都由 `git rev-parse --absolute-git-dir` 定位到 Git 实际 git-dir（linked worktree 各有各的 git-dir）：L 为 `<gitdir>/release-apply.lock`，R 为 `<gitdir>/release-apply.reclaim.lock`。锁不落在工作区，因此不会破坏 clean-worktree 前置条件，也不需要修改 `.gitignore`。
 - **快路径**：以排他创建（`open 'wx'`，权限 0o600）原子抢 L；锁内容为 JSON `{ pid, timestamp, token }`，`token` 是本次持有的唯一凭据。
-- L 已存在时先做陈旧判定：仅当持有 pid 已不存在（`process.kill(pid, 0)` 报 `ESRCH`）或锁龄至少 **10 分钟**（优先读锁内 timestamp，坏锁回退文件 mtime）才允许回收；否则立即抛 `RELEASE_LOCKED`，消息点名持有者 pid（无法解析时称 unknown pid）并明确**不等待、不自动重试**。
-- **回收先取 R**（获取协议与 L 相同，陈旧的 R 本身也要先被回收）：R 把「陈旧 L 的回收」串行化。持有 R 后重读 L，内容必须与陈旧判定时逐字节一致，否则视为被竞争者替换（`RELEASE_LOCKED`）；随后把 L 以 `rename` 原子移入唯一隔离路径，并核验移入的字节仍是判定时那把旧锁——若发现移动的其实是竞争者刚换上的新锁，用硬链接恢复原位并中止，绝不误删；确认无误才删除隔离文件并以 `wx` 创建新 L（此时 `EEXIST` 说明有更快者，同样 `RELEASE_LOCKED`）。
-- **释放只删自身 token**：释放同样先 `rename` 到唯一隔离路径、核验 token 仍属于自己才删除；若锁已被换成别人的则原样保留。L 与 R 都在 `finally` 中按此协议释放。文件系统层面的失败以 `RELEASE_LOCK_FAILED` / `RELEASE_UNLOCK_FAILED` 显式暴露。
-- dry-run 不经过上述锁协议；该锁只序列化发布脚本的目标文件写入，不授权两个 Host 同时控制 Tower state（§6.4）。
+- L 已存在时，**只有**合法正整数 pid 的 `process.kill(pid, 0)` 探测明确报 `ESRCH` 才允许自动回收。活 pid、`EPERM`、其他探测错误、缺失/非法 pid 或坏 JSON 均保守返回 `RELEASE_LOCKED`；锁龄再长也不是接管依据。锁龄只用于诊断，消息含 pid（无法解析时称 unknown pid）、路径、年龄，并提醒慢速发布与人工核验，**不等待、不自动重试**。
+- **回收先取 R**（R 同样仅在 holder 被确认为 `ESRCH` 时才可回收，不能凭超时抢占）：R 把「陈旧 L 的回收」串行化。持有 R 后重读 L，内容必须与陈旧判定时逐字节一致，否则视为被竞争者替换（`RELEASE_LOCKED`）；随后把 L 以 `rename` 原子移入唯一隔离路径，并核验移入的字节仍是判定时那把旧锁——若发现移动的其实是竞争者刚换上的新锁，用硬链接尝试恢复原位并中止，不覆盖另一把已经出现的锁；确认无误才删除隔离文件并以 `wx` 创建新 L（此时 `EEXIST` 说明有更快者，同样 `RELEASE_LOCKED`）。
+- **释放只删自身 token**：释放同样先 `rename` 到唯一隔离路径、核验 token 仍属于自己才删除；若锁已被换成别人的则保留或尝试恢复，不删除外来 token。L 与 R 都在 `finally` 中按此协议释放。文件系统层面的失败以 `RELEASE_LOCK_FAILED` / `RELEASE_UNLOCK_FAILED` 等错误显式暴露。
+- dry-run 不经过上述锁协议；该锁只序列化发布脚本的目标文件写入，不授权两个 Host 同时控制 Tower state（§6.4），也没有按锁龄强制解锁的选项。
 
-写入仍逐文件采用同目录临时文件 + `rename` 原子替换，失败时清理本次临时文件。`applyPlan` 记录已成功写入的文件；后续文件失败时按逆序 best-effort 回滚：update 恢复原始字节，create 删除新文件，然后抛 `WRITE_FAILED`，消息区分「尚未写入」「已回滚」与「回滚失败」。因此原子替换降低单文件半写风险，回滚降低两份文件跨文件不一致风险，但后者不是事务保证，回滚错误会明确暴露。回归见 [../test/release.test.js](../test/release.test.js) 与 [../test/release-concurrency.test.js](../test/release-concurrency.test.js)（真进程并发：两个同时 `--apply` 恰有一个成功，落败方报结构化错误且仓库无临时/锁残留；dry-run 与 apply 并发时只有 apply 写文件）。
+**任何写入之前先复核全部目标。** `applyPlan` 首先调用 `validatePlan`：update 目标的当前字节必须等于计划中的 UTF-8 `before` 快照，覆盖完整 `package.json`（不只比较版本）与 `CHANGELOG.md`；create 目标通过 `lstat` 确认仍不存在，悬空符号链接也算已存在。内容变化、文件丢失、目标出现或读取/检查失败均抛 `RELEASE_PLAN_STALE`，本次不写任何目标文件，也不进入写失败回滚。`runRelease` 的 `finally` 仍按 token 释放自身锁；直接调用导出的 `applyPlan` 不会自行取锁或释放调用方的锁。
+
+通过复核后，逐文件采用同目录临时文件 + `rename` 原子替换，失败时清理本次临时文件。`applyPlan` 记录已成功写入的文件；后续文件失败时按逆序 best-effort 回滚：update 恢复原始字节，create 删除新文件，然后抛 `WRITE_FAILED`，消息区分「尚未写入」「已回滚」与「回滚失败」。**快照复核与逐文件原子替换不是跨文件事务，也不能阻止不遵循锁协议的外部写入者在复核后改文件**；回滚失败仍需人工处理。
+
+回归见 [../test/release.test.js](../test/release.test.js)、[../test/release-concurrency.test.js](../test/release-concurrency.test.js) 与 [../test/release-stale-lock.test.js](../test/release-stale-lock.test.js)：真实 CLI 并发、超龄活锁拒绝/死 pid 回收、旧计划被拒且目标字节不变、坏锁/未知探测结果保守拒绝，以及第二次写入失败后的回滚与自身 token 清理。
 
 ## 9. 失败恢复语义（汇总）
 
