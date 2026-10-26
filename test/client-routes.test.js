@@ -238,10 +238,28 @@ test('deriveRouteUsage matches core summaryRoutes field by field on the same sta
   const reviewed = await core.addMission({ title: 'Reviewed', description: 'Reviewed mission.' });
   await runWorker(core, { mission: reviewed, title: 'Reviewed', provider: 'prov-w', model: 'model-w' });
   await runReviewer(core, reviewed.id, { provider: 'prov-r', model: 'model-r' });
+  // Terminal missions count too — core's aggregate deliberately includes
+  // merged and abandoned records (their runs consumed quota like any other).
+  // The merged worker reuses the live busy route, so filtering terminal
+  // missions would silently drop a count; the two reviewers own routes under
+  // one provider with two different models, and the abandoned worker lands in
+  // the null bucket shared with the pending Unrouted mission, so the same
+  // filter would also vanish whole rows and shift null tie-breaks.
+  const merged = await core.addMission({ title: 'Merged', description: 'Terminal mission that merged.' });
+  await runWorker(core, { mission: merged, title: 'Merged', provider: 'prov-busy', model: 'model-b', reasoningEffort: 'high' });
+  await runReviewer(core, merged.id, { provider: 'prov-merged', model: 'model-m2' });
+  assert.equal((await core.merge(merged.id)).merged, true);
+  const abandoned = await core.addMission({ title: 'Abandoned', description: 'Terminal mission that was dropped.' });
+  await runWorker(core, { mission: abandoned, title: 'Abandoned' });
+  await runReviewer(core, abandoned.id, { provider: 'prov-merged', model: 'model-m1' });
+  await core.abandon(abandoned.id);
 
   const state = await core.store.read();
+  // the fixture really reached both terminal states, records still attached
+  assert.ok(state.missions.some((mission) => mission.status === 'merged' && mission.worker && mission.review), 'a merged mission with records exists');
+  assert.ok(state.missions.some((mission) => mission.status === 'abandoned' && mission.worker && mission.review), 'an abandoned mission with records exists');
   const { routes } = await core.summary();
-  assert.ok(routes.length >= 6, 'the scenario must exercise several buckets');
+  assert.ok(routes.length >= 8, 'the scenario must exercise several buckets');
   const derived = deriveRouteUsage(state);
   // The anti-drift contract: same length, same order, and every field equal.
   assert.equal(derived.length, routes.length);
@@ -251,8 +269,19 @@ test('deriveRouteUsage matches core summaryRoutes field by field on the same sta
       assert.deepEqual(derived[index][field], routes[index][field], `entry ${index} field ${field}`);
     }
   }
-  // the busy route really did aggregate across missions and roles
-  assert.deepEqual(derived[0], { provider: 'prov-busy', model: 'model-b', reasoningEffort: 'high', workerCount: 2, reviewerCount: 1, total: 3 });
+  // the busy route really did aggregate across missions, roles, and the
+  // merged mission — dropping terminal records would read total 3 here
+  assert.deepEqual(derived[0], { provider: 'prov-busy', model: 'model-b', reasoningEffort: 'high', workerCount: 3, reviewerCount: 1, total: 4 });
+  // both terminal reviewers are present under their own provider/models
+  assert.deepEqual(
+    derived.filter((entry) => entry.provider === 'prov-merged'),
+    [
+      { provider: 'prov-merged', model: 'model-m1', reasoningEffort: null, workerCount: 0, reviewerCount: 1, total: 1 },
+      { provider: 'prov-merged', model: 'model-m2', reasoningEffort: null, workerCount: 0, reviewerCount: 1, total: 1 },
+    ],
+  );
+  // the abandoned worker's unrouted spawn joined the pending mission's nulls
+  assert.deepEqual(derived.find((entry) => entry.provider === null), { provider: null, model: null, reasoningEffort: null, workerCount: 2, reviewerCount: 0, total: 2 });
   // The missions-array form derives the very same aggregate.
   assert.deepEqual(deriveRouteUsage(state.missions), routes);
   // The wire view publishes the same routes while the stored record stays verbatim.
@@ -269,12 +298,18 @@ test('deriveRouteUsage buckets nulls and orders ties exactly like summaryRoutes'
     routeMission({ id: 'D', worker: { provider: 'prov-s', model: 'model-s', reasoningEffort: 'low' } }),
     routeMission({ id: 'E', worker: { provider: 'prov-s', model: 'model-s', reasoningEffort: 'high' } }),
     routeMission({ id: 'F', worker: { provider: 'prov-s', model: 'model-s' } }),
+    // terminal missions contribute on every axis: the merged worker doubles a
+    // live route, the abandoned worker doubles the null bucket, and the
+    // abandoned reviewer adds a review count to a worker-only route —
+    // filtering by status would shift counts, rows, and tie-breaks below
+    routeMission({ id: 'G', status: 'merged', worker: { provider: 'prov-z', model: 'model-z' } }),
+    routeMission({ id: 'H', status: 'abandoned', worker: {}, review: { provider: 'prov-a', model: 'model-s' } }),
   ];
   assert.deepEqual(deriveRouteUsage(missions), [
-    { provider: 'prov-z', model: 'model-z', reasoningEffort: null, workerCount: 1, reviewerCount: 1, total: 2 },
-    // null sorts before any string inside the total-1 tie group
-    { provider: null, model: null, reasoningEffort: null, workerCount: 1, reviewerCount: 0, total: 1 },
-    { provider: 'prov-a', model: 'model-s', reasoningEffort: null, workerCount: 1, reviewerCount: 0, total: 1 },
+    { provider: 'prov-z', model: 'model-z', reasoningEffort: null, workerCount: 2, reviewerCount: 1, total: 3 },
+    // null sorts before any string inside the total-2 tie group
+    { provider: null, model: null, reasoningEffort: null, workerCount: 2, reviewerCount: 0, total: 2 },
+    { provider: 'prov-a', model: 'model-s', reasoningEffort: null, workerCount: 1, reviewerCount: 1, total: 2 },
     { provider: 'prov-s', model: 'model-s', reasoningEffort: null, workerCount: 1, reviewerCount: 0, total: 1 },
     { provider: 'prov-s', model: 'model-s', reasoningEffort: 'high', workerCount: 1, reviewerCount: 0, total: 1 },
     { provider: 'prov-s', model: 'model-s', reasoningEffort: 'low', workerCount: 1, reviewerCount: 0, total: 1 },
