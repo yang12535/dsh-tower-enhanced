@@ -250,7 +250,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 ### 3.7 `worker_failed` / `review_failed` 重试
 
 - 症状：worker 落定后 mission → `worker_failed`：进程异常（`stopReason ≠ completed`，`worker.error` 有诊断）、脏收尾（`error:"worker finished with uncommitted or untracked files; ..."`，附 `dirtyEntries`）或 `spawn` 本身失败（`failSpawn`）。reviewer 落定后 mission → `review_failed`：进程错误、被中断、未返回结构化结论（`error:"reviewer did not return a structured verdict"` 或 diagnostic）或 spawn 失败；事件均为 `spawn-failed`。两者的结算通知都保证送达（§2.10）。
-- 诊断：`status`（或 `summary` 概览）读对应记录的 `stopReason`、`error`、`dirtyEntries`；需要更多上下文时 `send` 询问仍在线的 agent，或查看其子代理会话。
+- 诊断：`status`（或 `summary` 概览）读对应记录的 `stopReason`、`error`、`dirtyEntries`；需要更多上下文时 `send` 询问仍在线的 agent，或查看其子代理会话。中断原因的辨别（限流 / 父会话取消 / 其它错误）与无损续跑见 3.15。
 - 安全处理（两个状态都在各自的重启集合里，直接重派）：
   - `worker_failed` → `tower({action:"spawn", role:"worker"})`，instructions 里点名要处理的事项（先 commit / 清理 untracked / 修复报错）。重派 worker 会**清空既有 review 记录**（`beginSpawn` 的既定行为），完成后需要完整重审；若上一轮是 `changes_requested` 后的返工失败，worker 任务简报会自动附带上一轮审查反馈。脏 worktree 会保留给新 worker 修复（不自动清理）。
   - `review_failed` → 二选一：`tower({action:"spawn", role:"reviewer"})` 重试审查（新 run 绑定当前 SHA）；或 `tower({action:"spawn", role:"worker"})` 直接返工（会清空失败记录与既有 review）。merge gate 在拿到 clean 审查前持续报 `NOT_APPROVED`。
@@ -464,6 +464,37 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
   - **前提：没有运行中的 activation**。state 可用时以 `tower({action:"status"})` 确认没有任何 mission 处于 `worker_running`/`review_running`；若有且属于已停止的旧控制器，先 `tower({action:"recover"})` 标记中断（3.8，前提是旧 Host 确已停止）。worker 仍在使用的 worktree 绝不清理。
   - 路由：**已登记** mission 的 worktree → `teardown`（只删终态、干净、已注册的，对账式幂等见 3.9）；**未登记**的孤儿 worktree/分支 → 3.10：优先同 id `add` 收编，确认无用才由人工执行 `git worktree remove <path>` 与 `git branch -D tower/<id>`——这是全手册**唯一**允许 git 写命令清理的场景（§5 禁令 6 的例外），且仅当分支无独有提交、或其价值已另行保全（cherry-pick/merge 到正式分支）之后；动手前逐字核对路径与分支名。
 - **何时不要手改 state.json**：store 是唯一写入方——`write` 先 `validateState` 校验、写 `<state.json>.<pid>.<uuid>.tmp` 再原子 rename、失败清理本次临时文件（3.5），`read` 读回时再次校验。手改没有任何校验器把关，两种结局都更糟：语法/结构非法 → 下一次任何动作的 `read()`（含 `init` 的幂等分支）直接抛 `STATE_INVALID`，全部动作瘫痪（即本节症状）；语法结构碰巧合法但语义错误 → 制造出工具永远无法推导的僵尸状态（§5 禁令 1）。替代做法全部走 tower 动作、由 store 统一写入与校验：改 mission 元数据 → `edit`（仅 `pending`）；悬置的 running 记录 → `recover`；清理已登记 worktree → `teardown`；state 损坏/误删 → 本节与 3.11 的重建流程。**没有任何场景需要用编辑器打开 state.json。**
+
+### 3.15 子代理中断的辨别与续跑
+
+worker/reviewer 中断在 mission 侧都长一个样——落定成 `worker_failed`/`review_failed`，或跨重启悬置在 running（3.8）——但「为什么断」决定下一步完全不同：限流要换路由或等窗口，父会话取消可能只差一个 commit，其它错误要先定位根因。结算通知（§2.10）保证送达但 `reason` 截断到 500 字符，辨别要靠 `status` 的 role 记录加子会话日志的 `turn/end`。
+
+- 症状：`status`（§2.4）里 role 记录的 `stopReason` 为 `error`（`error` 文本各异：`429: {...}`、进程异常……）或 `aborted`（`error` 形如 `worker ended with aborted`，或 `recover` 标记的 `activation is not owned by this runtime; ...`）；也可能 mission 悬置在 `worker_running`/`review_running` 无人落定（3.8 的场景）。
+- 诊断（辨别表：症状 → 判定 → 证据位置）：
+
+  | 判定 | mission 侧（`status` 的 role 记录） | 子会话 `turn/end` 证据 |
+  |---|---|---|
+  | 供应商限流 | `stopReason:"error"`，`error` 文本含 `429`、`code 1308` 或 `RATE_LIMIT`（形如 `429: {...}`） | `reason.kind:"error"`，`error` 内是供应商原始响应 |
+  | 父会话取消 | `stopReason:"aborted"`；worker 侧 mission → `worker_failed`、reviewer 侧 → `review_failed`（悬置 running 的经 `recover` 标记后同为 `aborted`，3.8） | `reason.kind:"aborted"` 且 `reason.reason.kind:"parent"` |
+  | 其它错误 | `stopReason:"error"` 且错误文本不含 429 | `reason.kind:"error"`，`error` 为其它异常 |
+
+  子会话日志是最终证据：`status` 里的 `error` 文本已被子代理侧截到上限（4096 字节的 diagnostic 上限），结算通知再截到 500 字符，429 响应体携带的窗口信息可能被截掉。查看方法——`<childId>` 即 `status` 中该 role 记录的 `childId`，会话日志按 `<会话根>/<项目目录>/<childId>/session.v4.jsonl.zstd` 存放（会话根默认 `~/.dsh/sessions`，其下按项目工作目录分组）：
+
+  ```bash
+  find ~/.dsh/sessions -maxdepth 2 -type d -name "<childId>"                 # 先定位子会话目录
+  zstdcat ~/.dsh/sessions/<项目目录>/<childId>/session.v4.jsonl.zstd | tail  # 末尾即最后一条 turn/end
+  ```
+
+- 安全处理（处置矩阵）：
+
+  | 判定 | 处置 |
+  |---|---|
+  | 供应商限流 | 换路由或等窗口：`tower({action:"spawn", mission_id:"<id>", role:"worker", provider:"...", model:"..."})` 重派（可用路由先用 `models` 查，§2.3），或等限流窗口重置。窗口重置时间看两处：子会话 `turn/end` 里完整的 429 响应体（常带重试/窗口提示），以及供应商控制台或用量页。不换路由、不到点就重试，只会再吃一次同样的 429（3.7 的环境性失败） |
+  | 父会话取消 | **先查 worktree 再决定续跑或重做**（全部只读）：`git -C <worktree> status --porcelain` 看有无未提交/未跟踪文件、`git -C <worktree> log --oneline -3` 看有无已完成的新提交、`git -C <worktree> diff` 看改动内容。有成果（哪怕未提交）→ 续跑：重派 worker，instructions 里点名「worktree 已有上轮成果，先核对并提交/收尾」；一无所有 → 直接重做。mission 还悬置在 running 的先按 3.8 `recover`（前提：旧控制器确已停止） |
+  | 其它错误 | 按上面的命令看子会话日志定位根因（`turn/end` 的 `error` 与其前后文）：环境性的（路由不可用 `MODEL_ROUTE_*`、网络等）先修环境再重派；任务性的按 3.7 重派，并把诊断写进新 run 的 instructions |
+
+- 续跑语义（与实现一致，[lib/core.js](../lib/core.js) `beginSpawn`）：`spawn` 每次都新建 `runId` 并**整体替换** `mission.worker`/`mission.review` 记录，**不 adopt 旧 activation**——不会向旧子代理递话，也不会续用它的会话上下文；上一轮的工作只存在于 worktree（已提交或未提交的文件）里，这正是父会话取消后要先查 worktree 的原因。因此续跑只有两条正路：已落定为 `worker_failed`/`review_failed` → 直接重派（3.7）；悬置在 running → 先 `recover`（3.8）再重派——没有任何「接管旧进程接着跑」的动作。重派 worker 会**清空既有 review 记录**（完成后需完整重审，3.7）；worktree 里的未提交文件**保留**给新 worker 处理，tower 不自动清理。**不要手改 state.json** 去伪造落定或抹掉失败记录，替代动作清单见 3.14「何时不要手改 state.json」。
+- 何时不应重试：限流未换路由且窗口未重置（同样的请求只会得到同样的 429）；父会话取消后未检查 worktree 之前（可能把已完成的工作白做一遍）；旧控制器可能仍在运行时执行 `recover`（3.8 的前提是它确已停止）。
 
 ## 4. Merge gate block code 速查表
 
