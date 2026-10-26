@@ -47,6 +47,9 @@ const ACTIVE_STATUSES = new Set([
   'merge_blocked',
 ]);
 
+/** Mission lifecycle end states (mirrors lib/core.js TERMINAL_STATUSES). */
+const TERMINAL_STATUSES = new Set(['merged', 'abandoned']);
+
 /** Upper bound on lstat calls for the git-metadata ownership scan. */
 const GIT_METADATA_SCAN_LIMIT = 5000;
 
@@ -73,7 +76,8 @@ Checks: state structure (version, required fields, missions), repo identity,
 base branch vs recorded baseCommit, mission branches, worktree registration
 and existence, orphan worktrees, merged missions' mergeCommit ancestry on the
 base branch, teardown consistency, running activations whose records look
-finished, and git metadata health (entries owned by another user — POSIX
+finished, terminal missions whose worker/reviewer records still look active,
+and git metadata health (entries owned by another user — POSIX
 only, skipped on platforms without process.getuid — plus writability of the
 git object store, refs, index, and the tower state directory). Everything is
 reported only — the doctor never repairs anything.
@@ -599,6 +603,30 @@ export async function collectFindings(options = {}) {
       } else {
         report.checksPassed += 1;
       }
+    }
+
+    // Terminal missions must not carry role records that still look active.
+    // `tower recover` only reconciles running-status missions, so a record
+    // with a runId but no completedAt/stopReason here is skipped by every
+    // repair path — normally only reachable by editing state directly. It is
+    // a warning, not an error: the mission itself is settled, but a live
+    // activation waking up could still clobber the terminal status.
+    if (TERMINAL_STATUSES.has(mission.status)) {
+      let leftover = false;
+      for (const [role, record] of [['worker', mission.worker], ['reviewer', mission.review]]) {
+        if (record === null || typeof record !== 'object' || Array.isArray(record)) continue;
+        if (typeof record.runId !== 'string' || record.runId.length === 0) continue;
+        if (record.completedAt !== undefined || record.stopReason !== undefined) continue;
+        leftover = true;
+        findings.push(finding(
+          'MISSION_TERMINAL_ACTIVE_ROLE',
+          'warning',
+          `mission ${mission.id}: ${role} run ${record.runId.slice(0, 8)} still looks active (runId set, no completedAt/stopReason) but the mission is already ${mission.status}; `
+            + `tower recover skips terminal missions — confirm no live activation remains, then reconcile via tower recover or the state-rebuild runbook (operations.md §3.14); never hand-edit state.json (doctor only reports)`,
+          { mission: mission.id, role, runId: record.runId },
+        ));
+      }
+      if (!leftover) report.checksPassed += 1;
     }
   }
 

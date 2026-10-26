@@ -407,6 +407,93 @@ test('review_running without any run record is an error (exit 2)', async (t) => 
   assert.equal(result.findings[0].role, 'reviewer');
 });
 
+// —— MISSION_TERMINAL_ACTIVE_ROLE (leftover active role records in terminal missions) ——
+
+test('merged mission with a leftover running worker record is a warning (exit 1)', async (t) => {
+  const repo = makeRepo(t);
+  const state = healthyState(repo);
+  const runId = '0e1f2a3b-4c5d-6e7f-8a9b-0c1d2e3f4a5b';
+  state.missions[0].worker = { runId, startedAt: new Date().toISOString() };
+  writeState(repo, state);
+  const result = await runDoctor(['--repo', repo]);
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(codes(result.findings), ['MISSION_TERMINAL_ACTIVE_ROLE']);
+  const item = result.findings[0];
+  assert.equal(item.severity, 'warning');
+  assert.equal(item.mission, 'M0');
+  assert.equal(item.role, 'worker');
+  assert.equal(item.runId, runId);
+  // The message locates the leftover: mission id, role, runId prefix.
+  assert.match(item.message, /M0/);
+  assert.match(item.message, /worker/);
+  assert.match(item.message, /0e1f2a3b/);
+  assert.match(item.message, /merged/);
+  assert.equal(result.summary.warnings, 1);
+  assert.equal(result.summary.errors, 0);
+});
+
+test('abandoned mission with a leftover review record names the reviewer role', async (t) => {
+  const repo = makeRepo(t);
+  const state = healthyState(repo);
+  state.missions[1].status = 'abandoned';
+  state.missions[1].review = { runId: '9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d', startedAt: new Date().toISOString() };
+  writeState(repo, state);
+  const result = await runDoctor(['--repo', repo]);
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(codes(result.findings), ['MISSION_TERMINAL_ACTIVE_ROLE']);
+  const item = result.findings[0];
+  assert.equal(item.severity, 'warning');
+  assert.equal(item.mission, 'M1');
+  assert.equal(item.role, 'reviewer');
+  assert.equal(item.runId, '9a8b7c6d-5e4f-3a2b-1c0d-9e8f7a6b5c4d');
+  assert.match(item.message, /M1/);
+  assert.match(item.message, /reviewer/);
+  assert.match(item.message, /9a8b7c6d/);
+  assert.match(item.message, /abandoned/);
+});
+
+test('terminal missions whose role records ended are not flagged (exit 0)', async (t) => {
+  const repo = makeRepo(t);
+  const state = healthyState(repo);
+  const now = new Date().toISOString();
+  // Records exactly as completeSpawn / recover write them: end markers present.
+  state.missions[0].worker = { runId: 'run-w-done', startedAt: now, completedAt: now, stopReason: 'completed' };
+  state.missions[0].review = { runId: 'run-r-done', startedAt: now, completedAt: now, stopReason: 'completed', verdict: 'clean', merge: true };
+  state.missions[1].status = 'abandoned';
+  state.missions[1].worker = { runId: 'run-w-abort', startedAt: now, completedAt: now, stopReason: 'aborted' };
+  writeState(repo, state);
+  const result = await runDoctor(['--repo', repo]);
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.summary.warnings, 0);
+  assert.equal(result.summary.errors, 0);
+});
+
+test('MISSION_TERMINAL_ACTIVE_ROLE: default exit 1, --fail-on-warning exit 2', async (t) => {
+  const repo = makeRepo(t);
+  const state = healthyState(repo);
+  state.missions[0].worker = { runId: 'c0ffee11-2222-3333-4444-555566667777', startedAt: new Date().toISOString() };
+  writeState(repo, state);
+
+  const defaultRun = await runDoctor(['--repo', repo]);
+  assert.equal(defaultRun.exitCode, 1);
+  assert.equal(defaultRun.summary.exitCode, 1);
+  assert.equal(defaultRun.summary.warnings, 1);
+  assert.equal(defaultRun.summary.errors, 0);
+
+  // Strict gating escalates the warning-only run; findings stay identical.
+  const strictRun = await runDoctor(['--repo', repo, '--fail-on-warning']);
+  assert.equal(strictRun.exitCode, 2);
+  assert.equal(strictRun.summary.exitCode, 2);
+  assert.equal(strictRun.summary.warnings, 1);
+  assert.equal(strictRun.summary.errors, 0);
+  assert.deepEqual(strictRun.findings, defaultRun.findings);
+
+  // Real CLI processes follow the same policy.
+  assert.equal(runCli(['--repo', repo]).status, 1);
+  assert.equal(runCli(['--repo', repo, '--fail-on-warning']).status, 2);
+});
+
 test('errors take precedence over warnings in the exit code', async (t) => {
   const repo = makeRepo(t);
   const state = healthyState(repo);

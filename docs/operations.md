@@ -421,8 +421,11 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
   | 非法 JSON / 顶层不是对象 | `STATE_INVALID`（消息形如 `could not parse ...state.json: ...`） | `STATE_CORRUPT`（error） |
   | 结构校验失败 | `STATE_INVALID`（`validateState`：version=1、字段类型、status 枚举、revision 正整数、id 去重） | `STATE_VERSION` / `STATE_FIELD_INVALID` / `MISSION_FIELD_INVALID` / `MISSION_DUPLICATE`（error，规则镜像 store） |
   | 文件存在但读不出（典型为权限） | 原样抛出底层 fs 错误（如 `EACCES`，store 只把 ENOENT 翻译成 `TOWER_NOT_INITIALIZED`） | `STATE_READ_FAILED`（error，配合 3.12 排查属主/权限） |
+  | 终态 mission 残留活跃角色记录 | `recover` 跳过（只对账 `worker_running`/`review_running`） | `MISSION_TERMINAL_ACTIVE_ROLE`（warning，处置见下） |
 
   注意症状形态：store 的 `read` 先解析再校验（[lib/store.js](../lib/store.js)）。**文件缺失**时，除 `init`（幂等分支会新建 state）外的所有动作抛 `TOWER_NOT_INITIALIZED`；**文件损坏**时连 `init` 也一起失败——它的幂等分支同样要先读旧文件（[lib/core.js](../lib/core.js) `TowerCore.init`），读到坏文件照样抛 `STATE_INVALID`。诊断细节与只读命令见 3.11。
+
+  终态 mission 残留的活跃角色记录（doctor：`MISSION_TERMINAL_ACTIVE_ROLE`，warning）也归本节处置：`merged`/`abandoned` mission 的 `worker`/`review` 记录仍带 `runId` 且无 `completedAt`/`stopReason`。正常 API 路径不会产生它（`abandon` 拒绝 running mission，merge 前审查早已落 `completedAt`），多由直接改 state 等异常路径形成；`recover` 只对账 `worker_running`/`review_running`（3.8），不会碰终态 mission，所以这类残留此前无法被任何手段发现。它本身是无害的陈旧记录，但若该 `runId` 背后的 agent 仍存活，它随后的落账会把终态 mission 改回中间态。处置顺序：**先**在进程/会话层面确认该 `runId` 已无活跃 activation，再运行 `tower({action:"recover"})` 顺带对账其它悬置激活；残留记录需要彻底清除时按本节重建流程，**不要手改 state.json**。
 
 - 诊断：
   - **state 路径来源**：tower 动作固定使用仓库根下 `<stateDir>/state.json`（`stateDir` 是运行时配置，默认 `.dsh-tower`，工具调用参数**不能**覆盖）；doctor 默认取 `<repo>/.dsh-tower/state.json`，但可用 `--repo <path>` 与 `--state <file>` 检查任意位置（`--state` 指向 **state 文件本身**，不是目录）。
@@ -550,7 +553,7 @@ node scripts/tower-doctor.mjs --help              # 用法
 ```
 
 - 退出码：`0` = 全部检查通过；`1` = 有 warning；`2` = 有 error（或参数用法错误）。加 `--fail-on-warning` 后，仅有 warning 的运行也退出 `2`（clean 仍为 `0`，error 仍为 `2`），默认行为不变，适合发布检查 / CI 严格守门；与 `--json` 同用时 payload 额外携带 `failOnWarning: true`（默认输出不含该键，既有键集不变）。人类可读输出逐行列出 `[severity] code: message` 并汇总 `N checks passed, X warning(s), Y error(s)`。
-- 检查范围：state 结构（镜像 [lib/store.js](../lib/store.js) 规则）、repo 一致性、base 分支与 `baseCommit` 关系、每个 mission 的分支存在性 / worktree 注册与磁盘存在性 / 检出分支、已合并 mission 的 `mergeCommit` 是否可达自 base、teardown 一致性、悬置的 running 记录、`.dsh-tower/worktrees/` 下的孤儿目录，以及 git 元数据属主（仅 POSIX）与对象库 / refs / index / Tower state 目录的可写性。属主扫描的样例上限、扫描预算与非 POSIX 行为见 3.12。
+- 检查范围：state 结构（镜像 [lib/store.js](../lib/store.js) 规则）、repo 一致性、base 分支与 `baseCommit` 关系、每个 mission 的分支存在性 / worktree 注册与磁盘存在性 / 检出分支、已合并 mission 的 `mergeCommit` 是否可达自 base、teardown 一致性、悬置的 running 记录、终态 mission 残留的活跃角色记录（`MISSION_TERMINAL_ACTIVE_ROLE`）、`.dsh-tower/worktrees/` 下的孤儿目录，以及 git 元数据属主（仅 POSIX）与对象库 / refs / index / Tower state 目录的可写性。属主扫描的样例上限、扫描预算与非 POSIX 行为见 3.12。
 - 常见 finding 与处置：
 
 | code（severity） | 含义 | 处置 |
@@ -566,6 +569,7 @@ node scripts/tower-doctor.mjs --help              # 用法
 | `TEARDOWN_INCOMPLETE` / `WORKTREE_STILL_REGISTERED`（error） | `worktreeRemoved:true` 但目录/注册仍在 | 复核后人工清理（3.10 惟一例外） |
 | `MERGE_RECORD_MISSING` / `MERGE_COMMIT_NOT_IN_BASE`（error） | `merged` mission 记账不完整或不在 base | 3.4 / 3.5 对账 |
 | `RUNNING_RECORD_MISSING`（error）/ `RUNNING_RECORD_FINISHED`（warning） | running 状态但记录缺失 / 记录已结束 | 后者按提示执行 `tower action=recover`（3.8） |
+| `MISSION_TERMINAL_ACTIVE_ROLE`（warning） | 终态（`merged`/`abandoned`）mission 的 `worker`/`review` 记录仍带 `runId` 且无 `completedAt`/`stopReason`（消息含 mission id、role、runId 前缀；`recover` 跳过终态 mission，故此前不可见） | warning 不影响 gate，`--fail-on-warning` 下升级为退出 2；处置见 3.14：确认该 `runId` 已无活跃 activation 后用 `tower recover` 对账或按 3.14 重建，**不要手改 state.json** |
 | `GIT_METADATA_FOREIGN_OWNER`（warning） | 扫描发现由其它 uid 拥有的 repo/git 元数据；`sample` 最多 10 条，`truncated:true` 表示达到扫描预算 | 3.12；先停止写入、诊断与备份，再由人工确认并修复属主 |
 | `GIT_METADATA_NOT_WRITABLE`（error） | 现存的对象库 / refs / index / Tower state 目录对当前用户不可写 | 3.12；先备份并处理活跃 worker，再人工修复属主或目标权限 |
 
