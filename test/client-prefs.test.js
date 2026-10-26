@@ -321,8 +321,9 @@ test('remount after a tab switch restores state through localStorage', () => {
   headOf(groupOf(tree, 'reviewer')).props.onClick();
   first.unmount('root');
   // the two records landed under the documented namespace, split as specified
+  // (routesCollapsed is the M68 route-usage fold, always boolean)
   assert.deepEqual(JSON.parse(storage.store.get(GLOBAL_KEY)), {
-    view: 'agents', scope: 'workspace', filter: 'attention', collapsed: ['reviewer'],
+    view: 'agents', scope: 'workspace', filter: 'attention', collapsed: ['reviewer'], routesCollapsed: false,
   });
   assert.deepEqual(JSON.parse(storage.store.get(sessionKey('root'))), { selected: 'r-failed', scrollTop: null });
   // a fresh module load (what a new page would see) has an empty memory
