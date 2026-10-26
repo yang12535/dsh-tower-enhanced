@@ -26,7 +26,7 @@
 | `worker_failed` | worker 异常结束或留下脏 worktree | worker 落定失败 / `failSpawn` / `recover` | `spawn` worker 重试；`abandon` |
 | `review_running` | reviewer 运行中 | `spawn` role=reviewer | `send` / `interrupt`；等待落定 |
 | `review_failed` | reviewer 异常结束（进程错误 / 无结构化结论 / 启动失败 / `recover` 标记） | reviewer 落定失败 / `failSpawn` / `recover` | `spawn` reviewer 重试；`spawn` worker 直接返工；`rebase`（真 no-op 时保持 `review_failed`） |
-| `changes_requested` | 审查要求返工 | reviewer verdict 非 clean 或 merge≠true | `spawn` worker 返工（清空既有 review） |
+| `changes_requested` | 审查要求返工 | reviewer verdict 非 clean 或 merge≠true | `spawn` worker 返工（清空既有 review）；满足 §2.5 前提时 `spawn` role=reviewer 重审；干净 worktree 可 `rebase`（失效/真 no-op 规则见 §2.9） |
 | `approved` | clean 且 merge=true 的审查通过 | reviewer 落定 | `gate` → `merge`；`rebase`；`abandon` |
 | `rebase_blocked` | rebase 冲突，tower 已自动 `rebase --abort` | `rebase` 失败 | `spawn` worker 手工解决冲突；`abandon` |
 | `merge_blocked` | merge 的 git 步骤失败，tower 已尝试 `merge --abort` | `merge` 失败 | 修复后重试 `merge`（gate 对该状态放行）；`rebase`；`abandon` |
@@ -58,9 +58,10 @@ tower({action:"init"})            // 可选 base_branch，默认当前检出分�
 ### 2.2 add（含 scope 设计与校验规则）
 
 ```text
-tower({action:"add", id:"M1", title:"...", description:"...", dependsOn:["M0"], scope:["docs/**"]})
+tower({action:"add", id:"M1", title:"...", description:"...", depends_on:["M0"], scope:["docs/**"]})
 ```
 
+- **依赖输入参数名是 snake_case：`depends_on`。** `M0` 必须已存在。不要把返回字段的 camelCase `dependsOn` 原样传回工具：当前 `add`/`edit` 的运行时分发只读取 `depends_on`，误写 `dependsOn` 会被忽略而不报错；`add` 会得到空依赖，`edit` 则保留旧依赖。调用后核对返回的 `mission.dependsOn`，避免依赖约束被静默省略（schema 见 [lib/index.js](../lib/index.js)，分发见 [lib/runtime.js](../lib/runtime.js)）。
 - 预期输出：`{ mission: { id, title, description, dependsOn, scope, branch, worktree, baseCommit, status:"pending", revision, createdAt, worktreeRemoved:false } }`，并创建分支 `tower/<id>` 与隔离 worktree（`git worktree add -b`）。`id` 省略时自动分配 `M<最大序号+1>`。
 - scope 校验（`add` 与 `edit` 完全一致，见 [lib/core.js](../lib/core.js) `validateScope`）：
   - 非数组（字符串、`null`、其它类型）→ `ARGUMENT_INVALID`（`scope must be an array of glob patterns`）；空字符串模式 → `SCOPE_INVALID`（`scope patterns must be non-empty strings`）。
@@ -69,7 +70,7 @@ tower({action:"add", id:"M1", title:"...", description:"...", dependsOn:["M0"], 
 - scope 设计建议：
   - scope 是仓库相对 glob，空数组 = 完全不限。**建议始终显式给出**——gate 的 `OUT_OF_SCOPE` 检查只在 scope 非空时生效。
   - 粒度以目录/主题为宜（如 `docs/**`、`lib/client.js` + `test/client.test.js` 成对给出）；过宽失去保护，过窄容易把测试、locale 文案等伴生改动误伤成 out-of-scope。
-  - 预期会改同一区域的 mission 用 `dependsOn` 串行化，而不是靠 scope 并行硬撞（并行写同一文件最终会在 rebase/merge 阶段冲突）。
+  - 预期会改同一区域的 mission 用 `depends_on` 串行化，而不是靠 scope 并行硬撞（并行写同一文件最终会在 rebase/merge 阶段冲突）。
 - 失败与 next action：
   - `MISSION_EXISTS` / `MISSION_ID_INVALID`：换 id（id 规则：大写字母开头，仅大写字母/数字/`_`/`-`，≤32 字符）。
   - `DEPENDENCY_INVALID`（重复或不存在）/ `MISSION_NOT_FOUND`（依赖项）：修正 `depends_on` 指向已存在的 mission。
@@ -107,7 +108,10 @@ tower({action:"summary", mission_id:"M1"})     // 概览，条目收窄到单个
 ```
 
 - `status` 预期输出：`{ version, repoRoot, baseBranch, baseCommit, missions[], events }`；`observe:true` 时额外返回 `observations: { checkedOutBranch, baseTip, baseStatus, missions: { "<id>": { tip, status:{clean, entries} } } }`。把「持久化 state」与「git 事实」并排摆出，是所有「状态怀疑滞后/不一致」场景的首选诊断（见 3.5）。mission 内 `worker`/`review` 记录的 `output`、`error`、`dirtyEntries`、`headCommit`、`structured`（审查结论）都在这里读。
-- `summary` 预期输出：`{ version, repoRoot, baseBranch, baseCommit, counts, missions[] }`，其中 `counts` 为**全塔**统计（`missions`/`workerRunning`/`reviewRunning`/`approved`/`merged`/`blocked`/`abandoned`），`missions[]` 为每任务一行（`id`/`title`/`status`/`dependsOn`/精简 `worker`/`review`/`mergeCommit`，不含 description/scope/worktree/历史）。`mission_id` 只收窄条目，不改 counts。纯读：无事件、无 revision 变化，适合日常巡检。
+- `summary` 工具预期输出：`{ summary: { version, repoRoot, baseBranch, baseCommit, counts, routes: [], missions: [] } }`（直接调用 `TowerCore.summary()` 则返回内层对象）。其中 `counts` 为**全塔**统计（`missions`/`workerRunning`/`reviewRunning`/`approved`/`merged`/`blocked`/`abandoned`），`missions[]` 为每任务一行（`id`/`title`/`status`/`dependsOn`/精简 `worker`/`review`/`mergeCommit`，不含 description/scope/worktree/历史）。`mission_id` 只收窄 `missions[]`，不改全塔 `counts` 或 `routes`。纯读：无事件、无 revision 变化，适合日常巡检。
+  - `routes[]` 每项为 `{ provider, model, reasoningEffort, workerCount, reviewerCount, total }`，以 `(provider, model, reasoningEffort)` 三元组分桶；缺失的路由字段为 `null`，不能自行猜测默认模型。每条现存 worker 记录计入 `workerCount`，每条现存 review 记录计入 `reviewerCount`，`total` 为两者之和；**包含 `merged` / `abandoned` mission 的记录**，无记录时为空数组。
+  - 排序：先 `total` 降序，相同再按 `provider` → `model` → `reasoningEffort` 的字典序升序，逐字段 `null` 在字符串之前，排序不依赖 locale。聚合实现见 [lib/core.js](../lib/core.js) 的 `summaryRoutes`。
+  - 这些数字只统计 state **当前保留的角色记录**，不是完整历史运行次数或 token/费用账单；重新派发会替换对应记录，worker 返工还会清空 review，因此不能将 `total` 当作累计调用次数。
 
 ### 2.5 spawn reviewer
 
@@ -250,10 +254,11 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 ### 3.7 `worker_failed` / `review_failed` 重试
 
 - 症状：worker 落定后 mission → `worker_failed`：进程异常（`stopReason ≠ completed`，`worker.error` 有诊断）、脏收尾（`error:"worker finished with uncommitted or untracked files; ..."`，附 `dirtyEntries`）或 `spawn` 本身失败（`failSpawn`）。reviewer 落定后 mission → `review_failed`：进程错误、被中断、未返回结构化结论（`error:"reviewer did not return a structured verdict"` 或 diagnostic）或 spawn 失败；事件均为 `spawn-failed`。两者的结算通知都保证送达（§2.10）。
-- 诊断：`status`（或 `summary` 概览）读对应记录的 `stopReason`、`error`、`dirtyEntries`；需要更多上下文时 `send` 询问仍在线的 agent，或查看其子代理会话。中断原因的辨别（限流 / 父会话取消 / 其它错误）与无损续跑见 3.15。
+- 诊断：先用 `summary` 定位失败 mission，再用 `tower({action:"status", mission_id:"<id>"})` 读取完整 `worker`/`review` 记录里的 `stopReason`、`error`、`dirtyEntries`（精简 summary 不含全部诊断字段）。需要更多上下文时查看该 run 对应的子代理会话；需要继续修复则按下方步骤 `spawn` 新 run，不向已落定失败的 run 发 `send`。
+  - `send` / `interrupt` **只对当前活跃 run 有效**：mission 必须处于相应的 `worker_running` / `review_running`，且附带的 childId/runId 与本 runtime 活跃记录的 mission/role 地址一致；缺失或不匹配会抛 `AGENT_NOT_RUNNING`。保留着旧会话或 childId 不代表仍可递话，已经落定的失败 run 不能靠 `send` 续跑。中断原因的辨别（限流 / 父会话取消 / 其它错误）与无损续跑见 §3.15。
 - 安全处理（两个状态都在各自的重启集合里，直接重派）：
-  - `worker_failed` → `tower({action:"spawn", role:"worker"})`，instructions 里点名要处理的事项（先 commit / 清理 untracked / 修复报错）。重派 worker 会**清空既有 review 记录**（`beginSpawn` 的既定行为），完成后需要完整重审；若上一轮是 `changes_requested` 后的返工失败，worker 任务简报会自动附带上一轮审查反馈。脏 worktree 会保留给新 worker 修复（不自动清理）。
-  - `review_failed` → 二选一：`tower({action:"spawn", role:"reviewer"})` 重试审查（新 run 绑定当前 SHA）；或 `tower({action:"spawn", role:"worker"})` 直接返工（会清空失败记录与既有 review）。merge gate 在拿到 clean 审查前持续报 `NOT_APPROVED`。
+  - `worker_failed` → `tower({action:"spawn", mission_id:"<id>", role:"worker"})`，instructions 里点名要处理的事项（先 commit / 清理 untracked / 修复报错）。重派 worker 会**清空既有 review 记录**（`beginSpawn` 的既定行为），完成后需要完整重审；若上一轮是 `changes_requested` 后的返工失败，worker 任务简报会自动附带上一轮审查反馈。脏 worktree 会保留给新 worker 修复（不自动清理）。
+  - `review_failed` → 二选一：`tower({action:"spawn", mission_id:"<id>", role:"reviewer"})` 重试审查（新 run 绑定当前 SHA）；或 `tower({action:"spawn", mission_id:"<id>", role:"worker"})` 直接返工（会清空失败记录与既有 review）。merge gate 在拿到 clean 审查前持续报 `NOT_APPROVED`。
 - 何时不应重试：同一失败连续复现（说明任务本身有问题，改 mission 或 `abandon`）；worktree 处于 rebase/merge 中间态（先按 3.1/3.2 清理）；或 `error` 显示问题是环境性的（如 `429` 限流、路由不可用 `MODEL_ROUTE_*`）而未先修环境/换路由。
 
 ### 3.8 `recover` 的语义
