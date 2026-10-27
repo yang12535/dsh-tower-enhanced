@@ -4,6 +4,8 @@ Experimental **Tower-lite** bundle for DeepSeek Harness. It adds a controller `t
 
 This is an independently maintained prototype, not Kimi Tower and not an official DeepSeek bundle.
 
+> 如你所见，这是一个从头到尾都是ai做的kimi tower for dsh风味插件，单纯是在额度富余但马上过期不想浪费的情况下堆出来的，不保证效果，如果你想尝尝我做的勾石的话，那我只能说，小馋猫~
+
 [中文文档](README.zh-CN.md)
 
 ## Features
