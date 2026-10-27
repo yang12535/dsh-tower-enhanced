@@ -178,7 +178,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 
 ### 2.10 运行期通知（落定即尝试投递 + 僵尸提示）
 
-- **结算通知：落定即生成并尝试投递**（[lib/runtime.js](../lib/runtime.js) `track`/`settlementNotice`）：每个 worker/reviewer 落定都会生成一条形如 `Tower <role> for <mission> <outcome>: mission status <status>` 的通知并尝试 steer 给控制器 Session；`failed`/`interrupted`/`stale` 结局附带截断到 500 字符的 `reason` 与 next action（如 `review_failed` → `spawn a fresh reviewer when ready`）。即使 state 落账或投影发布失败，这次投递尝试也仍会进行（最差退化为点名 role/mission/run/error 并提示 `tower action=status`）。但投递本身也可能失败：此时仅记 error 日志，没有持久重试队列——通知是落定路径上的告知机制，不是消息队列；未收到通知属于需要排查的场景，用 `status` 与 error 日志兜底。
+- **结算通知：落定即生成并尝试投递**（[lib/runtime.js](../lib/runtime.js) `track`/`settlementNotice`）：每个 worker/reviewer 落定都会生成一条通知并尝试 steer 给控制器 Session。通知结构：常规形态是首行 `Tower <role> for <mission> <outcome>: mission status <status>`、其后 next action 行（如 `review_failed` → `spawn a fresh reviewer when ready`）；run 完全无法落账（两次状态写入都失败）时，Next 之前另有一行 `run <runId> could not be recorded in Tower state` 诊断。无论哪种形态，物理末行固定是 `stopReason: <实际值>`，`failed`/`interrupted`/`stale` 结局在同一行追加 `; reason: <有界原因>`（来自记录的 error/diagnostic，最多 500 字符，缺失记 `no reason recorded`）。stopReason 优先取激活结果，缺失回退 role 记录；stopReason 缺失时末行报告 `unknown`。stopReason 与 reason 内部的换行和连续空白都会折叠成一个空格，末行因此永远是单行，多行错误文本不会撑破通知结构。若模型本身已完成、只是 state 落账失败，末行 stopReason 仍保留 `completed`、把落账错误放进 reason，不会把完成伪写成 error。即使 state 落账或投影发布失败，这次投递尝试也仍会进行（最差退化为点名 role/mission/run/error 并提示 `tower action=status` 的兜底通知）。但投递本身也可能失败：此时仅记 error 日志，没有持久重试队列——通知是落定路径上的告知机制，不是消息队列；未收到通知属于需要排查的场景，用 `status` 与 error 日志兜底。
 - **`agent/created` 僵尸提示**：Host 重启后，任何新 agent 创建时，runtime 会按其当前工作目录解析仓库，读取 tower state，把该 Session 名下仍标记 `worker_running`/`review_running`、但本运行时不再拥有的激活列成一条通知（每个 run 一次，不重复打扰），建议执行 `tower action=recover`。提示只发给记录中的控制器 Session；探测失败只记警告，不影响 agent 创建。
 
 ## 3. 故障场景 Runbook
@@ -468,7 +468,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 
 ### 3.15 子代理中断的辨别与续跑
 
-worker/reviewer 中断在 mission 侧都长一个样——落定成 `worker_failed`/`review_failed`，或跨重启悬置在 running（3.8）——但「为什么断」决定下一步完全不同：限流要换路由或等窗口，父会话取消可能只差一个 commit，其它错误要先定位根因。结算通知（§2.10）落定即生成并尝试投递，但投递可能失败（仅记 error 日志、无持久重试）且 `reason` 截断到 500 字符，辨别一律要靠 `status` 的 role 记录加子会话日志的 `turn/end`。
+worker/reviewer 中断在 mission 侧都长一个样——落定成 `worker_failed`/`review_failed`，或跨重启悬置在 running（3.8）——但「为什么断」决定下一步完全不同：限流要换路由或等窗口，父会话取消可能只差一个 commit，其它错误要先定位根因。结算通知（§2.10）落定即生成并尝试投递，其物理末行 `stopReason: <实际值>`（缺失记 `unknown`；`failed`/`interrupted`/`stale` 同行附 `; reason:`）是第一道分辨信号，但投递可能失败（仅记 error 日志、无持久重试），且 `reason` 截断到 500 字符、换行和连续空白折叠成一个空格，最终辨别一律要靠 `status` 的 role 记录加子会话日志的 `turn/end`。
 
 - 症状：`status`（§2.4）里 role 记录的 `stopReason` 为 `error`（`error` 文本各异：`429: {...}`、进程异常……）或 `aborted`（`error` 形如 `worker ended with aborted`，或 `recover` 标记的 `activation is not owned by this runtime; ...`）；也可能 mission 悬置在 `worker_running`/`review_running` 无人落定（3.8 的场景）。
 - 诊断（辨别表：症状 → 判定 → 证据位置）：

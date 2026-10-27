@@ -17,7 +17,7 @@
 - 卡片显示任务、角色、结果、耗时，以及启动时记录的 provider/model/reasoning effort，绝不替代主会话的模型选择器。点击卡片会打开其原生 `subagentchat` 会话记录；**任务与结果** 可展开记录的输出、review 检查项、分支与提交信息。失败、被中断、过期（stale）与 changes-requested 的结果和正常完成始终保持可区分。筛选器可以选择全部、运行中或需要关注的 agent。
 - 聊天链接与会话成员关系依次使用宿主的子会话目录、列出的谱系、spawn 时记录的控制器，绝不会从面板当前 Session 猜测未知归属。视图使用同一仓库最新可用的投影；这些是已记录的 Tower 激活，不是子会话内部后续每次模型变更的实时流。
 - `edit` 可按与 `add` 相同的校验规则修正 pending 任务的标题、描述、scope 与依赖。`summary` 提供只读的紧凑概览，包含全局计数与每个任务一行的条目；可选 `mission_id` 只收窄条目，不改变全局计数。
-- reviewer 启动或运行失败会进入显式且可重试的 `review_failed` 状态：可以重新 spawn reviewer，也可以直接另派 worker 返工。每个落定的 worker/reviewer 都会生成结果通知并尝试投递给控制器；失败时附带截断的原因与下一步操作，即使状态记录或投影发布失败也仍会尝试投递；投递本身失败仅记 error 日志，不做重试。
+- reviewer 启动或运行失败会进入显式且可重试的 `review_failed` 状态：可以重新 spawn reviewer，也可以直接另派 worker 返工。每个落定的 worker/reviewer 都会生成结果通知并尝试投递给控制器（首行结果概要、随后下一步操作——run 完全无法落账时 Next 之前另有一行 run 诊断——物理末行报告实际 `stopReason`，缺失记 `unknown`；失败/被中断/过期的结局在同一行附带截断到 500 字符的原因），即使状态记录或投影发布失败也仍会尝试投递；投递本身失败仅记 error 日志，不做重试。
 - 宿主重启后，持久化的运行中激活会主动触发僵尸告警。在确认旧控制器已停止并显式调用 `recover` 将其标记为中断之前，这些记录会阻塞新工作；恢复过程绝不接管旧进程。
 - pending 任务首次启动 worker 前，会把尚未改动且干净的 worktree 快进到当前 base。本地改动、被忽略文件的覆盖冲突或分叉提交会阻止刷新，而不会被覆盖。
 - review 证据同时绑定当前的 base SHA 与被审查的 tip SHA。任何 rebase 或相关移动都需要重新审查；即使任务 tip 没变，只要 base 变化，旧 verdict 也会失效。
@@ -133,7 +133,7 @@ config:
 
 ## 失败恢复
 
-- 失败一定会产生通知，投递是尽力而为、不构成端到端保证：每个结束的 worker/reviewer 都会生成一条形如 `Tower <role> for <mission> <outcome>: mission status <status>` 的通知并尝试 steer 给控制器 Session；失败/被中断/过期（stale）的结果会附带截断到 500 字符以内的 `reason`（来自记录的 error 或 diagnostic）以及下一步操作提示 —— 即使状态记录或投影发布失败，这次尝试也仍会进行（最坏情况下退化为一条包含 role、mission、run 与错误文本的兜底通知）。steer 本身也可能失败，届时仅记 error 日志、没有持久重试；未收到通知时用 `tower action=status` 与日志兜底核对。
+- 失败一定会产生通知，投递是尽力而为、不构成端到端保证：每个结束的 worker/reviewer 都会生成一条通知并尝试 steer 给控制器 Session，常规形态是首行 `Tower <role> for <mission> <outcome>: mission status <status>`、随后是下一步操作行；run 完全无法落账时，Next 之前另有一行 `run <runId> could not be recorded in Tower state` 诊断。无论哪种形态，物理末行固定是 `stopReason: <实际值>`；`failed`（失败）/`interrupted`（被中断）/`stale`（过期）结局在同一行追加 `; reason: <有界原因>`（来自记录的 error 或 diagnostic，最多 500 字符）。stopReason 缺失时末行报告 `unknown`；stopReason 与 reason 内部的换行和连续空白都会折叠成一个空格，末行始终是一行。若模型本身已完成、只是 state 落账失败，末行 stopReason 仍保留 `completed`、把落账错误放进 reason，不会把完成伪写成 error——即使状态记录或投影发布失败，这次尝试也仍会进行（最坏情况下退化为一条包含 role、mission、run 与错误文本的兜底通知）。steer 本身也可能失败，届时仅记 error 日志、没有持久重试；未收到通知时用 `tower action=status` 与日志兜底核对。
 - review 失败是显式状态：reviewer 出错、没有返回结构化结论、或根本没有启动成功时，任务进入 `review_failed`（记录 `error`、`stopReason`、`completedAt`，并写入 `spawn-failed` 事件），而不会再退回难以区分的 `worker_completed`。可以从中重新 spawn reviewer，或直接另派 worker 返工；在干净的 review 批准之前，合并门禁会给出 `NOT_APPROVED`。
 - 面板把审查失败与运行中、审查通过区分开，并显示重试建议；过期审查证据优先于旧结论。agent 卡片和任务角色行以纯文本显示错误，最多 500 个 Unicode 码点（含省略号），展开结果仍保留记录的原始输出。没有创建子会话的启动失败会显示在任务视图中，不会虚构 agent，也不会一直显示“正在创建子代理会话”。
 - 宿主进程重启后，运行时会从 agent 的当前工作目录定位 Git 仓库根，包括会话曾切换目录或停在仓库子目录的情况。对持久化的 `worker_running`/`review_running` 激活，向所属控制器主动 steer 一次僵尸告警（列出 mission/role/启动时间），提示执行 `tower action=recover`。仅在工作目录服务不可用时，才回退到会话创建时的目录。

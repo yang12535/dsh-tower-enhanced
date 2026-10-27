@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Read-only guard over the settlement-notification contract as documented in
-// both READMEs and docs/operations.md.
+// both READMEs, docs/operations.md, and docs/architecture.md.
 //
 // lib/runtime.js `track`/`settlementNotice` guarantees: every settled
 // worker/reviewer run BUILDS a notice and ATTEMPTS `parent.steer`; state
@@ -24,13 +24,18 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Documents that state the settlement-notification contract. */
-const DOC_FILES = ['README.md', 'README.zh-CN.md', 'docs/operations.md'];
+const DOC_FILES = ['README.md', 'README.zh-CN.md', 'docs/operations.md', 'docs/architecture.md'];
 
 /**
  * Per-file floor in UTF-16 code units. A deleted or emptied file must fail
  * loudly instead of passing every regex below vacuously.
  */
-const MIN_LENGTHS = { 'README.md': 4000, 'README.zh-CN.md': 4000, 'docs/operations.md': 10000 };
+const MIN_LENGTHS = {
+  'README.md': 4000,
+  'README.zh-CN.md': 4000,
+  'docs/operations.md': 10000,
+  'docs/architecture.md': 20000,
+};
 
 /** Load one pinned document, failing on a missing or gutted file. */
 function loadDoc(rel) {
@@ -131,6 +136,102 @@ test('both READMEs keep the same best-effort delivery contract (en/zh parity)', 
   assert.match(zh, /即使状态记录或投影发布失败，这次尝试也仍会进行/, 'ZH README must keep the isolation guarantee');
   assert.match(zh, /仅记 error 日志、没有持久重试/, 'ZH README must state the logged-only, no-retry boundary');
   assert.match(zh, /都会生成结果通知并尝试投递给控制器/, 'ZH README feature list must phrase notice as generated + attempted');
+});
+
+/**
+ * The settlement-notice final-line contract (lib/runtime.js
+ * `settlementNotice`, pinned by test/runtime.test.js track/settlement cases):
+ * a regular notice is first line `Tower <role> for <mission> <outcome>:
+ * mission status <status>` → next-action line → physical LAST line
+ * `stopReason: <actual value>`; when the run could not be recorded in Tower
+ * state at all, a run-diagnostic line (`run <runId> could not be recorded in
+ * Tower state`) precedes the next action, and the last physical line is still
+ * the stop reason; failed/interrupted/stale outcomes append `; reason:
+ * <bounded reason>` on that same line; a missing stop reason is reported as
+ * `unknown`; line breaks and repeated whitespace inside stopReason/reason
+ * collapse to one space so the final line stays single-line, with the reason
+ * still capped at 500 characters; and when the model completed but state
+ * recording failed, the stop reason keeps `completed` (the recording error
+ * moves into `reason`) instead of being rewritten as an error.
+ *
+ * The M80 runtime change made all of that true; these docs then still
+ * described only the summary line, `reason`, and Next. Each notification doc
+ * must carry every point below — this is a keyword/regex checklist per file,
+ * not full-text equality, so rewording around the pinned keywords stays free.
+ */
+const ZH_FINAL_LINE_POINTS = [
+  // Regular notice order: summary first line, then the next-action line.
+  { pattern: /常规形态是首行/, why: '常规顺序：首行概要 → next action 行' },
+  // The unrecordable-run fallback inserts a run-diagnostic line before Next
+  // (test/runtime.test.js "an unrecordable run still notifies…").
+  { pattern: /Next 之前另有一行 `run <runId> could not be recorded in Tower state`/, why: 'run 无法落账时 Next 前插入 run 诊断行' },
+  // The final physical line reports the actual stop reason — not just the
+  // first-line summary shape — in BOTH the regular and fallback shapes.
+  { pattern: /物理末行固定是 `stopReason: <实际值>`/, why: '末行固定报告实际 stopReason' },
+  // failed/interrupted/stale carry the bounded reason on that same line.
+  { pattern: /在同一行追加 `; reason: <有界原因>`/, why: 'failed/interrupted/stale 同一行的有界 reason' },
+  // A missing stop reason is reported as unknown, never invented.
+  { pattern: /stopReason 缺失时末行报告 `unknown`/, why: '缺失 stopReason 报告 unknown' },
+  // Newlines/repeated whitespace collapse so the final line stays one line.
+  { pattern: /换行和连续空白都会折叠成一个空格/, why: 'stopReason/reason 单行化折叠' },
+  // Model completion survives a state-recording failure.
+  { pattern: /不会把完成伪写成 error/, why: 'state 落账失败不把 completed 伪写成 error' },
+  // The reason bound stays 500 characters.
+  { pattern: /500 字符/, why: 'reason 最多 500 字符' },
+];
+
+const FINAL_LINE_CONTRACT = [
+  {
+    rel: 'README.md',
+    points: [
+      // Regular notice order: summary first line, then the next-action line.
+      { pattern: /first line `Tower <role> for <mission> <outcome>: mission status <status>`, then the next-action line/, why: 'regular order: summary line, then next action' },
+      // The unrecordable-run fallback inserts a run-diagnostic line before Next.
+      { pattern: /run-diagnostic line \(`run <runId> could not be recorded in Tower state`\) precedes the next action/, why: 'unrecordable-run fallback inserts a run-diagnostic line before Next' },
+      // Final physical line reports the actual stop reason.
+      { pattern: /The physical last line is always `stopReason: <actual value>`/, why: 'final physical line = actual stopReason' },
+      { pattern: /append `; reason: <bounded reason>`[^\n]*on that same (?:last )?line/, why: 'failed/interrupted/stale same-line bounded reason' },
+      { pattern: /A missing stop reason reports `unknown`/, why: 'missing stop reason reports unknown' },
+      { pattern: /line breaks or repeated whitespace inside the stop reason or reason are collapsed to a single line/, why: 'single-line folding of stopReason/reason' },
+      { pattern: /completion is never rewritten as an error/, why: 'state-recording failure keeps completed' },
+      { pattern: /500 characters/, why: 'reason capped at 500 characters' },
+    ],
+  },
+  { rel: 'README.zh-CN.md', points: ZH_FINAL_LINE_POINTS },
+  { rel: 'docs/operations.md', points: ZH_FINAL_LINE_POINTS },
+  { rel: 'docs/architecture.md', points: ZH_FINAL_LINE_POINTS },
+];
+
+test('every notification doc pins the settlement final-line stopReason contract', () => {
+  for (const { rel, points } of FINAL_LINE_CONTRACT) {
+    const text = loadDoc(rel);
+    for (const { pattern, why } of points) {
+      assert.ok(
+        pattern.test(text),
+        `${rel} lost a final-line contract point (${why}); lib/runtime.js settlementNotice ends every ` +
+          'settlement notice with `stopReason: <actual value>` and a same-line bounded reason for ' +
+          'failed/interrupted/stale outcomes',
+      );
+    }
+  }
+});
+
+test('architecture frames notices as generate-and-attempt only, never guaranteed delivery', () => {
+  const arch = loadDoc('docs/architecture.md');
+  // §3.4 must own the explicit semantics that replaced the old 「保证送达」
+  // label: only generation + attempt per settle is guaranteed.
+  assert.match(
+    arch,
+    /只保证[^\n]*生成并尝试投递/,
+    '§3.4 must state only generation-and-attempt is guaranteed',
+  );
+  assert.match(
+    arch,
+    /不承诺端到端送达/,
+    '§3.4 must deny end-to-end delivery explicitly',
+  );
+  // The section heading itself must not revive a delivery guarantee.
+  assert.match(arch, /### 3\.4 落定通知：只保证生成并尝试投递/, '§3.4 heading must keep the generate-and-attempt framing');
 });
 
 test('operations §3.15 routes the models lookup to §2.9 (where models lives), not §2.3 (spawn worker)', () => {
