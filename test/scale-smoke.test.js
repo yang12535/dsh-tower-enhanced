@@ -6,6 +6,9 @@ import { initializedCore, makeRepo } from './helpers.js';
 
 const MISSION_COUNT = 100;
 const MAX_STATE_BYTES = 1.5 * 1024 * 1024;
+const EVENT_CAP = 200;
+const CAP_EDITS = 205;
+const PUBLIC_EVENT_WINDOW = 20;
 
 async function measure(operation) {
   const startedAt = performance.now();
@@ -150,4 +153,59 @@ test('100-mission state remains responsive without unbounded growth', async (t) 
   assert.equal(persisted.events.length, 200, 'the appendEvent cap must still bound event history');
   assert.equal(persisted.events.at(-1).type, 'mission-edited');
   assert.equal(persisted.events.at(-1).mission, 'M2');
+});
+
+test('a real 205-edit overflow proves appendEvent truncation and the 20-event public window', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Cap probe', description: 'Drives the appendEvent cap with real edits.' });
+
+  // Pin the pre-overflow history instead of assuming it: exactly the init and
+  // mission-added events exist before the overflow begins.
+  const seededTypes = (await core.store.read()).events.map((event) => event.type);
+  assert.deepEqual(seededTypes, ['initialized', 'mission-added']);
+  const seedCount = seededTypes.length;
+
+  // Really exceed the cap: 205 sequential edits of one pending mission, each a
+  // genuine appendEvent path. Alternating the edited field stamps each event's
+  // identity into `fields`, so the surviving window can be identified exactly.
+  const overflow = await measure(async () => {
+    for (let edit = 1; edit <= CAP_EDITS; edit += 1) {
+      if (edit % 2 === 1) await core.editMission({ missionId: 'M1', title: `Cap probe edit ${edit}` });
+      else await core.editMission({ missionId: 'M1', description: `Cap probe edit ${edit}.` });
+    }
+  });
+  assert.ok(overflow.elapsed < 1_000, `205 capped edits took ${overflow.elapsed.toFixed(1)}ms`);
+
+  const persisted = await core.store.read();
+  assert.equal(persisted.events.length, EVENT_CAP, 'the persisted event history must be capped at 200');
+
+  // The oldest events were really dropped: event #1 (initialized) and #2
+  // (mission-added) no longer exist; only edit events remain.
+  assert.ok(
+    persisted.events.every((event) => event.type === 'mission-edited' && event.mission === 'M1'),
+    'the overflow must have evicted the seeded events at the front of the history',
+  );
+
+  // Identify the window: seedCount + CAP_EDITS events were appended and 200
+  // survive, so the evicted prefix is seedCount + 5 events and the first
+  // survivor is edit #6 (an even, description-only edit).
+  const evicted = seedCount + CAP_EDITS - EVENT_CAP;
+  const firstSurvivingEdit = evicted - seedCount + 1;
+  const fieldOf = (edit) => (edit % 2 === 1 ? 'title' : 'description');
+  assert.ok(
+    persisted.events.every((event, index) => event.fields.length === 1 && event.fields[0] === fieldOf(firstSurvivingEdit + index)),
+    `surviving events must be exactly edits #${firstSurvivingEdit}..#${CAP_EDITS} in order`,
+  );
+  assert.deepEqual(persisted.events.at(-1).fields, ['title'], `edit #${CAP_EDITS} must be the newest persisted event`);
+
+  // Event #201 — the first append that crossed the cap — is edit #199. It must
+  // still be present (at index 200 - evicted), proving it entered the history
+  // and pushed event #1 out rather than being dropped itself.
+  assert.equal(persisted.events[200 - evicted].fields[0], fieldOf(201 - seedCount));
+
+  // The public view only exposes the last 20 events of the capped history.
+  const publicView = await core.status();
+  assert.equal(publicView.events.length, PUBLIC_EVENT_WINDOW);
+  assert.deepEqual(publicView.events, persisted.events.slice(-20));
 });
