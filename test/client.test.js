@@ -930,6 +930,76 @@ function matrixHarness() {
   return h;
 }
 
+test('agents controls, filters, and task cards stay ahead of route usage while missions keep their layout', () => {
+  const tower = filterMatrixTower();
+  tower.routes = [{ provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high', workerCount: 1, reviewerCount: 0, total: 1 }];
+  const h = harness(tower);
+  const agentTree = h.render();
+  const scope = findAll(agentTree, has('className', 'Tw_scope'))[0];
+  const filter = findAll(agentTree, has('className', 'Tw_filters'))[0];
+  const workerGroup = groupOf(agentTree, 'worker');
+  const routes = findAll(agentTree, withProp('data-tower-routes'))[0];
+  // Expanded DOM order is the visual order: statistics cannot cover live work.
+  assert.ok(scope && filter && workerGroup && routes);
+  assert.deepEqual(findAll(scope, withProp('data-tower-routes')), []);
+  assert.deepEqual(findAll(workerGroup, withProp('data-tower-routes')), []);
+  assert.deepEqual(findAll(routes, withProp('data-tower-agent')), []);
+  const workspace = findAll(agentTree, has('data-tower-workspace', true))[0];
+  const fragments = findAll(workspace, (node) => node.type === 'Fragment' && Array.isArray(node.props.children)
+    && node.props.children.some((child) => child?.props?.className === 'Tw_scope'));
+  assert.equal(fragments.length, 1);
+  const agentsSection = fragments[0].props.children;
+  const workerIndex = agentsSection.findIndex((child) => Array.isArray(child)
+    && child.some((group) => group?.props?.['data-tower-group'] === 'worker'));
+  const routeIndex = agentsSection.findIndex((child) => child?.props?.['data-tower-routes'] === true);
+  assert.ok(workerIndex >= 0 && routeIndex > workerIndex);
+
+  findAll(agentTree, has('data-tower-view-button', 'missions'))[0].props.onClick();
+  const missionTree = h.render();
+  const missionRoutes = findAll(missionTree, withProp('data-tower-routes'))[0];
+  const missionView = findAll(missionTree, has('data-tower-mission-view', true))[0];
+  const missionFragment = findAll(missionTree, (node) => node.type === 'Fragment' && Array.isArray(node.props.children)
+    && node.props.children.some((child) => child?.props?.['data-tower-mission-view'] === true))[0];
+  const missionChildren = missionFragment.props.children;
+  assert.ok(missionChildren.findIndex((child) => child?.props?.['data-tower-routes'] === true)
+    < missionChildren.findIndex((child) => child?.props?.['data-tower-mission-view'] === true));
+  assert.equal(missionRoutes.props['data-routes-collapsed'], false);
+  assert.equal(findAll(missionView, withProp('data-tower-routes')).length, 0);
+});
+
+test('resume cards expose bilingual provenance without changing fresh spawns or revealing prompt hashes', () => {
+  for (const [language, runLabel, seqLabel] of [
+    ['zh', '上次 runId', '会话序号 (sessionSeq)'],
+    ['en', 'Previous runId', 'Session sequence (sessionSeq)'],
+  ]) {
+    const tower = filterMatrixTower();
+    tower.missions.find((mission) => mission.id === 'RUN').worker.resumeFrom = {
+      runId: 'previous-run-42', sessionSeq: 7, childId: 'previous-child', promptHash: 'never-render-this-hash',
+    };
+    const h = harness(tower, { language });
+    for (const childId of ['run-child', 'fail-worker-child', 'fail-review-child']) h.rows[childId] = { parentId: 'root' };
+    const tree = h.render();
+    const resumed = cardArticle(tree, 'run-child');
+    const fresh = cardArticle(tree, 'worker-child');
+    const badges = findAll(resumed, withProp('data-agent-resumed'));
+    assert.equal(badges.length, 1, language);
+    assert.equal(textOf(badges[0]), '续接 / Resumed', language);
+    assert.equal(resumed.props['data-agent-resume-run'], 'previous-run-42');
+    assert.equal(resumed.props['data-agent-resume-session-seq'], 7);
+    assert.equal(fresh.props['data-agent-resume-run'], undefined);
+    assert.equal(fresh.props['data-agent-resume-session-seq'], undefined);
+    assert.equal(findAll(fresh, withProp('data-agent-resumed')).length, 0);
+    const details = findAll(resumed, has('className', 'Tw_details'))[0];
+    assert.match(textOf(details), new RegExp(`${runLabel}.*previous-run-42.*${seqLabel.replace(/[()]/g, '\\$&')}.*7`));
+    assert.match(textOf(details), /任务与结果|Task & result/);
+    assert.doesNotMatch(textOf(tree), /never-render-this-hash|promptHash/);
+    // Existing open and result details stay on the same resumed card.
+    findAll(resumed, has('data-tower-agent', 'RUN:worker'))[0].props.onClick();
+    assert.equal(cardArticle(h.render(), 'run-child').props['data-selected'], true);
+    assert.match(textOf(h.render()), /Running mission/);
+  }
+});
+
 test('agents view opens on session scope with the all filter pressed', () => {
   const tree = harness().render();
   // the agents view is the default surface
