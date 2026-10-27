@@ -150,11 +150,11 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 成功返回均带完整地址 `{ mission, role, runId, childId }`：`send` 另含 `sent:true` 与宿主返回的 `messageId`，消息文本经 trim 后转发；`interrupt` 另含 `interrupted:true`，以 `{ kind:'ancestor', agent }` 请求取消。两个动作本身不写 Tower state，成功路径也不 publish；实际落定状态仍由 §6.3 的 `track` 统一结算。覆盖测试见 [../test/control-actions.test.js](../test/control-actions.test.js)。
 
-### 3.4 落定通知的保证
+### 3.4 落定通知：只保证生成并尝试投递
 
 `TowerRuntime.track` 对每个激活只走一条结算链：等待 `activation.result` → `completeSpawn`，异常时尝试 `failSpawn` → 在 `finally` 删除 active 并 dispose activation → 独立尝试 publish → 构造并向控制器 `steer` 一条 `subagent-settled` 通知。状态落账与 projection 发布分别被隔离，二者失败都不能吞掉后续通知；即使两次状态写入都失败，fallback 通知仍点名 role、mission、runId 与错误，并提示先用 `status` 检查。
 
-通知首行是 `Tower <role> for <mission> <outcome>: mission status <status>`；`failed` / `interrupted` / `stale` 附 reason 和下一步，reason 统一以 `boundedReason` 截到 500 字符。`review_failed` 指引重派 reviewer，`changes_requested` 指引 worker 返工后重审，approved 指引 gate/merge。这里的「保证送达」指**每次落定都必然生成并尝试投递，前序失败不会静默**；若宿主 `steer` 自身抛错，则记录 error 日志，不伪称还有跨进程持久队列或自动重试。可执行契约见 [../test/runtime.test.js](../test/runtime.test.js) 的 track/settlement 用例。
+通知结构：常规形态是首行 `Tower <role> for <mission> <outcome>: mission status <status>`、其后 next action 行；两次状态写入都失败、run 完全无法落账时，Next 之前另有一行 `run <runId> could not be recorded in Tower state` 诊断。无论哪种形态，物理末行固定是 `stopReason: <实际值>`——`failed` / `interrupted` / `stale` 结局在同一行追加 `; reason: <有界原因>`，`boundedReason` 统一截到最多 500 字符、缺失记 `no reason recorded`。stopReason 优先取激活结果，缺失回退 role 记录；stopReason 缺失时末行报告 `unknown`。stopReason 与 reason 内部的换行和连续空白都会折叠成一个空格，末行因此永远是单行；若模型本身已完成、只是 state 落账失败，末行 stopReason 仍保留 `completed`、把落账错误放进 reason，不会把完成伪写成 error。`review_failed` 指引重派 reviewer，`changes_requested` 指引 worker 返工后重审，approved 指引 gate/merge。本节只保证每次落定都必然**生成并尝试投递**通知、前序失败不会静默，**不承诺端到端送达**；若宿主 `steer` 自身抛错，则记录 error 日志，不伪称还有跨进程持久队列或自动重试。可执行契约见 [../test/runtime.test.js](../test/runtime.test.js) 的 track/settlement 用例。
 
 ### 3.5 不允许的操作
 
