@@ -1,0 +1,19 @@
+{
+  "reviewDate": "2026-10-27",
+  "timezone": "Asia/Shanghai",
+  "mainCommit": "0818acc240f6bcbc951c6bb931b97d2aa0bfe640",
+  "m83BaseCommit": "072ec3f37ebdca40044ba378c41ddb1bcd949221",
+  "mainFiles": {
+    "lib/core.js": "b576ce680bbd6a5f0244c37ec52a3be1ba2295dc8d4619c8564dc426d0581805",
+    "lib/runtime.js": "808bd936016d019a85fb61c46985fe54a5baea438e011dc903e662cb1dcb9e7b",
+    "lib/store.js": "007ca9dab5f998794939917f33100568122bd9ee022464f7b7e7a1df1247c91f",
+    "lib/projection.js": "1750e48ba4dbe6dc968627714348bb6bea6f651812c644e7bc62a37841d3192a",
+    "lib/client.js": "2efe146645b5c9bb9b39746c5f0db50eb29d1482fca220f498c0f80a7e507d65",
+    "lib/index.js": "530f68cac075381e4f9b64de394426981506555c8ee92f7ccabc05eeec122ce2"
+  },
+  "m83UncommittedFiles": {
+    "lib/core.js": "fa71ee2d2caa908359802b664957ce9ceb7a95977a3f305be492b314be4efa07",
+    "lib/runtime.js": "5691dedeaf3efd0daf35c3a17c5a7e261f36c11204c9c3c53d38ff8099a7cf26"
+  },
+  "m83PatchSha256": "9af3945ad624c83f543a2a5987aa981b8072ea54e3c6f20148aaf4dc0c749fbb"
+}

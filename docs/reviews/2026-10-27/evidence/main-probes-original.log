@@ -1,0 +1,71 @@
+✖ a concurrent short call must not release its Session sibling startup claim (125.638045ms)
+✖ recover must not classify this runtime pending startup as a stale run (75.35995ms)
+CHARACTERIZATION retry: current role count 2 -> 1; original worker child reference and review removed from mission current records
+✔ characterization: worker retry replaces latest record, removes review and reduces route count (96.274056ms)
+CHARACTERIZATION dependency: upstream abandoned -> dependent worker admitted
+✔ characterization: abandonment resolves dependsOn without providing upstream artifacts (80.029067ms)
+CHARACTERIZATION known boundary: recovered worker_failed -> old core late write -> worker_completed
+✔ characterization: second core recover does not fence old core late completion (74.649589ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 3
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 560.140566
+
+✖ failing tests:
+
+test at work/main-review/main-probes.test.mjs:32:1
+✖ a concurrent short call must not release its Session sibling startup claim (125.638045ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    {
+      activeControllers: [
+  +     'controller-B',
+        'controller-A'
+      ],
+  +   foreignAccepted: true,
+  +   ownerAfterSummary: undefined
+  -   foreignAccepted: false,
+  -   ownerAfterSummary: 'controller-A'
+    }
+  
+      at TestContext.<anonymous> (file:///home/yangtim/Documents/Codex/2026-10-27/home-yangtim-dsh-tower-enhanced-docs/work/main-review/main-probes.test.mjs:50:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { ownerAfterSummary: undefined, foreignAccepted: true, activeControllers: [ 'controller-B', 'controller-A' ] },
+    expected: { ownerAfterSummary: 'controller-A', foreignAccepted: false, activeControllers: [ 'controller-A' ] },
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at work/main-review/main-probes.test.mjs:54:1
+✖ recover must not classify this runtime pending startup as a stale run (75.35995ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    {
+  +   recovered: [
+  +     'M1'
+  +   ],
+  +   status: 'worker_failed',
+  -   recovered: [],
+  -   status: 'worker_running',
+      tracked: 1
+    }
+  
+      at TestContext.<anonymous> (file:///home/yangtim/Documents/Codex/2026-10-27/home-yangtim-dsh-tower-enhanced-docs/work/main-review/main-probes.test.mjs:67:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { recovered: [ 'M1' ], status: 'worker_failed', tracked: 1 },
+    expected: { recovered: [], status: 'worker_running', tracked: 1 },
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

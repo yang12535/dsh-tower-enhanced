@@ -1,0 +1,182 @@
+✖ invalid review JSON must settle as review_failed (real TowerCore) (252.028947ms)
+✖ JSON quoted as an example in prose must not become review approval (1.063947ms)
+✖ an end event without this resume start must not settle the activation (0.93554ms)
+✖ resumed reviewer prompt must name the newly bound base and tip (123.264914ms)
+✖ dispose after a matched terminal edge must not interrupt the next host epoch (0.489655ms)
+✖ resume is registered in both the public schema and runtime dispatch (1.940688ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 0
+ℹ fail 6
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 499.424186
+
+✖ failing tests:
+
+test at work/m83-review/review-probes.test.mjs:34:1
+✖ invalid review JSON must settle as review_failed (real TowerCore) (252.028947ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+      {
+  +     gateReady: true,
+  +     status: 'approved'
+  -     gateReady: false,
+  -     status: 'review_failed'
+      },
+      {
+  +     gateReady: true,
+  +     status: 'approved'
+  -     gateReady: false,
+  -     status: 'review_failed'
+      },
+      {
+  +     gateReady: true,
+  +     status: 'approved'
+  -     gateReady: false,
+  -     status: 'review_failed'
+      },
+      {
+        gateReady: false,
+  +     status: 'changes_requested'
+  -     status: 'review_failed'
+      }
+    ]
+  
+      at TestContext.<anonymous> (file:///home/yangtim/Documents/Codex/2026-10-27/home-yangtim-dsh-tower-enhanced-docs/work/m83-review/review-probes.test.mjs:52:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ { status: 'approved', gateReady: true }, { status: 'approved', gateReady: true }, { status: 'approved', gateReady: true }, { status: 'changes_requested', gateReady: false } ],
+    expected: [ { status: 'review_failed', gateReady: false }, { status: 'review_failed', gateReady: false }, { status: 'review_failed', gateReady: false }, { status: 'review_failed', gateReady: false } ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at work/m83-review/review-probes.test.mjs:55:1
+✖ JSON quoted as an example in prose must not become review approval (1.063947ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + {
+  +   checks: [],
+  +   findings: [],
+  +   merge: true,
+  +   summary: 'clean',
+  +   verdict: 'clean'
+  + }
+  - undefined
+  
+      at TestContext.<anonymous> (file:///home/yangtim/Documents/Codex/2026-10-27/home-yangtim-dsh-tower-enhanced-docs/work/m83-review/review-probes.test.mjs:60:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { verdict: 'clean', merge: true, summary: 'clean', findings: [], checks: [] },
+    expected: undefined,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at work/m83-review/review-probes.test.mjs:63:1
+✖ an end event without this resume start must not settle the activation (0.93554ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + {
+  +   output: [
+  +     {
+  +       text: '{"verdict":"clean","merge":true,"summary":"clean","findings":[],"checks":[]}',
+  +       type: 'text'
+  +     }
+  +   ],
+  +   stopReason: 'completed',
+  +   structured: {
+  +     checks: [],
+  +     findings: [],
+  +     merge: true,
+  +     summary: 'clean',
+  +     verdict: 'clean'
+  +   }
+  + }
+  - 'pending'
+  
+      at TestContext.<anonymous> (file:///home/yangtim/Documents/Codex/2026-10-27/home-yangtim-dsh-tower-enhanced-docs/work/m83-review/review-probes.test.mjs:70:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { stopReason: 'completed', structured: { verdict: 'clean', merge: true, summary: 'clean', findings: [], checks: [] }, output: [ [Object] ] },
+    expected: 'pending',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at work/m83-review/review-probes.test.mjs:73:1
+✖ resumed reviewer prompt must name the newly bound base and tip (123.264914ms)
+  AssertionError [ERR_ASSERTION]: new SHA binding is absent from delivered prompt
+      at TestContext.<anonymous> (file:///home/yangtim/Documents/Codex/2026-10-27/home-yangtim-dsh-tower-enhanced-docs/work/m83-review/review-probes.test.mjs:89:10)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at work/m83-review/review-probes.test.mjs:92:1
+✖ dispose after a matched terminal edge must not interrupt the next host epoch (0.489655ms)
+  AssertionError [ERR_ASSERTION]: old activation interrupted the child now running host-next
+  + actual - expected
+  
+  + [
+  +   'child'
+  + ]
+  - []
+  
+      at TestContext.<anonymous> (file:///home/yangtim/Documents/Codex/2026-10-27/home-yangtim-dsh-tower-enhanced-docs/work/m83-review/review-probes.test.mjs:103:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: [ 'child' ],
+    expected: [],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at work/m83-review/review-probes.test.mjs:109:1
+✖ resume is registered in both the public schema and runtime dispatch (1.940688ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    {
+  +   dispatch: 'unknown Tower action resume',
+  +   schema: false,
+  +   sessionQuery: false
+  -   dispatch: {
+  -     resumed: true
+  -   },
+  -   schema: true,
+  -   sessionQuery: true
+    }
+  
+      at TestContext.<anonymous> (file:///home/yangtim/Documents/Codex/2026-10-27/home-yangtim-dsh-tower-enhanced-docs/work/m83-review/review-probes.test.mjs:125:10)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { schema: false, sessionQuery: false, dispatch: 'unknown Tower action resume' },
+    expected: { schema: true, sessionQuery: true, dispatch: { resumed: true } },
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
