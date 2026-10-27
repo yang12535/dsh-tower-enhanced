@@ -4,7 +4,7 @@
 
 ## 基线
 
-本手册与 base `c6080c5` 的代码行为一致：[lib/core.js](../lib/core.js)（状态机、merge gate、merge/rebase/teardown/recover 语义）、[lib/runtime.js](../lib/runtime.js)（action 分发、workspace 归属、通知与僵尸探测）、[lib/store.js](../lib/store.js)（state 持久化与校验）、[lib/git.js](../lib/git.js)（git 封装）。该基线包含：`summary` 概览、`review_failed` 状态、pending 首次派发前的 ff-only 基线同步、失败通知保证送达与 `agent/created` 僵尸提示、rebase 时 base 变化即失效审查、`add`/`edit` 一致的 scope 校验、store 原子写失败清理临时文件，以及只读体检脚本 [scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs)。
+本手册与 base `c6080c5` 的代码行为一致：[lib/core.js](../lib/core.js)（状态机、merge gate、merge/rebase/teardown/recover 语义）、[lib/runtime.js](../lib/runtime.js)（action 分发、workspace 归属、通知与僵尸探测）、[lib/store.js](../lib/store.js)（state 持久化与校验）、[lib/git.js](../lib/git.js)（git 封装）。该基线包含：`summary` 概览、`review_failed` 状态、pending 首次派发前的 ff-only 基线同步、结算通知落定即生成并尝试投递（§2.10）与 `agent/created` 僵尸提示、rebase 时 base 变化即失效审查、`add`/`edit` 一致的 scope 校验、store 原子写失败清理临时文件，以及只读体检脚本 [scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs)。
 
 ## 约定
 
@@ -12,7 +12,7 @@
 - 文中 `<repo>` 指仓库根（`state.repoRoot`），`<id>` 指 mission id；mission 的分支为 `tower/<id 小写>`，worktree 为 `<repo>/.dsh-tower/worktrees/<id 小写>`。
 - tower 归属跟随仓库而非 Session 血统：同一仓库的 tower 同一时刻只有一个 owner（一次调用在途，或它启动的 worker/reviewer 仍在运行）。第二个 Session 会被 `WORKSPACE_BUSY` 拒绝。
 - `status` 返回的 `events` 是 `state.events` 的最后 20 条（state 内上限 200 条，事件类型见附录 B），是排障的第一手时间线。
-- 每个 worker/reviewer 落定都会向控制器 Session 送达一条结算通知（保证送达，见 §2.10）——「静默失败」不是需要排查的场景。
+- 每个 worker/reviewer 落定都会生成一条结算通知并尝试投递到控制器 Session（尽力而为，边界见 §2.10）。投递可能失败且只记 error 日志，所以「没收到通知」本身就是要排查的场景——用 `tower action=status` 与 error 日志兜底。
 
 ## 1. 状态机速览
 
@@ -176,9 +176,9 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 - `recover`：处置跨重启的僵尸 running 记录，语义见 3.8。
 - `models`：查询 provider 目录/精确路由元数据，不做任何仓库操作。
 
-### 2.10 运行期通知（保证送达 + 僵尸提示）
+### 2.10 运行期通知（落定即尝试投递 + 僵尸提示）
 
-- **结算通知保证送达**（[lib/runtime.js](../lib/runtime.js) `track`/`settlementNotice`）：每个 worker/reviewer 落定都会向控制器 Session 递一条形如 `Tower <role> for <mission> <outcome>: mission status <status>` 的通知；`failed`/`interrupted`/`stale` 结局附带截断到 500 字符的 `reason` 与 next action（如 `review_failed` → `spawn a fresh reviewer when ready`）。即使 state 落账或投影发布失败，通知仍会送达（最差退化为点名 role/mission/run/error 并提示 `tower action=status`）；投递本身失败则记 error 日志，绝不静默。
+- **结算通知：落定即生成并尝试投递**（[lib/runtime.js](../lib/runtime.js) `track`/`settlementNotice`）：每个 worker/reviewer 落定都会生成一条形如 `Tower <role> for <mission> <outcome>: mission status <status>` 的通知并尝试 steer 给控制器 Session；`failed`/`interrupted`/`stale` 结局附带截断到 500 字符的 `reason` 与 next action（如 `review_failed` → `spawn a fresh reviewer when ready`）。即使 state 落账或投影发布失败，这次投递尝试也仍会进行（最差退化为点名 role/mission/run/error 并提示 `tower action=status`）。但投递本身也可能失败：此时仅记 error 日志，没有持久重试队列——通知是落定路径上的告知机制，不是消息队列；未收到通知属于需要排查的场景，用 `status` 与 error 日志兜底。
 - **`agent/created` 僵尸提示**：Host 重启后，任何新 agent 创建时，runtime 会按其当前工作目录解析仓库，读取 tower state，把该 Session 名下仍标记 `worker_running`/`review_running`、但本运行时不再拥有的激活列成一条通知（每个 run 一次，不重复打扰），建议执行 `tower action=recover`。提示只发给记录中的控制器 Session；探测失败只记警告，不影响 agent 创建。
 
 ## 3. 故障场景 Runbook
@@ -253,7 +253,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 
 ### 3.7 `worker_failed` / `review_failed` 重试
 
-- 症状：worker 落定后 mission → `worker_failed`：进程异常（`stopReason ≠ completed`，`worker.error` 有诊断）、脏收尾（`error:"worker finished with uncommitted or untracked files; ..."`，附 `dirtyEntries`）或 `spawn` 本身失败（`failSpawn`）。reviewer 落定后 mission → `review_failed`：进程错误、被中断、未返回结构化结论（`error:"reviewer did not return a structured verdict"` 或 diagnostic）或 spawn 失败；事件均为 `spawn-failed`。两者的结算通知都保证送达（§2.10）。
+- 症状：worker 落定后 mission → `worker_failed`：进程异常（`stopReason ≠ completed`，`worker.error` 有诊断）、脏收尾（`error:"worker finished with uncommitted or untracked files; ..."`，附 `dirtyEntries`）或 `spawn` 本身失败（`failSpawn`）。reviewer 落定后 mission → `review_failed`：进程错误、被中断、未返回结构化结论（`error:"reviewer did not return a structured verdict"` 或 diagnostic）或 spawn 失败；事件均为 `spawn-failed`。两者的结算通知都会生成并尝试投递（§2.10），未收到时直接用 `status` 诊断。
 - 诊断：先用 `summary` 定位失败 mission，再用 `tower({action:"status", mission_id:"<id>"})` 读取完整 `worker`/`review` 记录里的 `stopReason`、`error`、`dirtyEntries`（精简 summary 不含全部诊断字段）。需要更多上下文时查看该 run 对应的子代理会话；需要继续修复则按下方步骤 `spawn` 新 run，不向已落定失败的 run 发 `send`。
   - `send` / `interrupt` **只对当前活跃 run 有效**：mission 必须处于相应的 `worker_running` / `review_running`，且附带的 childId/runId 与本 runtime 活跃记录的 mission/role 地址一致；缺失或不匹配会抛 `AGENT_NOT_RUNNING`。保留着旧会话或 childId 不代表仍可递话，已经落定的失败 run 不能靠 `send` 续跑。中断原因的辨别（限流 / 父会话取消 / 其它错误）与无损续跑见 §3.15。
 - 安全处理（两个状态都在各自的重启集合里，直接重派）：
@@ -459,7 +459,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
      ⑤ 已合并过的 mission 收编后 abandon；依赖关系按原 depends_on 重挂，再逐个推进
      ```
 
-     **代价**：历史 mission 记录（审查结论、事件时间线、revision/时间戳、元数据原值）永久丢失，重新登记的 mission 从 `pending` 起步。若 state 损坏时仍有 worker/reviewer 在跑（`status` 已不可用，§2.10 的结算通知也不会再送达），先在进程/会话层面确认并停止它们再动手——重建后它们写的任何 state 都会被新账本覆盖语义。执行前与仓库 owner 确认（3.11）。
+     **代价**：历史 mission 记录（审查结论、事件时间线、revision/时间戳、元数据原值）永久丢失，重新登记的 mission 从 `pending` 起步。若 state 损坏时仍有 worker/reviewer 在跑（`status` 已不可用，§2.10 的结算通知也不会再生成投递），先在进程/会话层面确认并停止它们再动手——重建后它们写的任何 state 都会被新账本覆盖语义。执行前与仓库 owner 确认（3.11）。
 
 - 清理（残留 worktree / 分支）：
   - **前提：没有运行中的 activation**。state 可用时以 `tower({action:"status"})` 确认没有任何 mission 处于 `worker_running`/`review_running`；若有且属于已停止的旧控制器，先 `tower({action:"recover"})` 标记中断（3.8，前提是旧 Host 确已停止）。worker 仍在使用的 worktree 绝不清理。
@@ -468,7 +468,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 
 ### 3.15 子代理中断的辨别与续跑
 
-worker/reviewer 中断在 mission 侧都长一个样——落定成 `worker_failed`/`review_failed`，或跨重启悬置在 running（3.8）——但「为什么断」决定下一步完全不同：限流要换路由或等窗口，父会话取消可能只差一个 commit，其它错误要先定位根因。结算通知（§2.10）保证送达但 `reason` 截断到 500 字符，辨别要靠 `status` 的 role 记录加子会话日志的 `turn/end`。
+worker/reviewer 中断在 mission 侧都长一个样——落定成 `worker_failed`/`review_failed`，或跨重启悬置在 running（3.8）——但「为什么断」决定下一步完全不同：限流要换路由或等窗口，父会话取消可能只差一个 commit，其它错误要先定位根因。结算通知（§2.10）落定即生成并尝试投递，但投递可能失败（仅记 error 日志、无持久重试）且 `reason` 截断到 500 字符，辨别一律要靠 `status` 的 role 记录加子会话日志的 `turn/end`。
 
 - 症状：`status`（§2.4）里 role 记录的 `stopReason` 为 `error`（`error` 文本各异：`429: {...}`、进程异常……）或 `aborted`（`error` 形如 `worker ended with aborted`，或 `recover` 标记的 `activation is not owned by this runtime; ...`）；也可能 mission 悬置在 `worker_running`/`review_running` 无人落定（3.8 的场景）。
 - 诊断（辨别表：症状 → 判定 → 证据位置）：
@@ -490,7 +490,7 @@ worker/reviewer 中断在 mission 侧都长一个样——落定成 `worker_fail
 
   | 判定 | 处置 |
   |---|---|
-  | 供应商限流 | 换路由或等窗口：`tower({action:"spawn", mission_id:"<id>", role:"worker", provider:"...", model:"..."})` 重派（可用路由先用 `models` 查，§2.3），或等限流窗口重置。窗口重置时间看两处：子会话 `turn/end` 里完整的 429 响应体（常带重试/窗口提示），以及供应商控制台或用量页。不换路由、不到点就重试，只会再吃一次同样的 429（3.7 的环境性失败） |
+  | 供应商限流 | 换路由或等窗口：`tower({action:"spawn", mission_id:"<id>", role:"worker", provider:"...", model:"..."})` 重派（可用路由先用 `models` 查，§2.9），或等限流窗口重置。窗口重置时间看两处：子会话 `turn/end` 里完整的 429 响应体（常带重试/窗口提示），以及供应商控制台或用量页。不换路由、不到点就重试，只会再吃一次同样的 429（3.7 的环境性失败） |
   | 父会话取消 | **先查 worktree 再决定续跑或重做**（全部只读）：`git -C <worktree> status --porcelain` 看有无未提交/未跟踪文件、`git -C <worktree> log --oneline -3` 看有无已完成的新提交、`git -C <worktree> diff` 看改动内容。有成果（哪怕未提交）→ 续跑：重派 worker，instructions 里点名「worktree 已有上轮成果，先核对并提交/收尾」；一无所有 → 直接重做。mission 还悬置在 running 的先按 3.8 `recover`（前提：旧控制器确已停止） |
   | 其它错误 | 按上面的命令看子会话日志定位根因（`turn/end` 的 `error` 与其前后文）：环境性的（路由不可用 `MODEL_ROUTE_*`、网络等）先修环境再重派；任务性的按 3.7 重派，并把诊断写进新 run 的 instructions |
 
