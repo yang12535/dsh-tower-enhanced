@@ -205,10 +205,21 @@ test('a simultaneous dry run never writes or leaves a half-written release', asy
     assert.equal(dryPayload.currentVersion, '0.2.0');
     assert.equal(dryPayload.nextVersion, VERSION);
   } else {
-    // The scheduler may let apply finish before dry-run reads package.json.
-    // In that ordering VERSION_NOT_GREATER is the dry run's only valid failure.
+    // Two interleavings are valid for this race. computePlan in
+    // scripts/release.mjs reads package.json and performs the
+    // VERSION_NOT_GREATER check before it reads CHANGELOG.md. If apply has
+    // already bumped package.json when the dry run reads it, the dry run fails
+    // early with VERSION_NOT_GREATER. If the dry run instead reads the old
+    // package.json (comparison passes) but apply finishes writing both files
+    // before the dry run reads CHANGELOG.md, the dry run finds the newly
+    // promoted version section and fails with VERSION_ALREADY_RELEASED. Both
+    // are legitimate outcomes of the package.json -> CHANGELOG.md read order;
+    // every other failure code is still a bug.
     const dryError = parseError(dry);
-    assert.equal(dryError.code, 'VERSION_NOT_GREATER');
+    assert.ok(
+      dryError.code === 'VERSION_NOT_GREATER' || dryError.code === 'VERSION_ALREADY_RELEASED',
+      `the dry-run loser must report VERSION_NOT_GREATER or VERSION_ALREADY_RELEASED; actual=${dryError.code}`,
+    );
   }
 
   // Only the apply process may write, regardless of the dry run's scheduling outcome.
