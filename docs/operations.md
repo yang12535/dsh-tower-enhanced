@@ -459,7 +459,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
      ⑤ 已合并过的 mission 收编后 abandon；依赖关系按原 depends_on 重挂，再逐个推进
      ```
 
-     **代价**：历史 mission 记录（审查结论、事件时间线、revision/时间戳、元数据原值）永久丢失，重新登记的 mission 从 `pending` 起步。若 state 损坏时仍有 worker/reviewer 在跑（`status` 已不可用，§2.10 的结算通知也不会再生成投递），先在进程/会话层面确认并停止它们再动手——重建后它们写的任何 state 都会被新账本覆盖语义。执行前与仓库 owner 确认（3.11）。
+     **代价**：历史 mission 记录（审查结论、事件时间线、revision/时间戳、元数据原值）永久丢失，重新登记的 mission 从 `pending` 起步。若 state 损坏时仍有 worker/reviewer 在跑（`status` 已不可用；§2.10 的结算通知仍会在落定时生成并尝试投递，但最差只退化为点名 role/mission/run/error 的兜底通知，不能据此确认状态已落账），先在进程/会话层面确认并停止它们再动手——重建后它们写的任何 state 都会被新账本覆盖语义。执行前与仓库 owner 确认（3.11）。
 
 - 清理（残留 worktree / 分支）：
   - **前提：没有运行中的 activation**。state 可用时以 `tower({action:"status"})` 确认没有任何 mission 处于 `worker_running`/`review_running`；若有且属于已停止的旧控制器，先 `tower({action:"recover"})` 标记中断（3.8，前提是旧 Host 确已停止）。worker 仍在使用的 worktree 绝不清理。

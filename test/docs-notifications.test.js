@@ -148,3 +148,51 @@ test('operations §3.15 routes the models lookup to §2.9 (where models lives), 
   assert.ok(section29, '§2.9 section not found in operations.md');
   assert.match(section29[0], /`models`：/, '§2.9 must document the `models` action for the cross-reference to be meaningful');
 });
+
+test('operations §3.14 corrupt-state runbook keeps the fallback attempt, not silence', () => {
+  const ops = loadDoc('docs/operations.md');
+  const section = ops.match(/### 3\.14[^\n]*\n[\s\S]*?(?=\n### |\n## )/);
+  assert.ok(section, '§3.14 state-recovery runbook not found in operations.md');
+  const body = section[0];
+
+  // Reverse assertion: losing `status` must not be described as losing the
+  // notice too. lib/runtime.js `track` still runs completeSpawn -> failSpawn
+  // -> publish -> settlementNotice -> parent.steer after a state failure, and
+  // test/runtime.test.js "an unrecordable run still notifies with role,
+  // mission, run, and error" pins exactly one fallback notice when BOTH
+  // completeSpawn and failSpawn reject. Claiming corrupt state suppresses
+  // generation/delivery is the same false reliability boundary, inverted.
+  const SILENCE_CLAIMS = [
+    /结算通知也[^。\n]*(不会|不再)[^。\n]*(生成|投递)/,
+    /不会再生成投递/,
+    /不再生成通知/,
+    /通知(也)?不会(再)?(生成|投递)/,
+    /结算通知[^。\n]*(停止|失败)[^。\n]*(生成|投递)/,
+  ];
+  for (const pattern of SILENCE_CLAIMS) {
+    assert.ok(
+      !pattern.test(body),
+      `§3.14 claims corrupt state silences settlement notices (${pattern}); ` +
+        'runtime still builds the fallback notice and attempts parent.steer after state failures',
+    );
+  }
+
+  // Forward assertion: the runbook must state the accurate boundary instead —
+  // status view gone, notice degraded to a fallback attempt that cannot
+  // confirm what was recorded.
+  assert.match(body, /`?status`?[^\n。]*不可用/, '§3.14 must say the status view is unavailable when state is corrupt');
+  assert.match(body, /兜底/, '§3.14 must say the notice degrades to a fallback attempt instead of disappearing');
+  assert.match(body, /role\/mission\/run\/error/, '§3.14 must name the fallback notice fields');
+  assert.match(body, /不能据此确认/, '§3.14 must warn that a fallback notice cannot confirm the state was recorded');
+  assert.match(body, /§2\.10/, '§3.14 must cross-reference §2.10 for the notification boundary');
+
+  // Ground the fallback vocabulary in §2.10 itself, so §3.14 cannot invent a
+  // contract the notification section does not state.
+  const section210 = ops.match(/### 2\.10[^\n]*\n[\s\S]*?(?=\n### |\n## )/);
+  assert.ok(section210, '§2.10 notification section not found in operations.md');
+  assert.match(
+    section210[0],
+    /最差退化为点名 role\/mission\/run\/error/,
+    '§2.10 must describe the same fallback notice that §3.14 refers to',
+  );
+});
