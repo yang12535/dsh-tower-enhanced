@@ -328,15 +328,32 @@ test('doctor finding-code whitelist matches the implementation inventory', () =>
   );
 });
 
-test('docs state the real tower-doctor finding-code count', () => {
-  const implemented = doctorFindingCodes();
-  const expected = implemented.size;
+/**
+ * Collect every finding-code count-claim problem, diffed against the real
+ * inventory size. Dependency-injected on purpose — `readDoc(rel)` returns the
+ * document's content, or `null` when it does not exist — so the regression
+ * tests below drive this exact helper with in-memory fixtures instead of a
+ * parallel copy of the logic that would merely vouch for itself.
+ * docs/architecture.md owns the count claim: it must exist (a missing file
+ * used to `continue` the loop, letting the whole guard pass vacuously) and it
+ * must state the number explicitly. docs/operations.md stays an optional scan
+ * target: it never carries the claim, so only a mismatching claim, should one
+ * ever appear there, is reported.
+ */
+function findingCodeCountProblems(expected, readDoc) {
   const problems = [];
-
   for (const rel of ['docs/architecture.md', 'docs/operations.md']) {
-    const abs = path.join(root, rel);
-    if (!existsSync(abs)) continue; // 存在才扫
-    const claims = findingCodeCountClaims(readFileSync(abs, 'utf8'));
+    const source = readDoc(rel);
+    if (source === null) {
+      if (rel === 'docs/architecture.md') {
+        problems.push(
+          `docs/architecture.md is missing; the finding-code count guard cannot run — restore it, `
+            + `§8.1 must explicitly state the real count「${expected} 个 finding code」`,
+        );
+      }
+      continue; // docs/operations.md is an optional scan target
+    }
+    const claims = findingCodeCountClaims(source);
     for (const claim of claims) {
       if (claim.count !== expected) {
         problems.push(`${rel}:${claim.line} claims ${claim.count} finding codes but the doctor emits ${expected}`);
@@ -352,10 +369,52 @@ test('docs state the real tower-doctor finding-code count', () => {
       }
     }
   }
+  return problems;
+}
 
+test('docs state the real tower-doctor finding-code count', () => {
+  const expected = doctorFindingCodes().size;
+  const problems = findingCodeCountProblems(expected, (rel) => {
+    const abs = path.join(root, rel);
+    return existsSync(abs) ? readFileSync(abs, 'utf8') : null;
+  });
   assert.ok(
     problems.length === 0,
     `doctor finding-code count drift (implementation: ${expected} codes in scripts/tower-doctor.mjs)\n  - `
       + problems.join('\n  - '),
   );
+});
+
+// Regression fixtures (M78): pin down every mode of the count guard by feeding
+// the SAME findingCodeCountProblems() helper in-memory documents. A missing
+// docs/architecture.md must fail closed; a present-but-silent or mismatching
+// file must fail; the correct count (with docs/operations.md absent, as it is
+// merely an optional scan target) must pass.
+test('finding-code count guard fails closed when docs/architecture.md is missing', () => {
+  const problems = findingCodeCountProblems(12, (rel) => (rel === 'docs/architecture.md' ? null : '# 运维\n'));
+  assert.equal(problems.length, 1, `expected exactly the missing-file problem, got: [${problems.join(' | ')}]`);
+  assert.match(problems[0], /docs\/architecture\.md is missing/);
+});
+
+test('finding-code count guard fails when architecture exists but states no count', () => {
+  const problems = findingCodeCountProblems(12, (rel) =>
+    (rel === 'docs/architecture.md' ? '# 架构\n\n§8.1 只字未提数量。\n' : null));
+  assert.equal(problems.length, 1, `expected exactly the no-claim problem, got: [${problems.join(' | ')}]`);
+  assert.match(problems[0], /no longer states a「12 个 finding code」count claim/);
+});
+
+test('finding-code count guard fails on a mismatching count in any scanned doc', () => {
+  const problems = findingCodeCountProblems(12, (rel) =>
+    (rel === 'docs/architecture.md'
+      ? '§8.1 doctor 当前共有 11 个 finding code，覆盖状态与孤立项检查。\n'
+      : '故障排查参考共 11 个 finding code。\n'));
+  assert.equal(problems.length, 2, `expected one problem per scanned doc, got: [${problems.join(' | ')}]`);
+  assert.match(problems[0], /docs\/architecture\.md:1 claims 11 finding codes but the doctor emits 12/);
+  assert.match(problems[1], /docs\/operations\.md:1 claims 11 finding codes but the doctor emits 12/);
+});
+
+test('finding-code count guard passes on the correct count with operations absent', () => {
+  const problems = findingCodeCountProblems(12, (rel) =>
+    (rel === 'docs/architecture.md' ? '§8.1 doctor 当前共有 12 个 finding code，覆盖状态与孤立项检查。\n' : null));
+  assert.deepEqual(problems, []);
 });
