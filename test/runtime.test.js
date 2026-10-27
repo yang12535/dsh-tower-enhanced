@@ -897,6 +897,299 @@ test('a refused call finishes without touching repository state', async (t) => {
   assert.deepEqual(state.missions.map((mission) => mission.id), []);
 });
 
+/** Promise that the test settles explicitly. */
+function deferred() {
+  let resolve;
+  const promise = new Promise((settled) => { resolve = settled; });
+  return { promise, resolve };
+}
+
+/**
+ * Real-core startup harness: the runtime's first startActivation call parks
+ * until the test releases it, mirroring a slow host spawn, and later settles
+ * only when the test (or disposal) decides. `failStart` makes the first
+ * startActivation reject; `park: false` returns the first activation without
+ * parking; `core` seeds a core (possibly wrapped) into `runtime.cores` so
+ * `coreAt` reuses it instead of opening a fresh instance.
+ */
+function startupHarness(repo, options = {}) {
+  const starting = deferred();
+  const release = deferred();
+  const lifecycle = { disposes: 0, settle: undefined };
+  let nextId = 0;
+  const runtime = new TowerRuntime({
+    workingDirectory: { async ensure() { return repo; } },
+    sessions: { async flush() {} },
+    llm: { async resolveCallConfig(config) { return config; } },
+    subagents: {
+      async startActivation() {
+        const index = ++nextId;
+        if (index === 1 && options.failStart === true) {
+          starting.resolve();
+          throw new Error('host refused the activation');
+        }
+        const outcome = deferred();
+        const activation = {
+          childId: `fixture-child-${index}`,
+          result: outcome.promise,
+          async dispose() { lifecycle.disposes += 1; outcome.resolve({ stopReason: 'aborted', output: [] }); },
+        };
+        if (index === 1) {
+          lifecycle.settle = outcome.resolve;
+          starting.resolve();
+          if (options.park !== false) await release.promise;
+        }
+        return activation;
+      },
+    },
+    logger: { warn() {}, error() {} },
+  }, {});
+  if (options.core !== undefined) runtime.cores.set(repo, options.core);
+  // These regressions exercise ownership and run registration, not projection
+  // persistence.
+  runtime.publish = async () => {};
+  const run = (agent, args) => runtime.execute(args, { agent, signal: new AbortController().signal });
+  const controller = (id) => ({ options: { provider: 'fixture-provider', model: 'fixture-model' }, session: { id, header: {}, requestHeader() {} }, steer() {} });
+  return { runtime, run, controller, starting, release, lifecycle };
+}
+
+test('a concurrent short call must not release its Session sibling startup claim', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'First', description: 'Starting in controller A.' });
+  await core.addMission({ id: 'M2', title: 'Second', description: 'Must not start in controller B concurrently.' });
+  const { runtime, run, controller, starting, release } = startupHarness(repo);
+  const a = controller('controller-A');
+  const first = run(a, { action: 'spawn', mission_id: 'M1', role: 'worker' });
+  try {
+    await starting.promise;
+    // A read-only call from the same Session finishes while the spawn call is
+    // still parked in startActivation; its finally must release only its own
+    // claim, never the sibling spawn call's.
+    await run(a, { action: 'summary' });
+    const ownerAfterSummary = runtime.workspaceOwner(repo);
+    let foreignAccepted = false;
+    try { await run(controller('controller-B'), { action: 'spawn', mission_id: 'M2', role: 'worker' }); foreignAccepted = true; }
+    catch (error) { assert.equal(error.code, 'WORKSPACE_BUSY'); }
+    release.resolve();
+    await first;
+    const activeControllers = [...new Set([...runtime.active.values()].map((entry) => entry.parent.session.id))];
+    assert.deepEqual({ ownerAfterSummary, foreignAccepted, activeControllers }, { ownerAfterSummary: 'controller-A', foreignAccepted: false, activeControllers: ['controller-A'] });
+  } finally {
+    release.resolve();
+    await first.catch(() => {});
+    await runtime.dispose();
+  }
+});
+
+test('concurrent short calls from one Session do not release each other', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Read', description: 'A slow read holds the claim.' });
+  // Park the first summary inside the core: by the time the core method runs,
+  // the call has already claimed the workspace, so the parked window proves
+  // claim stacking without any spawn in flight.
+  const summaryEntered = deferred();
+  const finishSummary = deferred();
+  const realSummary = core.summary.bind(core);
+  core.summary = (...args) => {
+    summaryEntered.resolve();
+    return finishSummary.promise.then(() => realSummary(...args));
+  };
+  const { runtime, run, controller } = startupHarness(repo, { core });
+  const a = controller('controller-A');
+  const slow = run(a, { action: 'summary' });
+  try {
+    await summaryEntered.promise;
+    await run(a, { action: 'status' });
+    // The sibling short call returned; its finally must release only its own
+    // claim, so a foreign Session is still refused and the owner is unchanged.
+    await assert.rejects(
+      run(controller('controller-B'), { action: 'status' }),
+      (error) => error.code === 'WORKSPACE_BUSY',
+    );
+    assert.equal(runtime.workspaceOwner(repo), 'controller-A');
+    finishSummary.resolve();
+    await slow;
+    assert.equal(runtime.workspaceOwner(repo), undefined, 'the last call releases the workspace');
+    assert.equal(runtime.inFlight.has(repo), false);
+  } finally {
+    finishSummary.resolve();
+    await slow.catch(() => {});
+    await runtime.dispose();
+  }
+});
+
+test('recover must not classify this runtime pending startup as a stale run', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Starting', description: 'The host has not yet returned the activation handle.' });
+  const { runtime, run, controller, starting, release } = startupHarness(repo);
+  const a = controller('controller-A');
+  const first = run(a, { action: 'spawn', mission_id: 'M1', role: 'worker' });
+  try {
+    await starting.promise;
+    const recovered = await run(a, { action: 'recover' });
+    release.resolve();
+    await first;
+    const mission = await core.mission('M1');
+    assert.deepEqual(
+      { recovered: recovered.recovered.map((item) => item.mission), status: mission.status, tracked: runtime.active.size },
+      { recovered: [], status: 'worker_running', tracked: 1 },
+    );
+  } finally {
+    release.resolve();
+    await first.catch(() => {});
+    await runtime.dispose();
+  }
+});
+
+test('recover still reaps persisted orphans while a starting run is exempt', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Starting', description: 'Owned by this runtime.' });
+  await core.addMission({ id: 'M2', title: 'Orphan', description: 'Persisted running by a departed controller.' });
+  await core.beginSpawn({ missionId: 'M2', role: 'worker', controllerSessionId: 'gone-controller' });
+  const { runtime, run, controller, starting, release } = startupHarness(repo);
+  const first = run(controller('controller-A'), { action: 'spawn', mission_id: 'M1', role: 'worker' });
+  try {
+    await starting.promise;
+    const recovered = await run(controller('controller-A'), { action: 'recover' });
+    assert.deepEqual(recovered.recovered.map((item) => item.mission), ['M2'], 'the starting exemption must not mask genuine orphans');
+    assert.equal((await core.mission('M1')).status, 'worker_running');
+    assert.equal((await core.mission('M2')).status, 'worker_failed');
+    release.resolve();
+    await first;
+    assert.equal((await core.mission('M1')).status, 'worker_running', 'the starting run settles on its own terms');
+  } finally {
+    release.resolve();
+    await first.catch(() => {});
+    await runtime.dispose();
+  }
+});
+
+test('the workspace frees only after the last sibling call and its activation settle', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Busy', description: 'Holds the workspace across sibling calls.' });
+  const { runtime, run, controller, starting, release, lifecycle } = startupHarness(repo);
+  const a = controller('controller-A');
+  const first = run(a, { action: 'spawn', mission_id: 'M1', role: 'worker' });
+  try {
+    await starting.promise;
+    await run(a, { action: 'summary' });
+    assert.equal(runtime.workspaceOwner(repo), 'controller-A', 'the spawn call still holds its own claim after the sibling released');
+    await assert.rejects(
+      run(controller('controller-B'), { action: 'status' }),
+      (error) => error.code === 'WORKSPACE_BUSY',
+    );
+    release.resolve();
+    const started = await first;
+    // The spawn call has returned; the workspace stays owned by the live
+    // activation it started, so a foreign Session is still refused.
+    assert.equal(runtime.workspaceOwner(repo), 'controller-A');
+    await assert.rejects(
+      run(controller('controller-B'), { action: 'status' }),
+      (error) => error.code === 'WORKSPACE_BUSY',
+    );
+    const entry = runtime.active.get(started.runId);
+    lifecycle.settle({ stopReason: 'completed', output: [{ type: 'text', text: 'worker report' }] });
+    await entry.done;
+    assert.equal(runtime.active.size, 0, 'settlement removes the run registration');
+    assert.equal(runtime.workspaceOwner(repo), undefined);
+    assert.equal(runtime.inFlight.has(repo), false);
+    const takeover = await run(controller('controller-B'), { action: 'status' });
+    assert.equal(takeover.baseBranch, 'main');
+  } finally {
+    release.resolve();
+    await first.catch(() => {});
+    await runtime.dispose();
+  }
+});
+
+test('a failed startActivation unregisters the run and frees the workspace', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Start failure', description: 'The host refuses this activation.' });
+  const { runtime, run, controller, lifecycle } = startupHarness(repo, { failStart: true });
+  await assert.rejects(
+    run(controller('controller-A'), { action: 'spawn', mission_id: 'M1', role: 'worker' }),
+    /host refused the activation/,
+  );
+  const mission = await core.mission('M1');
+  assert.equal(mission.status, 'worker_failed');
+  assert.match(mission.worker.error, /host refused the activation/);
+  assert.equal(runtime.active.size, 0, 'no starting registration may survive a failed start');
+  assert.equal(runtime.workspaceOwner(repo), undefined);
+  assert.equal(runtime.inFlight.has(repo), false);
+  assert.equal(lifecycle.disposes, 0, 'no activation existed to dispose');
+  // The freed tower is claimable again and the cleanup leaks no exemption:
+  // recover from another Session finds nothing to do.
+  const recovered = await run(controller('controller-B'), { action: 'recover' });
+  assert.deepEqual(recovered.recovered, []);
+  await runtime.dispose();
+});
+
+test('a failed attachSpawn unregisters the run, disposes the activation, and frees the workspace', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Attach failure', description: 'The activation handle cannot be recorded.' });
+  core.attachSpawn = async () => { throw new Error('attach recording failed'); };
+  const { runtime, run, controller, lifecycle } = startupHarness(repo, { core, park: false });
+  await assert.rejects(
+    run(controller('controller-A'), { action: 'spawn', mission_id: 'M1', role: 'worker' }),
+    /attach recording failed/,
+  );
+  const mission = await core.mission('M1');
+  assert.equal(mission.status, 'worker_failed');
+  assert.match(mission.worker.error, /attach recording failed/);
+  assert.equal(runtime.active.size, 0, 'the starting registration is removed');
+  assert.equal(lifecycle.disposes, 1, 'the started activation is disposed exactly once');
+  assert.equal(runtime.workspaceOwner(repo), undefined);
+  assert.equal(runtime.inFlight.has(repo), false);
+  await runtime.dispose();
+  assert.equal(lifecycle.disposes, 1, 'dispose must not double-dispose the rolled-back activation');
+});
+
+test('recover must not reap a run whose rollback is still recording its failure', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Rollback race', description: 'A concurrent recover must not reap the run this runtime is rolling back.' });
+  core.attachSpawn = async () => { throw new Error('attach recording failed'); };
+  // Park the rollback inside failSpawn before it commits: persisted state is
+  // still worker_running while the runtime owns the rollback, which is exactly
+  // the window a sibling recover call from the same Session can hit.
+  const realFailSpawn = core.failSpawn.bind(core);
+  const failEntered = deferred();
+  const finishFail = deferred();
+  core.failSpawn = (...args) => {
+    failEntered.resolve();
+    return finishFail.promise.then(() => realFailSpawn(...args));
+  };
+  const { runtime, run, controller } = startupHarness(repo, { core, park: false });
+  const a = controller('controller-A');
+  const spawnCall = run(a, { action: 'spawn', mission_id: 'M1', role: 'worker' });
+  try {
+    await failEntered.promise;
+    const recovered = await run(a, { action: 'recover' });
+    assert.deepEqual(recovered.recovered, [], 'a run this runtime is rolling back is not a zombie');
+    assert.equal((await core.mission('M1')).status, 'worker_running', 'recover must not settle the run out from under the rollback');
+    finishFail.resolve();
+    await assert.rejects(spawnCall, /attach recording failed/);
+    const mission = await core.mission('M1');
+    assert.equal(mission.status, 'worker_failed');
+    assert.match(mission.worker.error, /attach recording failed/, 'the rollback records its own failure, not a recovery');
+    assert.equal(runtime.active.size, 0, 'the exemption lifts once the failure is recorded');
+    // The rollback settled the run itself, so no orphan survives for a later
+    // recover from any Session to find.
+    assert.deepEqual((await run(controller('controller-B'), { action: 'recover' })).recovered, []);
+  } finally {
+    finishFail.resolve();
+    await spawnCall.catch(() => {});
+    await runtime.dispose();
+  }
+});
+
 /**
  * Minimal core double for the edit dispatch path: seeded into
  * `runtime.cores` so `coreAt` reuses it instead of constructing a real
