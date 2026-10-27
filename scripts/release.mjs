@@ -10,7 +10,7 @@
 // commits, tags, pushes, or touches the network.
 
 import { spawnSync } from 'node:child_process';
-import { closeSync, linkSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, linkSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -264,7 +264,31 @@ export function atomicWrite(filePath, content) {
   }
 }
 
+function validatePlan(plan) {
+  for (const file of plan.files) {
+    let unchanged = false;
+    try {
+      if (file.action === 'create') {
+        try {
+          lstatSync(file.absolute);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          unchanged = true;
+        }
+      } else {
+        unchanged = readFileSync(file.absolute).equals(Buffer.from(file.before, 'utf8'));
+      }
+    } catch (error) {
+      throw new ReleaseError('RELEASE_PLAN_STALE', `cannot verify ${file.path} against the release plan: ${error.message}; no files were written. Inspect the files and compute a new plan before retrying.`, { cause: error });
+    }
+    if (!unchanged) {
+      throw new ReleaseError('RELEASE_PLAN_STALE', `${file.path} changed since the release plan was computed; no files were written. Inspect the files and compute a new plan before retrying.`);
+    }
+  }
+}
+
 export function applyPlan(plan) {
+  validatePlan(plan);
   const written = [];
   try {
     for (const file of plan.files) {
@@ -294,8 +318,6 @@ export function applyPlan(plan) {
 // Cross-process apply lock
 // ---------------------------------------------------------------------------
 
-const RELEASE_LOCK_MAX_AGE_MS = 10 * 60 * 1000;
-
 function resolveGitDirectory(repo) {
   const result = spawnSync('git', ['-C', repo, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf8' });
   if (result.error) {
@@ -320,18 +342,19 @@ function lockToken(raw) {
   }
 }
 
-function lockedError(lockPath, raw, modifiedAt) {
+function lockedError(lockPath, raw, modifiedAt, createdAt = modifiedAt) {
   let holder = null;
   try {
     const parsed = JSON.parse(raw);
-    if (Number.isInteger(parsed.pid) && parsed.pid > 0) holder = parsed.pid;
+    if (Number.isInteger(parsed?.pid) && parsed.pid > 0) holder = parsed.pid;
   } catch {
-    // A malformed lock is still respected until it is old enough to be stale.
+    // Malformed locks require manual inspection, regardless of age.
   }
   const owner = holder === null ? 'an unknown pid' : `pid ${holder}`;
+  const age = Math.max(0, Math.floor(Date.now() - createdAt));
   return new ReleaseError(
     'RELEASE_LOCKED',
-    `RELEASE_LOCKED: another release apply or stale-lock recovery is in progress (${owner}); lock: ${lockPath} (modified ${new Date(modifiedAt).toISOString()}). Wait for that process to finish before retrying; never wait or retry automatically. Do not remove a live lock; if the holder is gone and automatic stale-lock takeover did not resolve it, inspect the process and remove this lock manually.`,
+    `RELEASE_LOCKED: another release apply or stale-lock recovery may be in progress (${owner}); lock: ${lockPath} (age ${age} ms; modified ${new Date(modifiedAt).toISOString()}). A slow or long-running holder must not be displaced based on lock age. Automatic takeover requires a confirmed missing pid (ESRCH); unknown liveness is not proof of exit. Wait for that process to finish before retrying; never wait or retry automatically. Do not remove a live lock. Manually verify the process and lock ownership before considering cleanup.`,
   );
 }
 
@@ -365,14 +388,12 @@ function inspectStaleLock(lockPath) {
     try {
       process.kill(pid, 0);
     } catch (error) {
-      // EPERM means the process exists but belongs to another user.
+      // EPERM and other probe failures do not prove the holder has exited.
       processGone = error.code === 'ESRCH';
     }
   }
-  const expired = Date.now() - createdAt >= RELEASE_LOCK_MAX_AGE_MS;
-  if (!processGone && !expired) throw lockedError(lockPath, raw, lockStat.mtimeMs);
-  const reason = processGone ? `holder pid ${pid} no longer exists` : `lock is at least 10 minutes old`;
-  return { raw, notice: `Taking over stale release lock ${lockPath}: ${reason}.` };
+  if (!processGone) throw lockedError(lockPath, raw, lockStat.mtimeMs, createdAt);
+  return { raw, notice: `Taking over stale release lock ${lockPath}: holder pid ${pid} no longer exists.` };
 }
 
 function createLock(lockPath) {
@@ -778,13 +799,17 @@ Options:
 
 Safety:
   - Dry run never writes any file or acquires the apply lock.
-  - --apply is serialized with <git-dir>/release-apply.lock; a live concurrent
-    apply fails with RELEASE_LOCKED instead of waiting, while stale locks are
-    taken over when their holder is gone or they are at least 10 minutes old.
+  - --apply is serialized with <git-dir>/release-apply.lock. Automatic takeover
+    requires the holder pid to be confirmed gone (ESRCH). Live or unknown
+    holders fail with RELEASE_LOCKED, regardless of lock age; inspect unknown
+    holders manually. The same rule protects the stale-lock recovery lock.
   - --apply refuses a dirty work tree (git status --porcelain must be empty).
-  - Every validation runs before the first file is written; files are written
-    atomically (temporary file + rename) and the first file is rolled back
-    best effort if writing the second one fails.
+  - Before any write, all targets are checked against the plan's original
+    contents (new files must still be absent). A mismatch or unreadable target
+    fails with RELEASE_PLAN_STALE without writing any files.
+  - Files are written atomically (temporary file + rename) and the first file
+    is rolled back best effort if writing the second one fails. This is not
+    a multi-file transaction and cannot serialize non-cooperating writers.
 
 Exit codes: 0 on success (including dry run), 1 on any validation or write error.`;
 

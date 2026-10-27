@@ -230,33 +230,62 @@ test('apply refuses a dirty work tree and leaves every file unchanged', (t) => {
   assert.equal(dry.status, 0, dry.stderr);
 });
 
-test('a failure writing the second file rolls the first one back', (t) => {
+test('a target replaced by a directory is rejected before the first write', (t) => {
   const repo = makeRepo(t, { commit: false });
   const packageBefore = readFileSync(packagePath(repo));
-  // Compute the plan while the repository is still valid, then sabotage the
-  // CHANGELOG target so the second atomic write (temp file + rename) fails
-  // with EISDIR after package.json has already been rewritten. The CLI always
-  // re-validates and checks the work tree before writing, so this window can
-  // only be reproduced by driving applyPlan directly.
   const plan = computePlan({ repo, version: '0.3.0', date: '2026-02-03' });
-  assert.deepEqual(
-    plan.files.map((file) => file.path),
-    ['package.json', 'CHANGELOG.md'],
-  );
   rmSync(changelogPath(repo));
-  mkdirSync(changelogPath(repo)); // rename(file, directory) fails on Linux
+  mkdirSync(changelogPath(repo));
   assert.throws(
     () => applyPlan(plan),
     (error) => {
-      assert.equal(error.code, 'WRITE_FAILED');
-      assert.match(error.message, /failed to write CHANGELOG\.md/);
-      assert.match(error.message, /rolled back package\.json/);
+      assert.equal(error.code, 'RELEASE_PLAN_STALE');
+      assert.match(error.message, /CHANGELOG\.md/);
       return true;
     },
   );
-  assert.deepEqual(readFileSync(packagePath(repo)), packageBefore, 'package.json must be restored to its original bytes');
-  assert.deepEqual(tempArtifacts(repo), [], 'the failed temporary file is cleaned up');
-  rmSync(changelogPath(repo), { recursive: true, force: true });
+  assert.deepEqual(readFileSync(packagePath(repo)), packageBefore);
+  assert.deepEqual(tempArtifacts(repo), []);
+});
+
+test('a failure during the second atomic write rolls the first one back and unlocks', (t) => {
+  const repo = makeRepo(t);
+  const packageBefore = readFileSync(packagePath(repo));
+  const changelogBefore = readFileSync(changelogPath(repo));
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    const originalRename = fs.renameSync;
+    const packagePath = ${JSON.stringify(packagePath(repo))};
+    const changelogPath = ${JSON.stringify(changelogPath(repo))};
+    let injected = false;
+    fs.renameSync = (from, to) => {
+      if (to === changelogPath) {
+        assert.equal(JSON.parse(fs.readFileSync(packagePath, 'utf8')).version, '0.3.0');
+        assert.ok(fs.existsSync(from), 'the second temporary file was actually written');
+        injected = true;
+        throw Object.assign(new Error('injected second rename failure'), { code: 'EIO' });
+      }
+      return originalRename(from, to);
+    };
+    syncBuiltinESMExports();
+    const { cliMain } = await import(${JSON.stringify(new URL('../scripts/release.mjs', import.meta.url).href)});
+    process.exitCode = cliMain(['--repo', ${JSON.stringify(repo)}, '--version', '0.3.0', '--apply', '--json']);
+    assert.ok(injected, 'the failure must happen after validation and the first write');
+  `], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.stdout, '');
+  const error = JSON.parse(result.stderr);
+  assert.equal(error.code, 'WRITE_FAILED');
+  assert.match(error.message, /failed to write CHANGELOG\.md/);
+  assert.match(error.message, /rolled back package\.json/);
+  assert.deepEqual(readFileSync(packagePath(repo)), packageBefore);
+  assert.deepEqual(readFileSync(changelogPath(repo)), changelogBefore);
+  assert.deepEqual(tempArtifacts(repo), []);
+  assert.deepEqual(readdirSync(path.join(repo, '.git')).filter((name) => name.startsWith('release-apply')), []);
+  const retried = runCli(['--repo', repo, '--version', '0.3.0', '--apply']);
+  assert.equal(retried.status, 0, retried.stderr);
 });
 
 test('applying the same version twice is rejected', (t) => {
@@ -313,6 +342,10 @@ test('--help documents every option and unknown flags are rejected', () => {
     assert.ok(result.stdout.includes(flag), `--help must document ${flag}`);
   }
   assert.ok(result.stdout.includes('--create-changelog') && result.stdout.includes('Unreleased'), '--create-changelog semantics are explained');
+  assert.match(result.stdout, /ESRCH/);
+  assert.match(result.stdout, /regardless of lock age/);
+  assert.match(result.stdout, /RELEASE_PLAN_STALE/);
+  assert.doesNotMatch(result.stdout, /at least 10 minutes old/);
 
   const unknown = runCli(['--bogus']);
   assert.notEqual(unknown.status, 0);

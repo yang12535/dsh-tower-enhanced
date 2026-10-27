@@ -26,7 +26,7 @@
 | `worker_failed` | worker 异常结束或留下脏 worktree | worker 落定失败 / `failSpawn` / `recover` | `spawn` worker 重试；`abandon` |
 | `review_running` | reviewer 运行中 | `spawn` role=reviewer | `send` / `interrupt`；等待落定 |
 | `review_failed` | reviewer 异常结束（进程错误 / 无结构化结论 / 启动失败 / `recover` 标记） | reviewer 落定失败 / `failSpawn` / `recover` | `spawn` reviewer 重试；`spawn` worker 直接返工；`rebase`（真 no-op 时保持 `review_failed`） |
-| `changes_requested` | 审查要求返工 | reviewer verdict 非 clean 或 merge≠true | `spawn` worker 返工（清空既有 review） |
+| `changes_requested` | 审查要求返工 | reviewer verdict 非 clean 或 merge≠true | `spawn` worker 返工（清空既有 review）；满足 §2.5 前提时 `spawn` role=reviewer 重审；干净 worktree 可 `rebase`（失效/真 no-op 规则见 §2.9） |
 | `approved` | clean 且 merge=true 的审查通过 | reviewer 落定 | `gate` → `merge`；`rebase`；`abandon` |
 | `rebase_blocked` | rebase 冲突，tower 已自动 `rebase --abort` | `rebase` 失败 | `spawn` worker 手工解决冲突；`abandon` |
 | `merge_blocked` | merge 的 git 步骤失败，tower 已尝试 `merge --abort` | `merge` 失败 | 修复后重试 `merge`（gate 对该状态放行）；`rebase`；`abandon` |
@@ -58,9 +58,10 @@ tower({action:"init"})            // 可选 base_branch，默认当前检出分�
 ### 2.2 add（含 scope 设计与校验规则）
 
 ```text
-tower({action:"add", id:"M1", title:"...", description:"...", dependsOn:["M0"], scope:["docs/**"]})
+tower({action:"add", id:"M1", title:"...", description:"...", depends_on:["M0"], scope:["docs/**"]})
 ```
 
+- **依赖输入参数名是 snake_case：`depends_on`。** `M0` 必须已存在。不要把返回字段的 camelCase `dependsOn` 原样传回工具：当前 `add`/`edit` 的运行时分发只读取 `depends_on`，误写 `dependsOn` 会被忽略而不报错；`add` 会得到空依赖，`edit` 则保留旧依赖。调用后核对返回的 `mission.dependsOn`，避免依赖约束被静默省略（schema 见 [lib/index.js](../lib/index.js)，分发见 [lib/runtime.js](../lib/runtime.js)）。
 - 预期输出：`{ mission: { id, title, description, dependsOn, scope, branch, worktree, baseCommit, status:"pending", revision, createdAt, worktreeRemoved:false } }`，并创建分支 `tower/<id>` 与隔离 worktree（`git worktree add -b`）。`id` 省略时自动分配 `M<最大序号+1>`。
 - scope 校验（`add` 与 `edit` 完全一致，见 [lib/core.js](../lib/core.js) `validateScope`）：
   - 非数组（字符串、`null`、其它类型）→ `ARGUMENT_INVALID`（`scope must be an array of glob patterns`）；空字符串模式 → `SCOPE_INVALID`（`scope patterns must be non-empty strings`）。
@@ -69,7 +70,7 @@ tower({action:"add", id:"M1", title:"...", description:"...", dependsOn:["M0"], 
 - scope 设计建议：
   - scope 是仓库相对 glob，空数组 = 完全不限。**建议始终显式给出**——gate 的 `OUT_OF_SCOPE` 检查只在 scope 非空时生效。
   - 粒度以目录/主题为宜（如 `docs/**`、`lib/client.js` + `test/client.test.js` 成对给出）；过宽失去保护，过窄容易把测试、locale 文案等伴生改动误伤成 out-of-scope。
-  - 预期会改同一区域的 mission 用 `dependsOn` 串行化，而不是靠 scope 并行硬撞（并行写同一文件最终会在 rebase/merge 阶段冲突）。
+  - 预期会改同一区域的 mission 用 `depends_on` 串行化，而不是靠 scope 并行硬撞（并行写同一文件最终会在 rebase/merge 阶段冲突）。
 - 失败与 next action：
   - `MISSION_EXISTS` / `MISSION_ID_INVALID`：换 id（id 规则：大写字母开头，仅大写字母/数字/`_`/`-`，≤32 字符）。
   - `DEPENDENCY_INVALID`（重复或不存在）/ `MISSION_NOT_FOUND`（依赖项）：修正 `depends_on` 指向已存在的 mission。
@@ -107,7 +108,10 @@ tower({action:"summary", mission_id:"M1"})     // 概览，条目收窄到单个
 ```
 
 - `status` 预期输出：`{ version, repoRoot, baseBranch, baseCommit, missions[], events }`；`observe:true` 时额外返回 `observations: { checkedOutBranch, baseTip, baseStatus, missions: { "<id>": { tip, status:{clean, entries} } } }`。把「持久化 state」与「git 事实」并排摆出，是所有「状态怀疑滞后/不一致」场景的首选诊断（见 3.5）。mission 内 `worker`/`review` 记录的 `output`、`error`、`dirtyEntries`、`headCommit`、`structured`（审查结论）都在这里读。
-- `summary` 预期输出：`{ version, repoRoot, baseBranch, baseCommit, counts, missions[] }`，其中 `counts` 为**全塔**统计（`missions`/`workerRunning`/`reviewRunning`/`approved`/`merged`/`blocked`/`abandoned`），`missions[]` 为每任务一行（`id`/`title`/`status`/`dependsOn`/精简 `worker`/`review`/`mergeCommit`，不含 description/scope/worktree/历史）。`mission_id` 只收窄条目，不改 counts。纯读：无事件、无 revision 变化，适合日常巡检。
+- `summary` 工具预期输出：`{ summary: { version, repoRoot, baseBranch, baseCommit, counts, routes: [], missions: [] } }`（直接调用 `TowerCore.summary()` 则返回内层对象）。其中 `counts` 为**全塔**统计（`missions`/`workerRunning`/`reviewRunning`/`approved`/`merged`/`blocked`/`abandoned`），`missions[]` 为每任务一行（`id`/`title`/`status`/`dependsOn`/精简 `worker`/`review`/`mergeCommit`，不含 description/scope/worktree/历史）。`mission_id` 只收窄 `missions[]`，不改全塔 `counts` 或 `routes`。纯读：无事件、无 revision 变化，适合日常巡检。
+  - `routes[]` 每项为 `{ provider, model, reasoningEffort, workerCount, reviewerCount, total }`，以 `(provider, model, reasoningEffort)` 三元组分桶；缺失的路由字段为 `null`，不能自行猜测默认模型。每条现存 worker 记录计入 `workerCount`，每条现存 review 记录计入 `reviewerCount`，`total` 为两者之和；**包含 `merged` / `abandoned` mission 的记录**，无记录时为空数组。
+  - 排序：先 `total` 降序，相同再按 `provider` → `model` → `reasoningEffort` 的字典序升序，逐字段 `null` 在字符串之前，排序不依赖 locale。聚合实现见 [lib/core.js](../lib/core.js) 的 `summaryRoutes`。
+  - 这些数字只统计 state **当前保留的角色记录**，不是完整历史运行次数或 token/费用账单；重新派发会替换对应记录，worker 返工还会清空 review，因此不能将 `total` 当作累计调用次数。
 
 ### 2.5 spawn reviewer
 
@@ -250,10 +254,11 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 ### 3.7 `worker_failed` / `review_failed` 重试
 
 - 症状：worker 落定后 mission → `worker_failed`：进程异常（`stopReason ≠ completed`，`worker.error` 有诊断）、脏收尾（`error:"worker finished with uncommitted or untracked files; ..."`，附 `dirtyEntries`）或 `spawn` 本身失败（`failSpawn`）。reviewer 落定后 mission → `review_failed`：进程错误、被中断、未返回结构化结论（`error:"reviewer did not return a structured verdict"` 或 diagnostic）或 spawn 失败；事件均为 `spawn-failed`。两者的结算通知都保证送达（§2.10）。
-- 诊断：`status`（或 `summary` 概览）读对应记录的 `stopReason`、`error`、`dirtyEntries`；需要更多上下文时 `send` 询问仍在线的 agent，或查看其子代理会话。中断原因的辨别（限流 / 父会话取消 / 其它错误）与无损续跑见 3.15。
+- 诊断：先用 `summary` 定位失败 mission，再用 `tower({action:"status", mission_id:"<id>"})` 读取完整 `worker`/`review` 记录里的 `stopReason`、`error`、`dirtyEntries`（精简 summary 不含全部诊断字段）。需要更多上下文时查看该 run 对应的子代理会话；需要继续修复则按下方步骤 `spawn` 新 run，不向已落定失败的 run 发 `send`。
+  - `send` / `interrupt` **只对当前活跃 run 有效**：mission 必须处于相应的 `worker_running` / `review_running`，且附带的 childId/runId 与本 runtime 活跃记录的 mission/role 地址一致；缺失或不匹配会抛 `AGENT_NOT_RUNNING`。保留着旧会话或 childId 不代表仍可递话，已经落定的失败 run 不能靠 `send` 续跑。中断原因的辨别（限流 / 父会话取消 / 其它错误）与无损续跑见 §3.15。
 - 安全处理（两个状态都在各自的重启集合里，直接重派）：
-  - `worker_failed` → `tower({action:"spawn", role:"worker"})`，instructions 里点名要处理的事项（先 commit / 清理 untracked / 修复报错）。重派 worker 会**清空既有 review 记录**（`beginSpawn` 的既定行为），完成后需要完整重审；若上一轮是 `changes_requested` 后的返工失败，worker 任务简报会自动附带上一轮审查反馈。脏 worktree 会保留给新 worker 修复（不自动清理）。
-  - `review_failed` → 二选一：`tower({action:"spawn", role:"reviewer"})` 重试审查（新 run 绑定当前 SHA）；或 `tower({action:"spawn", role:"worker"})` 直接返工（会清空失败记录与既有 review）。merge gate 在拿到 clean 审查前持续报 `NOT_APPROVED`。
+  - `worker_failed` → `tower({action:"spawn", mission_id:"<id>", role:"worker"})`，instructions 里点名要处理的事项（先 commit / 清理 untracked / 修复报错）。重派 worker 会**清空既有 review 记录**（`beginSpawn` 的既定行为），完成后需要完整重审；若上一轮是 `changes_requested` 后的返工失败，worker 任务简报会自动附带上一轮审查反馈。脏 worktree 会保留给新 worker 修复（不自动清理）。
+  - `review_failed` → 二选一：`tower({action:"spawn", mission_id:"<id>", role:"reviewer"})` 重试审查（新 run 绑定当前 SHA）；或 `tower({action:"spawn", mission_id:"<id>", role:"worker"})` 直接返工（会清空失败记录与既有 review）。merge gate 在拿到 clean 审查前持续报 `NOT_APPROVED`。
 - 何时不应重试：同一失败连续复现（说明任务本身有问题，改 mission 或 `abandon`）；worktree 处于 rebase/merge 中间态（先按 3.1/3.2 清理）；或 `error` 显示问题是环境性的（如 `429` 限流、路由不可用 `MODEL_ROUTE_*`）而未先修环境/换路由。
 
 ### 3.8 `recover` 的语义
@@ -349,13 +354,14 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 
 ### 3.13 发布与锁
 
-本地发布脚本是 [scripts/release.mjs](../scripts/release.mjs)：默认 dry-run 只计算并打印 diff，**不写文件也不取锁**；`--apply` 会在真实 gitdir 中取得跨进程锁，再完成校验、脏工作区检查与写入。锁覆盖整个 apply 过程，避免并发进程基于旧状态发布。脚本**从不执行 commit、tag、push，也不访问网络**。
+本地发布脚本是 [scripts/release.mjs](../scripts/release.mjs)：默认 dry-run 只计算并打印 diff，**不写文件也不取锁**；`--apply` 会在真实 gitdir 中取得跨进程锁，再完成计划计算、脏工作区检查、写前快照复核与写入。锁覆盖整个 apply 过程，但只约束遵循同一锁协议的发布进程。脚本**从不执行 commit、tag、push，也不访问网络**。
 
 - 症状：
 
   | 错误码 | 典型原因 | 首要动作 |
   |---|---|---|
-  | `RELEASE_LOCKED` | 另一个 `--apply` 或陈旧锁接管过程持有主锁 / reclaim 锁，或获取期间锁已被其它进程替换 | 不要立即或循环重试；先查锁路径、持有 pid 与锁龄，按下方顺序处理 |
+  | `RELEASE_LOCKED` | 主锁 / reclaim 锁的持有者存活或无法确认已退出，或获取期间锁已被其它进程替换 | 不要立即或循环重试；先查锁路径、持有 pid 与锁龄，锁龄本身不授权接管 |
+  | `RELEASE_PLAN_STALE` | 写前复核发现 package/CHANGELOG 与计划快照不同、文件缺失、create 目标已出现，或无法读取/检查目标 | 本次尚未写入目标文件；保留当前内容，查清变化来源或读取故障，再重新计算计划，不要删锁强行覆盖 |
   | `DIRTY_WORKTREE` | `git status --porcelain` 非空，脚本拒绝 `--apply` | 保留并确认改动归属，提交或 stash 后使工作区干净；不要直接重跑 |
   | `VERSION_NOT_GREATER` | 目标版本不大于 [package.json](../package.json) 当前版本；相等时也属于此错误 | 检查是否已发布/已写入目标版本；选择严格更高的版本前先核对实际状态 |
   | `VERSION_ALREADY_RELEASED` | [CHANGELOG.md](../CHANGELOG.md) 已存在目标版本标题 `## [<version>]` | 核对 package 与 CHANGELOG 是否已经完成本次发布，不要重复提升或删除历史段落来强行重跑 |
@@ -364,10 +370,10 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
   `RELEASE_LOCKED` 的人类可读输出样例（pid、路径与时间随现场变化）：
 
   ```text
-  release: error: RELEASE_LOCKED: another release apply or stale-lock recovery is in progress (pid 12345); lock: /srv/repo/.git/release-apply.lock (modified 2026-10-26T02:00:00.000Z). Wait for that process to finish before retrying; never wait or retry automatically. Do not remove a live lock; if the holder is gone and automatic stale-lock takeover did not resolve it, inspect the process and remove this lock manually.
+  release: error: RELEASE_LOCKED: another release apply or stale-lock recovery may be in progress (pid 12345); lock: /srv/repo/.git/release-apply.lock (age 660000 ms; modified 2026-10-26T02:00:00.000Z). A slow or long-running holder must not be displaced based on lock age. Automatic takeover requires a confirmed missing pid (ESRCH); unknown liveness is not proof of exit. Wait for that process to finish before retrying; never wait or retry automatically. Do not remove a live lock. Manually verify the process and lock ownership before considering cleanup.
   ```
 
-  使用 `--json` 时，同一错误在 stderr 中是 `{ "ok": false, "code": "RELEASE_LOCKED", "message": "..." }` 形态，排障字段以 `message` 为准。
+  使用 `--json` 时，同一错误在 stderr 中是 `{ "ok": false, "code": "RELEASE_LOCKED", "message": "..." }` 形态，排障字段以 `message` 为准。写前发现内容变化时，`RELEASE_PLAN_STALE` 的消息形如 `CHANGELOG.md changed since the release plan was computed; no files were written. Inspect the files and compute a new plan before retrying.`；读取失败则说明无法核验对应文件。
 
 - 诊断（先进入实际发布仓库 `<repo>`，不要用假定的 `.git` 路径代替真实 gitdir；linked worktree 的 gitdir 通常是独立管理目录）：
 
@@ -378,36 +384,31 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
   ls -l -- "$gitdir/release-apply.lock" "$gitdir/release-apply.reclaim.lock"
   cat -- "$gitdir/release-apply.lock" "$gitdir/release-apply.reclaim.lock"
   git status --porcelain                       # 空输出才允许 --apply
+  git diff -- package.json CHANGELOG.md        # 查看当前内容，不回退或覆盖
 
-  # 将 <pid> 换成锁 JSON 或 RELEASE_LOCKED 输出中的持有者 pid
+  # 仅将 <pid> 换成有效的正整数持有者 pid；未知/非法 pid 不执行以下两行
   ps -p <pid> -o pid=,stat=,etime=,args=
   kill -0 <pid>; echo "$?"
-  date -u                                      # 与锁时间 / mtime 对照
+  date -u                                      # 锁龄仅供诊断，不是接管条件
   ```
 
-  主锁为 `<gitdir>/release-apply.lock`，用于串行化整个 apply；`<gitdir>/release-apply.reclaim.lock` 只串行化陈旧锁恢复。锁 JSON 通常含 `pid`、数值 `timestamp`（Unix 毫秒）与 `token`。脚本按锁内有效 `timestamp`（必要时回退到 `acquiredAt`，再回退到文件 mtime）计算锁龄，**达到 10 分钟即视为陈旧**；持有 pid 仅在探测得到 `ESRCH` 时视为不存在。`kill -0` 返回 `0` 表示进程存在；返回非零不能只凭这一点删锁，因为 `EPERM` 表示进程存在但当前用户无权向其发信号，应结合 `ps` 与错误文本确认。格式损坏或未知 pid 的锁也不会被立即视为失效，只能等其达到陈旧阈值。
+  主锁为 `<gitdir>/release-apply.lock`，用于串行化整个 apply；`<gitdir>/release-apply.reclaim.lock` 只串行化陈旧锁恢复。两把锁遵循相同规则：**只有 `process.kill(pid, 0)` 明确报 `ESRCH` 才可自动接管**。锁 JSON 通常含 `pid`、数值 `timestamp`（Unix 毫秒）与 `token`；timestamp / acquiredAt / mtime 用于诊断锁龄，不设置超时接管阈值。活 holder 无论运行多久都不抢占。`kill -0` 返回 `0` 表示进程存在；非零不等于已退出，`EPERM` 表示可能仍存活但无探测权限，其他探测错误也不能证明退出。坏 JSON、缺失/非法 pid 或无法确定存活状态的锁会一直保守拒绝，等待更久不会自动解除。
+
+  `applyPlan` 在首个写入之前检查全部目标：完整 package 与 CHANGELOG 当前字节须匹配原计划快照（不只比较版本），create 目标必须仍不存在，悬空符号链接也算占用。任何不一致或核验失败都返回 `RELEASE_PLAN_STALE`，本次不写目标。`runRelease` 的 `finally` 仍尝试仅释放自身 token 的锁；若锁已换成外来 token 则不删除。直接调用 `applyPlan` 不负责取锁/解锁。快照检查不是跨文件事务，无法阻止非协作写入者在检查后改动文件。
 
 - 安全处理：
-  1. **优先等待，或让持有者正常退出。** 用 `ps` 核对 pid 对应的确实是发布/锁恢复进程。进程仍存活时不要为了方便而删锁，也不要用自动重试循环争抢；长时间运行时先确认它是否仍在写入。
-  2. **让脚本自动接管陈旧锁。** 确认持有 pid 已不存在，或锁已达到 10 分钟阈值后，正常重跑一次 `node scripts/release.mjs --version <semver> --apply`。脚本会通过 reclaim 锁与原子 rename 隔离并核验陈旧锁，再取得新主锁；接管成功时会打印 `Taking over stale release lock ...`。手动删除不是常规恢复步骤。
-  3. **手动删除只是自动接管仍未解决时的最后手段。** 最低前提是已确认目标锁的持有 pid 不存在，或该目标锁已达到 10 分钟阈值；若 pid 仍存活，先按上一步核实并停止不再应继续写入的持有者。只删除已逐一确认陈旧的锁，不要因为主锁陈旧就顺手删除仍存活的 reclaim 锁，反之亦然：
-
-     ```bash
-     cd <repo>
-     gitdir="$(git rev-parse --absolute-git-dir)"
-     rm -f -- "$gitdir/release-apply.lock"          # 仅在主锁已确认陈旧时执行
-     rm -f -- "$gitdir/release-apply.reclaim.lock"  # 仅在 reclaim 锁已确认陈旧时执行
-     node scripts/release.mjs --version <semver> --apply
-     ```
-
-     删除后必须重跑 `--apply` 才会继续发布；dry-run 不会重建锁或写入文件。若删除前锁内容/持有者已变化，停止操作并重新诊断，不要删除新一代锁。
-  4. 成功 apply 后，[package.json](../package.json) 与 [CHANGELOG.md](../CHANGELOG.md) 会有意保持未提交状态。先审查 diff，再由人工 commit/tag；脚本不会替你做这些操作，也不会 push。
+  1. **优先等待，或让持有者正常退出。** 用 `ps` 核对 pid 对应的确实是发布/锁恢复进程；PID 可能被复用，不能只凭数字就终止进程。慢速进程仍存活时不要为了方便而删锁，也不要用自动重试循环争抢。脚本没有 `--force-unlock` 选项。
+  2. **已确认死亡的 holder 优先交给脚本回收。** 核对当前 package、CHANGELOG 与工作区状态，确保仍需发布且工作区干净后，先 dry-run 审查目标版本，再人工执行一次 `--apply`。脚本仅在探测得到 `ESRCH` 后，通过 reclaim 锁与原子 rename 隔离并核验旧锁，再取得新主锁；接管成功时会打印 `Taking over stale release lock ...`。只过了一段时间不是重跑或删锁的理由。
+  3. **人工清理是异常恢复，不是默认路径。** 自动接管无法处理坏 JSON、未知 pid 等情况时，先阻止新的发布/恢复任务启动，确认相关持有者和所有可能写入这些目标的进程都已退出，备份锁内容与受影响文件，再逐一核验真实 gitdir 内的具体锁路径、内容和归属。确认没有活跃持有者后才可单独清理该残留锁；不能凭锁龄判断，也不能把主锁与 reclaim 锁批量删除。仍无法确认进程状态、权限不足或锁内容已变化时停止操作，交由仓库 owner 核验。清理后先检查 diff 和工作区，重新 dry-run；明确仍需发布后才手动 `--apply`，不要把删除与发布串成一条自动命令。
+  4. **计划过期先对账，不复用旧计划。** 遇到 `RELEASE_PLAN_STALE`，保留磁盘上的较新内容，核对 `git diff -- package.json CHANGELOG.md`、当前版本与目标段落。若其他发布已完成就审查其结果；若是无关修改或读取故障，先解决并使工作区干净，再重新运行 dry-run 计算计划。该错误不意味着需要删锁，也不能通过恢复旧快照来强行发布。
+  5. 成功 apply 后，[package.json](../package.json) 与 [CHANGELOG.md](../CHANGELOG.md) 会有意保持未提交状态。先审查 diff，再由人工 commit/tag；脚本不会替你做这些操作，也不会 push。
 
 - 何时不要重试：
   - **工作区脏**：未提交或未跟踪文件未妥善处理前，重复 `--apply` 只会再次得到 `DIRTY_WORKTREE`。先逐项确认 `git status --porcelain`，提交或 stash，并确认输出为空。
+  - **计划已过期**：`RELEASE_PLAN_STALE` 表示本次没有写目标，不能据此断言其他进程没有写入。先保留并核对新内容或读取故障，不复用旧计划，不删锁绕过。
   - **package 版本已提升**：`VERSION_NOT_GREATER` 可能意味着上一次 apply 已成功。先比较 package、CHANGELOG 与 git diff；若目标版本已经正确写入，直接审查并人工完成后续发布步骤，不要再次 apply。
   - **CHANGELOG 已有目标版本段**：`VERSION_ALREADY_RELEASED` 是重复发布保护。先核对目标段与 package 版本是否一致、是否属于历史发布；不一致时先人工修正状态，不要靠重跑覆盖。
-  - **Git 检查失败或锁仍有效**：先修复 `GIT_CHECK_FAILED` 的根因，或等待有效锁释放。未改变根因的重试没有意义。
+  - **Git 检查失败或锁仍有效/未知**：先修复 `GIT_CHECK_FAILED` 的根因，或确认 holder 已退出。锁龄增长不改变处置权限；未改变根因的重试没有意义。
 
 ### 3.14 状态恢复：state 损坏 / 误删后的重建与清理总入口
 
@@ -610,7 +611,8 @@ node scripts/tower-doctor.mjs --help              # 用法
 
 | code | 含义 | 处置 |
 |---|---|---|
-| `RELEASE_LOCKED` | 主锁 / reclaim 锁由其它进程持有，或获取期间发生锁代际变化 | 查真实 gitdir、锁内容、pid 与锁龄；优先等待，陈旧锁交由脚本自动接管，手动删除仅为最后手段 |
+| `RELEASE_LOCKED` | 主锁 / reclaim 锁持有者存活或状态未知，或获取期间发生锁代际变化 | 查真实 gitdir、锁内容与 pid；只有明确 `ESRCH` 才可自动回收，锁龄不授权接管或删锁；人工处置按 3.13 |
+| `RELEASE_PLAN_STALE` | 写前发现目标已变化、缺失、create 目标已出现或无法核验 | 本次零目标写入；保留当前内容、查明变化或读取故障，工作区核对干净后重新 dry-run，不复用旧计划 |
 | `DIRTY_WORKTREE` | `--apply` 前工作区不干净 | 提交或 stash 改动，确认 `git status --porcelain` 为空后再运行 |
 | `VERSION_NOT_GREATER` | 目标版本不大于 package 当前版本 | 先确认是否已成功 apply；需要新版本时使用严格更高的 semver，不要对相同状态反复重试 |
 | `VERSION_ALREADY_RELEASED` | CHANGELOG 已有目标版本段 | 核对 package、CHANGELOG 与历史发布状态，先修正不一致，不要重复 apply |
