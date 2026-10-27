@@ -109,7 +109,7 @@ config:
     model: glm-5.3-flash
 ```
 
-The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1", role:"worker", provider:"...", model:"...", reasoning_effort:"...", max_tokens:...})`.
+The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1", role:"worker", provider:"...", model:"...", reasoning_effort:"...", max_tokens:...})`. Note that `provider` and `model` must be supplied together, and `max_tokens` must be a positive safe integer.
 
 `allowedModels` is optional. When present, every explicit/default override must resolve to one of those exact provider/model pairs. When absent, routes are validated against the live LLM adapter without a separate allowlist. With no role default or per-spawn override, the child inherits the controller's route.
 
