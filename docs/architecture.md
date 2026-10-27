@@ -19,8 +19,8 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 | 文件 | 职责 | 关键导出 / 函数 |
 | --- | --- | --- |
 | [../lib/index.js](../lib/index.js) | 插件入口。创建 `TowerRuntime`，向 `ctx.tools` 注册 `tower` 工具（`defineTool`），向 `ctx.root.sessionProjections` 注册 projection，并在插件卸载时 `dispose` | `apply(ctx, config)` |
-| [../lib/runtime.js](../lib/runtime.js) | 运行时：动作分发、子代理激活与跟踪、per-spawn 模型路由、仓库所有权、状态发布 | `TowerRuntime`：`execute`、`spawn`、`track`、`resolveRoute`、`models`、`publish`、`claimWorkspace` / `workspaceOwner` / `releaseWorkspace`、`dispose`；`REVIEW_OUTPUT_SCHEMA` |
-| [../lib/core.js](../lib/core.js) | 状态机与合并门禁：init/add/edit/spawn 记录维护、只读查询（`status` / `mission` 完整快照，`summary` 紧凑概览：全局 counts + 每 mission 一行条目）、gate 评估、merge/rebase/abandon/teardown、失败恢复 | `TowerCore`：`init`、`status`、`mission`、`summary`、`addMission`、`editMission`、`beginSpawn`、`attachSpawn`、`completeSpawn`、`failSpawn`、`evaluateMergeGate`、`mergeGate`、`merge`、`rebase`、`abandon`、`teardown`、`recover`；`recoverRebaseFailure` / `recoverMergeFailure` |
+| [../lib/runtime.js](../lib/runtime.js) | 运行时：动作分发、子代理激活与跟踪、原会话续接（resume）、per-spawn 模型路由、仓库所有权、状态发布 | `TowerRuntime`：`execute`、`spawn`、`resume`、`track`、`resolveRoute`、`models`、`publish`、`claimWorkspace` / `workspaceOwner` / `releaseWorkspace`、`dispose`；`REVIEW_OUTPUT_SCHEMA` |
+| [../lib/core.js](../lib/core.js) | 状态机与合并门禁：init/add/edit/spawn 记录维护、只读查询（`status` / `mission` 完整快照，`summary` 紧凑概览：全局 counts + 每 mission 一行条目）、gate 评估、merge/rebase/abandon/teardown、失败恢复 | `TowerCore`：`init`、`status`、`mission`、`summary`、`addMission`、`editMission`、`beginSpawn`、`attachSpawn`、`sealResumePrompt`、`completeSpawn`、`failSpawn`、`evaluateMergeGate`、`mergeGate`、`merge`、`rebase`、`abandon`、`teardown`、`recover`；`recoverRebaseFailure` / `recoverMergeFailure` |
 | [../lib/store.js](../lib/store.js) | 原子持久化：`state.json` 读写、串行更新队列、schema 校验、`.git/info/exclude` 维护 | `TowerStore`：`read` / `write` / `update` / `ensureLayout`；`validateState`；`ensureLocalExclude` |
 | [../lib/git.js](../lib/git.js) | Git 操作封装：无 shell 的 `execFile` 调用、rev-parse / status / merge-base / diff 等原语 | `runGit`、`gitOut`、`repoRoot`、`head`、`currentBranch`、`status`、`assertClean`、`isAncestor`、`changedFiles`、`rebaseInProgress`、`localExcludeFile` |
 | [../lib/projection.js](../lib/projection.js) | 把控制器发布的状态变成 session projection 事件（zod 校验） | `TOWER_RECORD_TYPE`、`towerProjectionDefinition`、`towerStateSchema` |
@@ -33,7 +33,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 
 ### 2.1 工具注册（lib/index.js）
 
-`apply` 注入 `tools`、`subagents`、`workingDirectory`、`llm`、`sessions`、`sessionProjections` 六个服务，注册名为 `tower` 的工具。工具的 action 枚举为 `init / add / edit / spawn / recover / send / interrupt / status / summary / gate / merge / rebase / abandon / teardown / models`（共 15 个，见 [../lib/index.js](../lib/index.js) 的 `enum`）。所有动作都委托给 `TowerRuntime.execute`。
+`apply` 注入 `tools`、`subagents`、`workingDirectory`、`llm`、`sessions`、`sessionProjections`、`sessionQuery` 七个服务（`sessionQuery` 供 `resume` 冷读子代理会话），注册名为 `tower` 的工具。工具的 action 枚举为 `init / add / edit / spawn / recover / resume / send / interrupt / status / summary / gate / merge / rebase / abandon / teardown / models`（共 16 个，见 [../lib/index.js](../lib/index.js) 的 `enum`）。所有动作都委托给 `TowerRuntime.execute`。
 
 `summary` 已由 `TowerRuntime.execute` 的 `case 'summary'` 接入，返回 `{ summary: await core.summary(...) }`；它与 `status` / `gate` 一样属于只读动作，完整返回契约见 §2.7。
 
@@ -45,12 +45,13 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 
 - `cores: Map<repoRoot, TowerCore>` —— 每个仓库一个 core 实例（`coreAt`）。
 - `active: Map<runId, entry>` —— 本运行时启动、尚未落定的 worker/reviewer 激活。
-- `inFlight: Map<repoRoot, sessionId>` —— 正在执行某次 `tower` 调用的 Session 占位（所有权的第一来源）。
+- `inFlight: Map<repoRoot, (sessionId → live call count)>` —— 每个仓库正在执行的 `tower` 调用按 Session 计数（所有权的第一来源）：同一 Session 的并发调用叠加计数而不是互相释放，任一计数为正时外来 Session 被拒，最后一个 claim 释放时条目消失。
 
 主要流程：
 
 - **`execute(args, exec)`**：校验调用方 Session（`assertCallingAgent`）→ `models` 动作直接走 LLM 目录（不触碰仓库状态）→ 其余动作先 `resolveRoot`（经 `workingDirectory.ensure` + `git rev-parse --show-toplevel`），再 `claimWorkspace`，然后 `coreAt` 打开（或 init）core 并分发动作，最后 `releaseWorkspace`。除 `status / summary / gate / send / interrupt` 外的动作成功后（以及任何动作抛错的 catch 路径上）调用 `publish` 发布 projection。
-- **`spawn(core, agent, args, signal)`**：`resolveRoute` 解析模型路由 → `core.beginSpawn` 预写状态（先占位，防并发重复派生）→ 生成角色 briefing（`workerBrief` / `reviewerBrief`）→ `ctx.subagents.startActivation` 以 `provider: spawn`、`cwd: mission.worktree`、reviewer 附带 `outputSchema: REVIEW_OUTPUT_SCHEMA` 启动子代理 → `core.attachSpawn` 记录 `childId` → `track(entry)` 在后台跟踪。启动失败会回滚：`failSpawn` 记录失败状态；attach 失败额外 `activation.dispose()`。
+- **`spawn(core, agent, args, signal)`**：`resolveRoute` 解析模型路由 → `core.beginSpawn` 预写状态（先占位，防并发重复派生）→ 生成角色 briefing（`workerBrief` / `reviewerBrief`）→ `ctx.subagents.startActivation` 以 `provider: spawn`、`cwd: mission.worktree`、reviewer 附带 `outputSchema: REVIEW_OUTPUT_SCHEMA` 启动子代理 → `core.attachSpawn` 记录 `childId` → `track(entry)` 在后台跟踪。启动失败会回滚：`failSpawn` 记录失败状态；attach 失败额外 `activation.dispose()`。run 从 `beginSpawn` 落账起就登记进 `active`，直到落定或回滚的 `failSpawn` 记录完成——启动中/回滚中的 run 仍归本运行时所有，不会被并发的 `recover` 误回收。
+- **`resume(core, agent, args, signal)`**：原样续接上一轮 worker/reviewer 子代理，不新开失忆代理。顺序是 WAL 契约：① WAL 读——先 `sessionQuery.observeSession` 读取原 childId 的持久会话偏移并校验 direct-parent 血统（不可读/非本控制器子代理一律 `AGENT_NOT_RUNNING`，且不改任何状态）；② `core.beginSpawn(..., resume: { previousRunId, childId, sessionSeq })` 预写新 run 与 `resumeFrom`（reviewer 同时落定本轮 exact-SHA 绑定）；③ 用 `begun.mission` 生成本轮 prompt（reviewer prompt 必须写本轮新的 base/tip）并经 `core.sealResumePrompt` 只落 prompt 的 SHA-256 指纹——prompt 原文绝不入 state；④ 注册本轮生命周期监听后 `ctx.subagents.sendMessage` 冷恢复原会话（宿主在投递期间发布本轮 `subagent/start`，绝不调用 `startActivation`，也不重算路由：`provider/model/reasoning_effort/max_tokens` 覆盖一律拒绝）；⑤ `core.attachSpawn` 补记 messageId 与本轮 hostRunId。落定对账 fail-closed：只有本轮 `subagent/start` 绑定的 hostRunId 的 `subagent/end` 才可结算，sendAccepted 不能替代 start，旧 epoch 的 end 一律丢弃；matched end 一到就同步失去 interrupt 资格（同 child 可能已在跑下一轮），异步再从偏移后、下一轮 user 消息之前的本轮事件里取输出/诊断；reviewer 输出必须整体是（或仅含一个 json fence 的）符合 `REVIEW_OUTPUT_SCHEMA` 且零违规的 JSON，否则 `review_failed`，绝不借用旧轮 verdict。send/attach 失败按「interrupt（仅本轮确已 start）→ dispose → `failSpawn` → 撤销 active 登记」回滚；`recover` 仍只标记 interrupted、绝不 adopt 旧执行。
 - **`track(entry)`**：等待 `activation.result`，交给 `core.completeSpawn` 结算状态；随后 `publish` 并向控制器 Session `steer` 一条 `subagent-settled` 通知（子代理落定提示，不是结果本身）。
 - **`resolveRoute`**：合并 role 默认（config 的 `workerAgentOptions` / `reviewerAgentOptions`）与 per-spawn 参数（`provider`+`model` 必须成对、`reasoning_effort`、`max_tokens` 正安全整数）；无任何覆盖时子代理继承控制器路由（`parentAgentOptionsForDelegation`）；配置了 `allowedModels` 时做精确路由允许清单校验（`MODEL_ROUTE_NOT_ALLOWED`）；最终经 `ctx.llm.resolveCallConfig` 验证。解析出的 route 同时写进 mission 的 `worker` / `review` 记录，供 projection/UI 展示。
 - **`models`**：三种形态——不带 `provider` 时聚合并返回所有 provider 的目录（`listProviders()` + 每个 provider 一次 `listModels()`，按 provider/model 排序，每个 provider 最多 100 条并带 `truncated` 标志，单个 provider 失败内聚为该条目的 `error` 而不让整个聚合失败；取消信号除外）；只带 `provider` 时返回该 provider 目录（上限 500 条）；`provider + model` 时经 `resolveModelInfo` 返回单条精确路由元数据。目录形态不逐个解析每模型的调用配置。
@@ -193,6 +194,8 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 `recover(activeRunIds)` 只把「状态文件里是 running、但 runId 不属于本运行时活跃集合」的记录标记为中止：worker 记录 `stopReason: 'aborted'` → `worker_failed`；reviewer 记录额外标 `stale: true` → `review_failed`。它从不尝试 attach、杀掉或继承旧控制器启动的进程；旧激活落定后由其宿主自行处理。重启后 persisted running 记录会一直阻塞新派生，直到控制器显式调用 `recover`。
 
+`resume` 与 `recover` 的分工：`recover` 只修 Tower 记账、绝不接管旧执行，也不证明旧执行已停止；活跃 mission（包括 `previousRunId`/`childId` 与本次完全相同的情形）对 `resume` 一律 `AGENT_BUSY`——必须先 `interrupt` 或 `recover`。`resume` 之后的新 run 记录额外携带 `resumeFrom: { runId（原 run）, childId, sessionSeq, promptHash }` 与 `resumeMessageId` / `resumeHostRunId` 关联句柄；`promptHash` 是投递前经 `sealResumePrompt` 落账的 prompt SHA-256 指纹，prompt 原文永不入 state。事件流相应追加带 `resumedFrom`/`childId` 的 `spawn-started`、`resume-prompt-sealed` 与带 `resumed` 标志的 `spawn-attached`。
+
 ### 4.5 Teardown 只清理 merged/abandoned 且干净的 worktree
 
 `teardown` 逐 mission 检查：
@@ -237,7 +240,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 所有权策略完整地实现在 `TowerRuntime` 的三个方法里（成员资格跟仓库不跟 Session 血缘）：
 
-- `workspaceOwner(root)`：先看 `inFlight`（某次 `tower` 调用正在执行），再遍历 `this.active`（本运行时启动的激活，其 core 的 `store.repoRoot` 等于该仓库且父 Session 存活）。
+- `workspaceOwner(root)`：先看 `inFlight`（第一个计数为正的 Session 调用占位），再遍历 `this.active`（本运行时启动的激活，其 core 的 `store.repoRoot` 等于该仓库且父 Session 存活）。
 - `claimWorkspace(root, sessionId)`：存在他人所有权时抛 `WORKSPACE_BUSY`；否则登记本次调用。claim 发生在 `init` / `open` 之前，被拒绝的 Session 不会触碰状态。
 - `releaseWorkspace(root, sessionId)`：调用结束时只释放自己持有的 claim。
 
@@ -249,7 +252,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 
 ### 6.3 激活生命周期
 
-`spawn` 先 `beginSpawn` 占位（状态进入 running，防止同 mission 重复派生），再启动激活、`attachSpawn` 记录 `childId`；`track` 在后台等待结果并结算。`dispose`（插件卸载）会 abort 所有在飞调用并 dispose 所有激活；落定路径上的 `active.delete` 保证所有权最终释放。
+`spawn` / `resume` 先 `beginSpawn` 占位（状态进入 running，防止同 mission 重复派生）并即刻登记 `active`，再启动/续接激活、`attachSpawn` 记录 `childId`；`track` 在后台等待结果并结算。启动中与回滚中的 run 在 `failSpawn` 记录完成之前都留在 `active` 中归本运行时所有，因此并发的 `recover` 不会回收一个正在被本运行时结算的 run。`dispose`（插件卸载）会 abort 所有在飞调用并 dispose 所有激活；落定路径上的 `active.delete` 保证所有权最终释放。
 
 ### 6.4 单进程边界（重要）
 
@@ -271,7 +274,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 ```
 
 - **分支命名**：`<branchPrefix>/<mission-id 小写>`，默认 `tower/m1`；`branchPrefix` 与 `stateDirectory` 都来自插件 config（默认值见 [../lib/runtime.js](../lib/runtime.js) 构造函数）。mission id 形如 `M1` / `API`（`/^[A-Z][A-Z0-9_-]{0,31}$/`），未指定时自动分配 `M<max+1>`。
-- **`state.json` 结构**（`validateState`）：`version: 1`、`repoRoot`（绝对路径）、`baseBranch`、`baseCommit`、`createdAt` / `updatedAt`、`missions[]`、`events[]`（最多保留 200 条）。每个 mission 记录：`id`、`title`、`description`、`dependsOn`、`scope`、`branch`、`worktree`、`baseCommit`、`status`、`revision`、`createdAt`、`worktreeRemoved`，以及可选的 `worker` / `review`（runId、route、childId、起止时间、stopReason、output、headCommit / 绑定与 verdict、`stale` 等字段）与 `merge`（mergedAt、commit、reviewedCommit、baseCommit、可选 reconciled）记录。projection 的 zod schema（[../lib/projection.js](../lib/projection.js)）与之对应。
+- **`state.json` 结构**（`validateState`）：`version: 1`、`repoRoot`（绝对路径）、`baseBranch`、`baseCommit`、`createdAt` / `updatedAt`、`missions[]`、`events[]`（最多保留 200 条）。每个 mission 记录：`id`、`title`、`description`、`dependsOn`、`scope`、`branch`、`worktree`、`baseCommit`、`status`、`revision`、`createdAt`、`worktreeRemoved`，以及可选的 `worker` / `review`（runId、route、childId、起止时间、stopReason、output、headCommit / 绑定与 verdict、`stale`，以及 resume run 的 `resumeFrom` / `resumeMessageId` / `resumeHostRunId` 等字段）与 `merge`（mergedAt、commit、reviewedCommit、baseCommit、可选 reconciled）记录。projection 的 zod schema（[../lib/projection.js](../lib/projection.js)）与之对应。
 - **artifact 对账**：`addMission` 遇到已存在的同名分支/worktree 时，只有「两者同时存在、worktree 干净、位于该分支、tip 是当前 base 的祖先（无独立提交）」才对账复用（`mission-artifacts-reconciled`，mission 记 `reconciled: true`、`baseCommit` 取 worktree tip）；任何不匹配都抛 `MISSION_ARTIFACT_CONFLICT`，交给人工检查，绝不自动删除。
 
 ## 8. 诊断与发布工具

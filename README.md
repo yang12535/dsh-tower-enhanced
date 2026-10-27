@@ -115,7 +115,7 @@ The same values can be passed per spawn: `tower({action:"spawn", mission_id:"M1"
 
 ## Tool flow
 
-Available actions: `init`, `add`, `edit`, `spawn`, `recover`, `send`, `interrupt`, `status`, `summary`, `gate`, `merge`, `rebase`, `abandon`, `teardown`, `models`.
+Available actions: `init`, `add`, `edit`, `spawn`, `recover`, `resume`, `send`, `interrupt`, `status`, `summary`, `gate`, `merge`, `rebase`, `abandon`, `teardown`, `models`.
 
 1. Make the Session's working directory the intended repository (`working_directory` supports `cd`), check out the local base branch, and ensure the main worktree is clean.
 2. `tower({action:"init"})`.
@@ -126,7 +126,7 @@ Available actions: `init`, `add`, `edit`, `spawn`, `recover`, `send`, `interrupt
 7. If the base moved, `rebase`, then obtain a fresh review before merging. A changed review base invalidates the verdict even when the mission tip stays unchanged; `reviewRequired` reports this too.
 8. `merge` evaluates the gate and merges the exact reviewed SHA. `teardown` later removes eligible worktrees only.
 
-`send` and `interrupt` address the currently active worker/reviewer. `models` lists a provider's catalog or resolves one exact route, including reasoning metadata when available. After a restart, persisted `worker_running`/`review_running` records intentionally block new work until the controller explicitly confirms the old runtime stopped and calls `recover`; this records stale activations as interrupted without adopting their processes.
+`send` and `interrupt` address the currently active worker/reviewer. `resume` continues the previous worker or reviewer of a settled run **in place** — the original child session is cold-resumed through the host's `sendMessage`, keeping its context, descriptor, provider/model/effort route, and cwd (route overrides are rejected; spawn a fresh agent to change the route). The continuation is tracked as a fresh Tower run with a write-ahead record (`resumeFrom`: previous run, child id, session offset, and the delivered prompt's SHA-256 fingerprint — the prompt text itself is never stored) persisted before the resume message is delivered, so a crash never leaves an unexplained running run. Results settle fail-closed: only the host run epoch bound to this round's `subagent/start` may produce the outcome, and a resumed reviewer must answer with a single JSON object (bare or one ```json fence) that validates against the review schema with zero violations — anything else is `review_failed`, never an approval. `outputSchema` capture and per-activation `max_tokens` from the original activation are not restored by cold resume. An actively running mission stays `AGENT_BUSY` (interrupt or `recover` first), and `recover` still only marks stale runs interrupted — it never adopts old executions. `models` lists a provider's catalog or resolves one exact route, including reasoning metadata when available. After a restart, persisted `worker_running`/`review_running` records intentionally block new work until the controller explicitly confirms the old runtime stopped and calls `recover`; this records stale activations as interrupted without adopting their processes.
 
 ## Failure recovery
 

@@ -118,7 +118,7 @@ config:
 
 ## 工具流程
 
-可用的 action：`init`、`add`、`edit`、`spawn`、`recover`、`send`、`interrupt`、`status`、`summary`、`gate`、`merge`、`rebase`、`abandon`、`teardown`、`models`。
+可用的 action：`init`、`add`、`edit`、`spawn`、`recover`、`resume`、`send`、`interrupt`、`status`、`summary`、`gate`、`merge`、`rebase`、`abandon`、`teardown`、`models`。
 
 1. 把 Session 的工作目录切换到目标仓库（`working_directory` 支持 `cd`），检出本地 base 分支，并确保主 worktree 干净。
 2. `tower({action:"init"})`。
@@ -129,7 +129,7 @@ config:
 7. 如果 base 发生了移动，先 `rebase`，然后在合并前获得新的 review。即使任务 tip 没变，只要审查绑定的 base 变化，旧 verdict 也会失效，`reviewRequired` 同样会报告需要重审。
 8. `merge` 会评估门禁并合并被审查的精确 SHA。`teardown` 稍后只移除符合条件的 worktree。
 
-`send` 与 `interrupt` 面向当前活跃的 worker/reviewer。`models` 列出某个 provider 的模型目录，或解析一条精确路由，并在可用时附带 reasoning 元数据。重启之后，持久化的 `worker_running`/`review_running` 记录会故意阻塞新工作，直到控制器显式确认旧运行时已停止并调用 `recover`；这会把过期激活记为 interrupted，而不会接管它们的进程。
+`send` 与 `interrupt` 面向当前活跃的 worker/reviewer。`resume` 把已落定一轮 run 的原 worker/reviewer **原地续接**——通过宿主 `sendMessage` 冷恢复原 child 会话，保留其上下文、descriptor、provider/model/effort 路由与 cwd（拒绝任何路由覆盖；要换路由请重新 spawn）。续接作为全新的 Tower run 跟踪，并先写日志再投递（WAL）：`resumeFrom`（原 runId、childId、会话偏移、以及本次投递 prompt 的 SHA-256 指纹——prompt 原文绝不入 state）在恢复消息发出前就已持久化，因此任何崩溃都只会留下可解释的 run 记录。落定对账 fail-closed：只有绑定到本轮 `subagent/start` 的宿主 run epoch 才能产出结果；被续接的 reviewer 必须以单一 JSON 对象（裸对象或仅一个 ```json 围栏）作答，且对审查 schema 零违规，否则一律 `review_failed`，绝不产生批准。冷恢复不会还原原激活的 `outputSchema` 捕获与 per-activation `max_tokens`。活跃中的 mission 一律 `AGENT_BUSY`（先 `interrupt` 或 `recover`）；`recover` 仍只把过期 run 标记为 interrupted，绝不接管旧执行。`models` 列出某个 provider 的模型目录，或解析一条精确路由，并在可用时附带 reasoning 元数据。重启之后，持久化的 `worker_running`/`review_running` 记录会故意阻塞新工作，直到控制器显式确认旧运行时已停止并调用 `recover`；这会把过期激活记为 interrupted，而不会接管它们的进程。
 
 ## 失败恢复
 

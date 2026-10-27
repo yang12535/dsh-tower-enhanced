@@ -173,7 +173,14 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 - `rebase`：把 mission 分支变基到当前 base（失败路径见 3.1）。返回 `{ rebased:true, reviewRequired, previousTip, tip, mission }`。`reviewRequired:true` 表示旧审查已失效（review 清空、状态回 `worker_completed`）——触发条件是 **tip 变化，或审查绑定的 base/reviewed SHA 与当前不一致**：即使 tip 没动，base 前进也会使审查失效。`reviewRequired:false` 的真 no-op：既有结论原样保留（`approved`/`changes_requested` 不变）；对 `review_failed` 的 no-op 变基则保持 `review_failed`（失败记录不因变基消失，重派 reviewer 即可）。**变基之后凡 `reviewRequired:true` 必须重新审查。**
 - `abandon`：mission → `abandoned`，工件保留，交给 `teardown` 清理；依赖它的 mission 视依赖为已解决。`merged` mission 不可 abandon（`MISSION_MERGED`），运行中不可 abandon（`AGENT_BUSY`）。
 - `send` / `interrupt`：向当前运行中的 worker/reviewer 递话/取消（`AGENT_NOT_RUNNING` 表示没有活跃子代理可寻址）。
-- `recover`：处置跨重启的僵尸 running 记录，语义见 3.8。
+- `resume`（原会话续接）：把已落定一轮 run 的原 worker/reviewer **原地续接**，适合「上下文比什么都贵」的返工/重审场景：
+  ```text
+  tower({action:"resume", mission_id:"M1", role:"worker", instructions:"继续完成剩余工作"})
+  ```
+  - 预期输出：`{ mission, role, runId, childId, resumed:true, resumeFrom:{ runId, childId, sessionSeq, promptHash }, messageId, hostRunId?, binding?(reviewer), status, worktree }`。
+  - 机制：先读原 childId 的持久会话偏移并校验 direct-parent 血统，`beginSpawn` 预写新 run 与 `resumeFrom`（WAL），用**本轮**绑定生成 prompt 并只落其 SHA-256 指纹，再经宿主 `sendMessage` 冷恢复原会话（不调用 `startActivation`，不重算路由；`provider`/`model`/`reasoning_effort`/`max_tokens` 覆盖一律 `ARGUMENT_INVALID`）。落定只认本轮 `subagent/start` 绑定的 epoch；被续接的 reviewer 必须以单一 JSON 对象（裸对象或仅一个 ```json 围栏）作答且对 schema 零违规，否则 `review_failed`。
+  - 边界：冷恢复保留原会话上下文、descriptor 与路由，但**不**还原原激活的 `outputSchema` 捕获与 per-activation `max_tokens`；活跃 mission（含 previousRunId/childId 相同的情形）一律 `AGENT_BUSY`——先 `interrupt`/`recover`；会话不可读或属于其他父会话报 `AGENT_NOT_RUNNING` 且不改任何状态；send/attach 失败会回滚（必要时 interrupt + `failSpawn`）。
+- `recover`：处置跨重启的僵尸 running 记录，语义见 3.8。`recover` 只修记账、不接管旧执行，也不是 `resume` 的前置替代——`resume` 面向已落定的 run，`recover` 面向悬置的 running 记录。
 - `models`：查询 provider 目录/精确路由元数据，不做任何仓库操作。
 
 ### 2.10 运行期通知（落定即尝试投递 + 僵尸提示）

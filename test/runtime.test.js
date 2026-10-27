@@ -805,7 +805,7 @@ test('bundle registers the tower tool and owned runtime effect', () => {
   };
   apply(ctx, {});
   assert.equal(name, 'tower-enhanced');
-  assert.deepEqual(inject, ['tools', 'subagents', 'workingDirectory', 'llm', 'sessions', 'sessionProjections']);
+  assert.deepEqual(inject, ['tools', 'subagents', 'workingDirectory', 'llm', 'sessions', 'sessionProjections', 'sessionQuery']);
   assert.equal(registrations.length, 1);
   assert.equal(registrations[0].name, 'tower');
   assert.equal(registrations[0].parameters.properties.action.enum.includes('spawn'), true);
