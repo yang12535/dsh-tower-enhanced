@@ -36,7 +36,8 @@
 - 归档 M83 probes：**6/6**；归档 main probes：**5/5**。
 - Lead 独立 `/tmp` 反向变异：WAL-before-send → 3 红；hostRunId epoch guard → 3 红；JSON schema → 2 红；disposal → no-hang 护栏抓住；event-slice 下一 user/message 截断 → 新回归测试精确取得下一轮 verdict B 并变红。
 - 真实宿主链测试经过实际 `SubagentManager.coldResume` 与持久化 `SessionStore`，验证 descriptor/route/composition、direct-parent authorization 和 durable delivery；仅 `materialize/announce` 模型执行边界使用捕获替身。
-- 验证边界：真实 coldResume 测试与 TowerRuntime settlement 测试是分段组合，并未在当前运行中的 Web Host 内做完整端到端 resume smoke；不要把测试通过表述成已经完成实机续接演示。
+- 真实 Host 端到端 smoke 已在 DSH 重启后完成：一次性 mission `SMOKE` 第一轮 run `46c23e4b-f5ca-4f36-be0e-ecc64a488bf4`，resume 新 run `60e6d877-a3e6-4386-a558-aa8c51547f3d`，child 始终为 `6a5d6838-ea75-451f-bfed-43ff918d8c11`；WAL `sessionSeq=55`，新 hostRunId `7e1ea4d6-7f36-4169-9674-d453cf93ec4f`。
+- 第二轮指令没有重复文件路径或 token，恢复原 Session 后正确追加 `round-2 ORCHID-731`，第二轮 commit `8c8c32785fc97e008cacac95f0c731fc1f804c29`，Tower 状态 `worker_completed`。Lead 已核对文件精确两行、提交与运行时记录；GUI 也显示恢复原 token。SMOKE 随后 abandon + teardown，未合并 main。
 
 ## 安装副本与下一步
 
@@ -47,9 +48,9 @@
 - `lib/runtime.js`
 - `README.md`
 
-四个文件与 main 逐字节一致，安装副本三个 runtime 文件均通过 `node --check`。**当前已经运行的 Host 仍需重启才会加载新代码；本次没有重启 Host，避免中断当前会话。**
+四个文件与 main 逐字节一致，安装副本三个 runtime 文件均通过 `node --check`。DSH Host 已由用户重启，真实 resume smoke 随后通过，确认原 child、sessionSeq、WAL、hostRunId、原上下文与最终 settlement 均正常。
 
-建议的唯一收尾：下次 Host 重启后，用一个可丢弃的小 mission 做一次真实 resume smoke，确认原 child/sessionSeq、WAL、hostRunId 和最终 settlement。若不是可复现 P1/P2，不继续扩功能或补低价值测试。
+功能与真实冒烟均已完成。除非外援发现可复现 P1/P2，不继续扩功能、UI 或补低价值测试。
 
 ## 最后一次外援的方针审查
 
