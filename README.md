@@ -6,6 +6,8 @@ This is an independently maintained prototype, not Kimi Tower and not an officia
 
 > 如你所见，这是一个从头到尾都是ai做的kimi tower for dsh风味插件，单纯是在额度富余但马上过期不想浪费的情况下堆出来的，不保证效果，如果你想尝尝我做的勾石的话，那我只能说，小馋猫~
 
+> 神奇的github，本地user自动关联了一个不认识的老账户....神秘....懒得改了///
+
 [中文文档](README.zh-CN.md)
 
 ## Features
