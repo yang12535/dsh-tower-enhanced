@@ -18,6 +18,13 @@ const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 const blocks = (text) => [{ type: 'text', text }];
 const validVerdict = { verdict: 'clean', merge: true, summary: 'clean', findings: [], checks: [] };
 
+/** Promise that the test settles explicitly. */
+function deferred() {
+  let resolve;
+  const promise = new Promise((settled) => { resolve = settled; });
+  return { promise, resolve };
+}
+
 function controllerAgent(id = 'parent') {
   return { id, session: { id, header: {} }, steer() {} };
 }
@@ -61,6 +68,7 @@ function resumeHarness(options = {}) {
       set.add(fn);
       return () => set.delete(fn);
     },
+    ...(options.repo === undefined ? {} : { workingDirectory: { async ensure() { return options.repo; } } }),
     sessionQuery: {
       async observeSession(id) {
         const events = sessionLogs.get(id);
@@ -131,6 +139,27 @@ function completeEpoch(harness, { childId, hostRunId, prompt = 'resume round', a
     runId: hostRunId,
     stopReason,
     lastAssistantMessage: assistant === undefined ? [] : blocks(assistant),
+  });
+}
+
+/**
+ * Grow one child's log by one resumed epoch that receives an in-epoch
+ * follow-up (a tower send delivered into the SAME host run) and publish the
+ * matched end edge. The reviewer answers, the follow-up arrives, and the
+ * final answer after it is the run's terminal lastAssistantMessage.
+ */
+function followupEpoch(harness, { childId, hostRunId, prompt = 'resume round', first, followup, final, stopReason = 'completed' }) {
+  const log = harness.sessionLogs.get(childId);
+  let seq = (log.at(-1)?.seq ?? -1) + 1;
+  log.push(userEvent(seq, prompt));
+  log.push(assistantEvent(seq + 1, first));
+  log.push(userEvent(seq + 2, followup));
+  log.push(assistantEvent(seq + 3, final));
+  harness.emit('subagent/end', {
+    id: childId,
+    runId: hostRunId,
+    stopReason,
+    lastAssistantMessage: blocks(final),
   });
 }
 
@@ -413,6 +442,62 @@ test('a settlement read that already observes the next epoch transcript still se
 });
 
 // ---------------------------------------------------------------------------
+// In-epoch follow-ups (tower send into the same host run): the matched
+// terminal edge's final answer outranks anything the truncated slice still
+// ends on.
+// ---------------------------------------------------------------------------
+
+test('an in-epoch follow-up cannot let an early clean verdict beat the terminal edge final rejection', async (t) => {
+  const { core, mission, childId } = await reviewerFixture(t);
+  const harness = resumeHarness({ sessionLogs: [[childId, [assistantEvent(0, 'prior review context')]]] });
+  const result = await harness.runtime.resume(core, controllerAgent(), { mission_id: mission.id, role: 'reviewer' }, new AbortController().signal);
+  followupEpoch(harness, {
+    childId,
+    hostRunId: harness.lastStart().runId,
+    first: JSON.stringify({ ...validVerdict, summary: 'early clean before the follow-up' }),
+    followup: 'controller follow-up: re-check the diff binding before you finish',
+    final: JSON.stringify({
+      verdict: 'changes_requested',
+      merge: false,
+      summary: 'final rejection after the follow-up',
+      findings: [{ severity: 'p1', path: 'lib/core.js', message: 'broken' }],
+      checks: [],
+    }),
+  });
+  await harness.runtime.active.get(result.runId).done;
+  const settled = await core.mission(mission.id);
+  assert.equal(settled.status, 'changes_requested', 'the final rejection must settle the round');
+  assert.equal(settled.review.verdict, 'changes_requested');
+  assert.equal(settled.review.merge, false);
+  assert.equal(settled.review.summary, 'final rejection after the follow-up');
+  assert.ok(!settled.review.summary.includes('early clean'), 'the superseded early verdict must not be recorded');
+  const gate = await core.mergeGate(mission.id);
+  assert.equal(gate.ready, false);
+  assert.ok(gate.blocks.some((block) => block.code === 'NO_CLEAN_REVIEW'));
+});
+
+test('an invalid final answer after an in-epoch follow-up is not rescued by the early clean verdict', async (t) => {
+  const { core, mission, childId } = await reviewerFixture(t);
+  const harness = resumeHarness({ sessionLogs: [[childId, [assistantEvent(0, 'prior review context')]]] });
+  const result = await harness.runtime.resume(core, controllerAgent(), { mission_id: mission.id, role: 'reviewer' }, new AbortController().signal);
+  const prose = 'On reflection: this needs changes, but I will not encode them as JSON.';
+  followupEpoch(harness, {
+    childId,
+    hostRunId: harness.lastStart().runId,
+    first: JSON.stringify({ ...validVerdict, summary: 'early clean before the follow-up' }),
+    followup: 'controller follow-up: answer with the structured verdict only',
+    final: prose,
+  });
+  await harness.runtime.active.get(result.runId).done;
+  const settled = await core.mission(mission.id);
+  assert.equal(settled.status, 'review_failed', 'an invalid final answer fails the review');
+  assert.equal(settled.review.verdict, undefined, 'the early clean verdict must not rescue the invalid final answer');
+  const gate = await core.mergeGate(mission.id);
+  assert.equal(gate.ready, false);
+  assert.ok(gate.blocks.some((block) => block.code === 'NO_CLEAN_REVIEW'));
+});
+
+// ---------------------------------------------------------------------------
 // Strict reviewer verdict parsing (REVIEW_OUTPUT_SCHEMA, zero violations).
 // ---------------------------------------------------------------------------
 
@@ -623,6 +708,59 @@ test('a failed attach rolls the run back the same way', async (t) => {
   assert.deepEqual(harness.interrupts.map((entry) => entry.id), [childId]);
   assert.equal(harness.runtime.active.size, 0);
   assert.equal((await core.mission(mission.id)).status, 'worker_failed');
+});
+
+test('a recover queued behind this runtime\'s resume beginSpawn write cannot reap the run it persists (resume)', async (t) => {
+  const { core, mission, childId } = await workerFixture(t);
+  // Park resume's beginSpawn persistence (the worker_running write of the new
+  // run) inside the store queue until a same-Session recover call from the
+  // same runtime has queued behind it: the resume window must enjoy the same
+  // ownership boundary as a plain spawn.
+  const realWrite = core.store.write.bind(core.store);
+  const writeEntered = deferred();
+  const releaseWrite = deferred();
+  let parked = false;
+  core.store.write = async (state) => {
+    if (!parked) {
+      parked = true;
+      writeEntered.resolve();
+      await releaseWrite.promise;
+    }
+    return realWrite(state);
+  };
+  const realRecover = core.recover.bind(core);
+  const recoverQueued = deferred();
+  core.recover = (activeRunIds) => {
+    const settled = realRecover(activeRunIds);
+    recoverQueued.resolve();
+    return settled;
+  };
+  const repo = core.store.repoRoot;
+  const harness = resumeHarness({ sessionLogs: [[childId, [assistantEvent(0, 'prior')]]], repo });
+  harness.runtime.cores.set(repo, core);
+  const agent = controllerAgent();
+  const signal = new AbortController().signal;
+  const resumeCall = harness.runtime.execute({ action: 'resume', mission_id: mission.id, role: 'worker' }, { agent, signal });
+  try {
+    await writeEntered.promise;
+    const recoverCall = harness.runtime.execute({ action: 'recover' }, { agent, signal });
+    await recoverQueued.promise;
+    releaseWrite.resolve();
+    const recovered = await recoverCall;
+    const resumed = await resumeCall;
+    assert.deepEqual(recovered.recovered, [], 'a recover queued behind the resume beginSpawn write must not reap the resumed run');
+    assert.equal((await core.mission(mission.id)).status, 'worker_running');
+    assert.ok(harness.runtime.active.has(resumed.runId), 'the resumed run stays registered to this runtime');
+    completeEpoch(harness, { childId, hostRunId: harness.lastStart().runId, assistant: 'resumed output after the race' });
+    await harness.runtime.active.get(resumed.runId).done;
+    const settled = await core.mission(mission.id);
+    assert.equal(settled.status, 'worker_completed');
+    assert.equal(settled.worker.output, 'resumed output after the race');
+  } finally {
+    releaseWrite.resolve();
+    await resumeCall.catch(() => {});
+    await harness.runtime.dispose();
+  }
 });
 
 test('dispose after a matched terminal edge never interrupts the child\'s next epoch', async (t) => {

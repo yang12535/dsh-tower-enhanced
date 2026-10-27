@@ -306,7 +306,8 @@ function spawnHarness(attachSpawn) {
   const runtime = new TowerRuntime(ctx, {});
   const core = {
     async mission() { return { id: 'M1', title: 'Mission', description: 'Work', scope: [] }; },
-    async beginSpawn() {
+    async beginSpawn(args = {}) {
+      args.onRunning?.('run-1');
       return { runId: 'run-1', mission: { id: 'M1', title: 'Mission', description: 'Work', scope: [], worktree: '/tmp', status: 'worker_running' } };
     },
     attachSpawn,
@@ -381,6 +382,7 @@ function trackHarness() {
   const core = {
     async mission() { return { id: 'M1', title: 'Mission', description: 'Work', scope: [] }; },
     async beginSpawn(args = {}) {
+      args.onRunning?.('run-1');
       return {
         runId: 'run-1',
         mission: {
@@ -1188,6 +1190,106 @@ test('recover must not reap a run whose rollback is still recording its failure'
     await spawnCall.catch(() => {});
     await runtime.dispose();
   }
+});
+
+/**
+ * Park one core's next store write inside the serialized queue until the test
+ * releases it, and resolve `entered` when that write has parked. Only the
+ * first write parks, so the later bookkeeping writes of the same spawn flow
+ * pass through.
+ */
+function parkFirstWrite(core) {
+  const realWrite = core.store.write.bind(core.store);
+  const entered = deferred();
+  const release = deferred();
+  let parked = false;
+  core.store.write = async (state) => {
+    if (!parked) {
+      parked = true;
+      entered.resolve();
+      await release.promise;
+    }
+    return realWrite(state);
+  };
+  return { entered, release };
+}
+
+/** Resolve `queued` once the core's recover call has registered its store entry. */
+function spyRecoverQueued(core) {
+  const realRecover = core.recover.bind(core);
+  const queued = deferred();
+  core.recover = (activeRunIds) => {
+    const settled = realRecover(activeRunIds);
+    queued.resolve();
+    return settled;
+  };
+  return { queued };
+}
+
+test('a recover queued behind this runtime\'s beginSpawn write cannot reap the run it persists (spawn)', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Begin race', description: 'beginSpawn parks mid-write while a sibling recover queues behind it.' });
+  // Park beginSpawn's worker_running persistence inside the store queue: the
+  // write is held until a same-Session recover call has already taken its
+  // ownership snapshot and queued behind it — exactly the startup window a
+  // concurrent recover must not misjudge.
+  const write = parkFirstWrite(core);
+  const { queued } = spyRecoverQueued(core);
+  const { runtime, run, controller, lifecycle } = startupHarness(repo, { core, park: false });
+  const a = controller('controller-A');
+  const spawnCall = run(a, { action: 'spawn', mission_id: 'M1', role: 'worker' });
+  try {
+    await write.entered.promise;
+    const recoverCall = run(a, { action: 'recover' });
+    await queued.promise;
+    write.release.resolve();
+    const recovered = await recoverCall;
+    const started = await spawnCall;
+    assert.deepEqual(recovered.recovered, [], 'a recover queued behind the beginSpawn write must not reap the run that write persists');
+    assert.equal((await core.mission('M1')).status, 'worker_running');
+    assert.ok(runtime.active.has(started.runId), 'the run stays registered to this runtime');
+    // The run settles on its own terms, proving no stale snapshot buried it.
+    lifecycle.settle({ stopReason: 'completed', output: [{ type: 'text', text: 'worker report' }] });
+    await runtime.active.get(started.runId).done;
+    assert.equal((await core.mission('M1')).status, 'worker_completed');
+  } finally {
+    write.release.resolve();
+    await spawnCall.catch(() => {});
+    await runtime.dispose();
+  }
+});
+
+test('a failed beginSpawn write drops the registration it made inside the store update', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Write failure', description: 'The running-state write fails after the ownership hook ran.' });
+  // The mutator placed the running record and ran the ownership hook before
+  // the committing write; failing that write must reject beginSpawn AND drop
+  // the registration, or a phantom owner would hold the workspace forever.
+  // Only the first write fails, so the later recover call can commit.
+  const realWrite = core.store.write.bind(core.store);
+  let sawRunningRecord = false;
+  let failedOnce = false;
+  core.store.write = async (state) => {
+    if (!failedOnce) {
+      failedOnce = true;
+      sawRunningRecord = state.missions[0].status === 'worker_running';
+      throw new Error('state disk exploded');
+    }
+    return realWrite(state);
+  };
+  const { runtime, run, controller } = startupHarness(repo, { core, park: false });
+  await assert.rejects(
+    run(controller('controller-A'), { action: 'spawn', mission_id: 'M1', role: 'worker' }),
+    /state disk exploded/,
+  );
+  assert.ok(sawRunningRecord, 'the ownership hook ran before the failing write');
+  assert.equal(runtime.active.size, 0, 'a run whose running-state write failed must not stay registered');
+  assert.equal(runtime.workspaceOwner(repo), undefined);
+  const recovered = await run(controller('controller-B'), { action: 'recover' });
+  assert.deepEqual(recovered.recovered, []);
+  await runtime.dispose();
 });
 
 /**

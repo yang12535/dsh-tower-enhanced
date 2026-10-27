@@ -178,7 +178,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
   tower({action:"resume", mission_id:"M1", role:"worker", instructions:"继续完成剩余工作"})
   ```
   - 预期输出：`{ mission, role, runId, childId, resumed:true, resumeFrom:{ runId, childId, sessionSeq, promptHash }, messageId, hostRunId?, binding?(reviewer), status, worktree }`。
-  - 机制：先读原 childId 的持久会话偏移并校验 direct-parent 血统，`beginSpawn` 预写新 run 与 `resumeFrom`（WAL），用**本轮**绑定生成 prompt 并只落其 SHA-256 指纹，再经宿主 `sendMessage` 冷恢复原会话（不调用 `startActivation`，不重算路由；`provider`/`model`/`reasoning_effort`/`max_tokens` 覆盖一律 `ARGUMENT_INVALID`）。落定只认本轮 `subagent/start` 绑定的 epoch；被续接的 reviewer 必须以单一 JSON 对象（裸对象或仅一个 ```json 围栏）作答且对 schema 零违规，否则 `review_failed`。
+  - 机制：先读原 childId 的持久会话偏移并校验 direct-parent 血统，`beginSpawn` 预写新 run 与 `resumeFrom`（WAL，新 run 的 `active` 登记与这次落盘在同一 store 串行段内完成），用**本轮**绑定生成 prompt 并只落其 SHA-256 指纹，再经宿主 `sendMessage` 冷恢复原会话（不调用 `startActivation`，不重算路由；`provider`/`model`/`reasoning_effort`/`max_tokens` 覆盖一律 `ARGUMENT_INVALID`）。落定只认本轮 `subagent/start` 绑定的 epoch；被续接的 reviewer 必须以单一 JSON 对象（裸对象或仅一个 ```json 围栏）作答且对 schema 零违规，否则 `review_failed`。若控制器在**同一 epoch 内**用 `send` 追加了消息，reviewer 的最终答复以 matched end 自带的最后一条 assistant 消息为准：最终拒绝就是 `changes_requested`（gate 不放行），最终输出非法就是 `review_failed`——追加前的早期 clean 结论不会挽救或替代它。
   - 边界：冷恢复保留原会话上下文、descriptor 与路由，但**不**还原原激活的 `outputSchema` 捕获与 per-activation `max_tokens`；活跃 mission（含 previousRunId/childId 相同的情形）一律 `AGENT_BUSY`——先 `interrupt`/`recover`；会话不可读或属于其他父会话报 `AGENT_NOT_RUNNING` 且不改任何状态；send/attach 失败会回滚（必要时 interrupt + `failSpawn`）。
 - `recover`：处置跨重启的僵尸 running 记录，语义见 3.8。`recover` 只修记账、不接管旧执行，也不是 `resume` 的前置替代——`resume` 面向已落定的 run，`recover` 面向悬置的 running 记录。
 - `models`：查询 provider 目录/精确路由元数据，不做任何仓库操作。
@@ -272,7 +272,7 @@ tower({action:"teardown", mission_id:"M1"})    // 省略 mission_id 则遍历全
 
 - 语义（[lib/core.js](../lib/core.js) `TowerCore.recover`）：把**持久化**为 `worker_running`/`review_running`、且其 `runId` 不属于当前运行时活跃集合的记录，标记为已中断——`stopReason:"aborted"`、`error:"activation is not owned by this runtime; ..."`；worker 侧 mission → `worker_failed`，reviewer 侧 mission → **`review_failed`**（记录同时置 `stale:true`）。它**只改标记，绝不接管旧进程**：不会向旧子代理发消息，也不会替它收尾。
 - 症状（需要 recover 的信号）：Host/控制器重启后，mission 永远停在 `worker_running`/`review_running`，任何 spawn 被 `AGENT_BUSY` 拒绝。重启后第一个新 agent 创建时通常已收到 §2.10 的僵尸提示通知。
-- 诊断：`status` 确认悬置的 role 与 `runId`。注意 `recover` 只会把「当前运行时不认领」的 runId 标记为中断；旧 Host 进程的活跃与否对当前运行时不可见，必须由操作者在进程层面确认它确实已停止。
+- 诊断：`status` 确认悬置的 role 与 `runId`。注意 `recover` 只会把「当前运行时不认领」的 runId 标记为中断；旧 Host 进程的活跃与否对当前运行时不可见，必须由操作者在进程层面确认它确实已停止。活跃集合的判定与 `beginSpawn` 的 running 落盘共享同一 store 串行边界：同一控制器内并发执行 `spawn`/`resume` 与 `recover` 是安全的——刚启动（写入尚在排队/落盘中）的 run 不会被排队的 `recover` 用旧快照误回收。
 - 安全处理：**先确认旧控制器确实停止**（这是 `recover` 的前提，README "Failure recovery" 同义），再 `tower({action:"recover"})`。返回 `{ recovered: [{ mission, role, runId }], state }`。随后：worker 侧按 3.7 重派；reviewer 侧 mission 已是 `review_failed`，直接重派 reviewer。
 - 何时不应重试（不应执行 recover）：旧 Host 进程可能仍在运行时——它的 worker/reviewer 落定回调仍会写 state，和 recover 的标记互相覆盖，制造真正的竞态。先停旧进程，再 recover，一次即可（幂等：没有可回收记录时返回空 `recovered`）。
 
