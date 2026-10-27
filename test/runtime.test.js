@@ -510,6 +510,56 @@ test('a failed run truncates its role-record reason to 500 characters', async ()
   assert.ok(final.endsWith('…'));
 });
 
+test('a multi-line diagnostic reason stays on the final physical line', async () => {
+  const harness = trackHarness();
+  const diagnostic = '429 rate limited\n{"error":{"code":429,"message":"rate limited"}}\nretry-after: 30';
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'review_failed', review: { stopReason: 'error', error: diagnostic } });
+  await runTrackedSpawn(harness, 'reviewer');
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'error', diagnostic });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  const text = harness.notices[0].content[0].text;
+  assert.match(text, /^Next: spawn a fresh reviewer/m);
+  assert.equal(text.split('\n').length, 3, 'the reason must not add physical lines');
+  assert.equal(
+    lastLine(text),
+    'stopReason: error; reason: 429 rate limited {"error":{"code":429,"message":"rate limited"}} retry-after: 30',
+  );
+});
+
+test('a multi-line stop reason is normalized onto the final physical line', async () => {
+  const harness = trackHarness();
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'worker_completed' });
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'completed\n(parent finished)\n' });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  const text = harness.notices[0].content[0].text;
+  assert.equal(text.split('\n').length, 3, 'the stop reason must not add physical lines');
+  assert.equal(lastLine(text), 'stopReason: completed (parent finished)');
+});
+
+test('a long multi-line reason is collapsed before it is truncated', async () => {
+  const harness = trackHarness();
+  const diagnostic = Array.from({ length: 40 }, (_, index) => `429 attempt ${index} rate limited`).join('\r\n');
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'worker_failed', worker: { stopReason: 'error', error: diagnostic } });
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'error' });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  const text = harness.notices[0].content[0].text;
+  assert.equal(text.split('\n').length, 3, 'the truncated reason must not add physical lines');
+  const prefix = 'stopReason: error; reason: ';
+  const final = lastLine(text);
+  assert.ok(final.startsWith(prefix), 'the reason lives on the final stop-reason line');
+  assert.ok(final.length - prefix.length <= 500, 'the reason is truncated to 500 characters');
+  assert.ok(final.endsWith('…'));
+  assert.ok(!/[\r\n]/.test(final), 'no raw line break may survive inside the final line');
+});
+
 test('approved, rejected, and stale settlements also end with a stop reason', async () => {
   const cases = [
     { status: 'approved', review: { stopReason: 'completed' }, expected: 'stopReason: completed' },
