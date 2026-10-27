@@ -591,7 +591,13 @@ test('dispose after a matched terminal edge never interrupts the child\'s next e
   completeEpoch(harness, { childId, hostRunId: harness.lastStart().runId, assistant: 'finished work' });
   harness.emit('subagent/start', { id: childId, runId: 'host-run-next' });
   try {
-    await harness.runtime.dispose();
+    // Release the gated settlement read concurrently with disposal: dispose
+    // settles the epoch from its own terminal edge, while entry.done drains
+    // the in-flight settlement read — awaiting dispose before releasing the
+    // gate would deadlock the test against its own settlement observer.
+    const disposing = harness.runtime.dispose();
+    releaseSettlement();
+    await disposing;
     assert.deepEqual(harness.interrupts, [], 'a settled epoch must not interrupt the child now running host-run-next');
   } finally {
     releaseSettlement();
@@ -613,6 +619,55 @@ test('dispose before settlement interrupts the epoch and settles aborted without
   const settled = await core.mission(mission.id);
   assert.equal(settled.status, 'worker_failed');
   assert.equal(settled.worker.stopReason, 'aborted');
+});
+
+test('runtime dispose of a sent-and-started epoch settles promptly and never rejects entry.done', async (t) => {
+  const { core, mission, childId } = await workerFixture(t);
+  const harness = resumeHarness({ sessionLogs: [[childId, [assistantEvent(0, 'prior')]]] });
+  const result = await harness.runtime.resume(core, controllerAgent(), { mission_id: mission.id, role: 'worker' }, new AbortController().signal);
+  // The message was delivered and this epoch's subagent/start observed, but
+  // no matching subagent/end will ever arrive: only runtime disposal can
+  // settle the run, and it must do so without waiting for such an edge.
+  const entry = harness.runtime.active.get(result.runId);
+  assert.equal(typeof entry.disposeActivation, 'function', 'a resume entry must carry the spawn-style exactly-once disposal guard');
+  // A start of some unrelated child must never turn disposal into its interrupt.
+  harness.emit('subagent/start', { id: 'unrelated-child', runId: 'host-run-unrelated' });
+  let hang;
+  const bounded = new Promise((resolve, reject) => {
+    hang = setTimeout(() => reject(new Error('runtime dispose hung on the pending resume epoch')), 5_000);
+    hang.unref?.();
+  });
+  await Promise.race([harness.runtime.dispose(), bounded]);
+  clearTimeout(hang);
+  await assert.doesNotReject(entry.done, 'track() cleanup must find the guarded disposeActivation and fulfill entry.done');
+  assert.deepEqual(harness.interrupts.map((call) => call.id), [childId], 'exactly one interrupt, aimed only at this epoch\'s child');
+  assert.equal(harness.runtime.active.size, 0);
+  assert.equal(harness.listenerCount('subagent/start'), 0);
+  assert.equal(harness.listenerCount('subagent/end'), 0);
+  const settled = await core.mission(mission.id);
+  assert.equal(settled.status, 'worker_failed');
+  assert.equal(settled.worker.stopReason, 'aborted');
+});
+
+test('a normally settled resumed epoch fulfills entry.done and steers its settlement notice', async (t) => {
+  const { core, mission, childId } = await workerFixture(t);
+  const harness = resumeHarness({ sessionLogs: [[childId, [assistantEvent(0, 'prior')]]] });
+  const steered = [];
+  const agent = { ...controllerAgent(), steer(message) { steered.push(message); } };
+  const result = await harness.runtime.resume(core, agent, { mission_id: mission.id, role: 'worker' }, new AbortController().signal);
+  const entry = harness.runtime.active.get(result.runId);
+  completeEpoch(harness, { childId, hostRunId: harness.lastStart().runId, assistant: 'all done' });
+  // entry.done must FULFILL through track()'s guarded cleanup; the notice is
+  // steered only after that cleanup, so a disposal TypeError there would
+  // reject entry.done and swallow the notice entirely.
+  await assert.doesNotReject(entry.done);
+  assert.equal(harness.runtime.active.size, 0);
+  const settled = await core.mission(mission.id);
+  assert.equal(settled.status, 'worker_completed');
+  assert.equal(settled.worker.output, 'all done');
+  assert.equal(steered.length, 1);
+  assert.match(steered[0].content.at(-1).text, /Tower worker for \S+ completed: mission status worker_completed/);
+  assert.match(steered[0].content.at(-1).text, /stopReason: completed/);
 });
 
 test('every session observation lease taken by a resume is disposed', async (t) => {
