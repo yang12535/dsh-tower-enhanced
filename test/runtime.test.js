@@ -8,6 +8,11 @@ import { TowerRuntime } from '../lib/runtime.js';
 import { TowerError } from '../lib/errors.js';
 import { initializedCore, makeRepo } from './helpers.js';
 
+/** Last physical line of a settlement notice; the stop reason must live there. */
+function lastLine(text) {
+  return text.split('\n').at(-1);
+}
+
 function routeContext(resolved = {}) {
   const calls = [];
   return {
@@ -354,6 +359,10 @@ test('settled activation records completion, cleans up, and emits a runtime noti
   assert.equal(notices[0].source.form, 'notice');
   assert.equal(notices[0].source.senderSessionId, 'child-run');
   assert.match(notices[0].source.summary, /worker_completed/);
+  const text = notices[0].content[0].text;
+  assert.equal(text.split('\n')[0], 'Tower worker for M1 completed: mission status worker_completed');
+  assert.match(text, /tower action=status/, 'the generic next-action hint remains');
+  assert.equal(lastLine(text), 'stopReason: completed');
 });
 
 /**
@@ -426,8 +435,9 @@ test('a failed reviewer activation notifies review_failed with a bounded reason 
   assert.equal(notice.source.summary, 'Tower reviewer for M1 failed: mission status review_failed');
   const text = notice.content[0].text;
   assert.match(text, /^Tower reviewer for M1 failed: mission status review_failed/);
-  assert.match(text, /reason: 429 rate limited/);
   assert.match(text, /spawn a fresh reviewer/);
+  assert.equal(lastLine(text), 'stopReason: error; reason: 429 rate limited');
+  assert.equal(text.split('\n').length, 3, 'summary, next action, then the stop-reason line');
   assert.equal(harness.runtime.active.size, 0);
   assert.equal(harness.lifecycle.disposeCalls, 1);
 });
@@ -442,8 +452,137 @@ test('an interrupted reviewer run reports interrupted with its reason and next a
   assert.equal(harness.notices.length, 1);
   assert.equal(harness.notices[0].source.summary, 'Tower reviewer for M1 interrupted: mission status review_failed');
   const text = harness.notices[0].content[0].text;
-  assert.match(text, /reason: activation is not owned by this runtime/);
-  assert.match(text, /spawn a fresh reviewer/);
+  assert.match(text, /^Next: spawn a fresh reviewer/m);
+  assert.equal(lastLine(text), 'stopReason: aborted; reason: activation is not owned by this runtime');
+});
+
+test('a missing activation stop reason falls back to the role record stop reason', async () => {
+  const harness = trackHarness();
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'review_failed', review: { stopReason: 'error', error: '429 rate limited' } });
+  await runTrackedSpawn(harness, 'reviewer');
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ diagnostic: '429 rate limited' });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  assert.equal(harness.notices[0].source.summary, 'Tower reviewer for M1 failed: mission status review_failed');
+  assert.equal(lastLine(harness.notices[0].content[0].text), 'stopReason: error; reason: 429 rate limited');
+});
+
+test('a record-only aborted stop reason classifies the run as interrupted', async () => {
+  const harness = trackHarness();
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'review_failed', review: { stopReason: 'aborted', error: 'activation is not owned by this runtime' } });
+  await runTrackedSpawn(harness, 'reviewer');
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ diagnostic: 'activation is not owned by this runtime' });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  assert.equal(harness.notices[0].source.summary, 'Tower reviewer for M1 interrupted: mission status review_failed');
+  assert.equal(lastLine(harness.notices[0].content[0].text), 'stopReason: aborted; reason: activation is not owned by this runtime');
+});
+
+test('a run with no stop reason anywhere reports unknown and keeps the next action', async () => {
+  const harness = trackHarness();
+  harness.core.failSpawn = async () => ({ id: 'M1', status: 'worker_failed', worker: { error: 'activation crashed' } });
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.reject(new Error('activation crashed'));
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  const text = harness.notices[0].content[0].text;
+  assert.equal(harness.notices[0].source.summary, 'Tower worker for M1 failed: mission status worker_failed');
+  assert.match(text, /^Next: spawn a fresh worker/m);
+  assert.equal(lastLine(text), 'stopReason: unknown; reason: activation crashed');
+});
+
+test('a failed run truncates its role-record reason to 500 characters', async () => {
+  const harness = trackHarness();
+  const longError = `429 ${'x'.repeat(600)}`;
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'review_failed', review: { stopReason: 'error', error: longError } });
+  await runTrackedSpawn(harness, 'reviewer');
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'error' });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  const prefix = 'stopReason: error; reason: ';
+  const final = lastLine(harness.notices[0].content[0].text);
+  assert.ok(final.startsWith(prefix), 'the reason lives on the final stop-reason line');
+  assert.ok(final.length - prefix.length <= 500, 'the reason is truncated to 500 characters');
+  assert.ok(final.endsWith('…'));
+});
+
+test('a multi-line diagnostic reason stays on the final physical line', async () => {
+  const harness = trackHarness();
+  const diagnostic = '429 rate limited\n{"error":{"code":429,"message":"rate limited"}}\nretry-after: 30';
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'review_failed', review: { stopReason: 'error', error: diagnostic } });
+  await runTrackedSpawn(harness, 'reviewer');
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'error', diagnostic });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  const text = harness.notices[0].content[0].text;
+  assert.match(text, /^Next: spawn a fresh reviewer/m);
+  assert.equal(text.split('\n').length, 3, 'the reason must not add physical lines');
+  assert.equal(
+    lastLine(text),
+    'stopReason: error; reason: 429 rate limited {"error":{"code":429,"message":"rate limited"}} retry-after: 30',
+  );
+});
+
+test('a multi-line stop reason is normalized onto the final physical line', async () => {
+  const harness = trackHarness();
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'worker_completed' });
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'completed\n(parent finished)\n' });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  const text = harness.notices[0].content[0].text;
+  assert.equal(text.split('\n').length, 3, 'the stop reason must not add physical lines');
+  assert.equal(lastLine(text), 'stopReason: completed (parent finished)');
+});
+
+test('a long multi-line reason is collapsed before it is truncated', async () => {
+  const harness = trackHarness();
+  const diagnostic = Array.from({ length: 40 }, (_, index) => `429 attempt ${index} rate limited`).join('\r\n');
+  harness.core.completeSpawn = async () => ({ id: 'M1', status: 'worker_failed', worker: { stopReason: 'error', error: diagnostic } });
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'error' });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  const text = harness.notices[0].content[0].text;
+  assert.equal(text.split('\n').length, 3, 'the truncated reason must not add physical lines');
+  const prefix = 'stopReason: error; reason: ';
+  const final = lastLine(text);
+  assert.ok(final.startsWith(prefix), 'the reason lives on the final stop-reason line');
+  assert.ok(final.length - prefix.length <= 500, 'the reason is truncated to 500 characters');
+  assert.ok(final.endsWith('…'));
+  assert.ok(!/[\r\n]/.test(final), 'no raw line break may survive inside the final line');
+});
+
+test('approved, rejected, and stale settlements also end with a stop reason', async () => {
+  const cases = [
+    { status: 'approved', review: { stopReason: 'completed' }, expected: 'stopReason: completed' },
+    { status: 'changes_requested', review: { stopReason: 'completed' }, expected: 'stopReason: completed' },
+    {
+      status: 'worker_completed',
+      review: { stale: true, error: 'review binding became stale while the reviewer was running' },
+      expected: 'stopReason: completed; reason: review binding became stale while the reviewer was running',
+    },
+  ];
+  for (const item of cases) {
+    const harness = trackHarness();
+    harness.core.completeSpawn = async () => ({ id: 'M1', status: item.status, review: item.review });
+    await runTrackedSpawn(harness, 'reviewer');
+    const entry = harness.runtime.active.get('run-1');
+    harness.lifecycle.settle({
+      stopReason: 'completed',
+      structured: { verdict: 'clean', merge: true, summary: 'ok', findings: [], checks: [] },
+    });
+    await entry.done;
+    assert.equal(harness.notices.length, 1, `${item.status} must notify`);
+    assert.equal(lastLine(harness.notices[0].content[0].text), item.expected, `${item.status} must end with its stop reason`);
+  }
 });
 
 test('a completeSpawn failure still steers a notice carrying the recorded error', async () => {
@@ -457,8 +596,10 @@ test('a completeSpawn failure still steers a notice carrying the recorded error'
   assert.equal(harness.notices.length, 1, 'recording failure must not silence the notice');
   const text = harness.notices[0].content[0].text;
   assert.match(text, /^Tower worker for M1 failed: mission status worker_failed/);
-  assert.match(text, /reason: state write failed/);
   assert.match(text, /spawn a fresh worker/);
+  // The model completed; only recording the state failed. The stop reason must
+  // keep that meaning instead of being rewritten as an error.
+  assert.equal(lastLine(text), 'stopReason: completed; reason: state write failed');
 });
 
 test('an unrecordable run still notifies with role, mission, run, and error', async () => {
@@ -475,11 +616,32 @@ test('an unrecordable run still notifies with role, mission, run, and error', as
   assert.match(text, /^Tower worker for M1 failed: mission status unknown/);
   assert.match(text, /run run-1 could not be recorded in Tower state/);
   assert.match(text, /tower action=status/);
-  const reason = text.split('\n').find((line) => line.startsWith('reason: '));
-  assert.ok(reason, 'the fallback notice carries a reason line');
-  assert.ok(reason.length <= 'reason: '.length + 500, 'the reason is truncated to 500 characters');
+  assert.match(text, /^Next: inspect the mission with tower action=status/m);
+  const prefix = 'stopReason: unknown; reason: ';
+  const final = lastLine(text);
+  assert.ok(final.startsWith(prefix), 'the fallback ends with stopReason and the bounded error');
+  const reason = final.slice(prefix.length);
+  assert.ok(reason.startsWith('activation transport crashed'));
+  assert.ok(reason.length <= 500, 'the reason is truncated to 500 characters');
   assert.ok(reason.endsWith('…'));
   assert.ok(harness.lifecycle.logs.error.some((line) => /could not record failed worker run run-1/.test(line)));
+});
+
+test('an unrecordable completed run still reports its completed stop reason', async () => {
+  const harness = trackHarness();
+  harness.core.completeSpawn = async () => { throw new Error('state store unavailable'); };
+  harness.core.failSpawn = async () => { throw new Error('state store unavailable'); };
+  await runTrackedSpawn(harness);
+  const entry = harness.runtime.active.get('run-1');
+  harness.lifecycle.settle({ stopReason: 'completed', output: [{ type: 'text', text: 'done' }] });
+  await entry.done;
+  assert.equal(harness.notices.length, 1);
+  const text = harness.notices[0].content[0].text;
+  assert.match(text, /^Tower worker for M1 failed: mission status unknown/);
+  assert.match(text, /^Next: inspect the mission/m);
+  // The model completed; only recording failed, so the stop reason must not
+  // be rewritten to error just because the state could not be written.
+  assert.equal(lastLine(text), 'stopReason: completed; reason: state store unavailable');
 });
 
 test('a failing projection publication never blocks the settlement notice', async () => {
@@ -491,6 +653,7 @@ test('a failing projection publication never blocks the settlement notice', asyn
   await entry.done;
   assert.equal(harness.notices.length, 1, 'publication failure must not block the steer');
   assert.equal(harness.notices[0].source.summary, 'Tower worker for M1 completed: mission status worker_completed');
+  assert.equal(lastLine(harness.notices[0].content[0].text), 'stopReason: completed');
   assert.ok(harness.lifecycle.logs.warn.some((line) => /projection publication failed/i.test(line)));
 });
 
