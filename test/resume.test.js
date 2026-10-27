@@ -359,6 +359,59 @@ test('two resume rounds keep outputs, verdicts, diagnostics, and listeners separ
   assert.equal(harness.listenerCount('subagent/end'), 0);
 });
 
+test('a settlement read that already observes the next epoch transcript still settles only this epoch', async () => {
+  // The settlement read is DEFERRED: the end edge arrived, but the
+  // sessionQuery observation stays pending until the same child has already
+  // opened its NEXT epoch in the same session log. When the observation is
+  // finally released it carries both epochs' events after the resume offset,
+  // so only the epoch boundary — the next user/message — can keep the later
+  // transcript out of this round's output, verdict, and diagnostic.
+  const log = [
+    assistantEvent(5, 'prior epoch context'),       // at the WAL offset: history
+    userEvent(6, 'resume prompt'),                  // this epoch's delivered prompt
+    assistantEvent(7, JSON.stringify({ ...validVerdict, summary: 'verdict A: this round is clean' })),
+  ];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const ctx = {
+    sessionQuery: {
+      observeSession() {
+        return gate.then(() => ({ header: {}, events: [...log], cursor: log.at(-1)?.seq ?? -1, [Symbol.dispose]() {} }));
+      },
+    },
+    logger: { warn() {}, error() {} },
+  };
+  const runtime = new TowerRuntime(ctx, {});
+  let settleWith;
+  const settled = new Promise((resolve) => { settleWith = resolve; });
+  runtime.settleResumedRun({
+    childId: 'child',
+    role: 'reviewer',
+    sessionSeq: 5,
+    fallback: { stopReason: 'completed', lastAssistantMessage: [] },
+    settle: settleWith,
+  });
+
+  // While the settlement read is pending, the next epoch writes its own user
+  // prompt, a different output carrying a DIFFERENT valid verdict, and an
+  // error turn ending — all after this round's offset, all in one log.
+  log.push(
+    userEvent(8, 'next epoch prompt'),
+    assistantEvent(9, JSON.stringify({ ...validVerdict, verdict: 'changes_requested', merge: false, summary: 'verdict B: next epoch leak' })),
+    { seq: 10, type: 'turn/end', data: { reason: errorReason('next epoch failure', 'ENEXT') } },
+  );
+  release();
+  const outcome = await settled;
+
+  // This round settles on verdict A and its own output — never verdict B.
+  assert.deepEqual(outcome.structured, { ...validVerdict, summary: 'verdict A: this round is clean' });
+  const text = outcome.output.map((block) => block?.text ?? '').join('\n');
+  assert.ok(text.includes('verdict A: this round is clean'), `output must be this epoch's message, got: ${text}`);
+  assert.ok(!text.includes('next epoch'), `a later epoch's output leaked into this settlement: ${text}`);
+  // A later epoch's error diagnostic must not fail this round either.
+  assert.equal(outcome.diagnostic, undefined, `a later epoch's diagnostic leaked: ${outcome.diagnostic}`);
+});
+
 // ---------------------------------------------------------------------------
 // Strict reviewer verdict parsing (REVIEW_OUTPUT_SCHEMA, zero violations).
 // ---------------------------------------------------------------------------
