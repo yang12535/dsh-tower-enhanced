@@ -219,3 +219,143 @@ test('docs/architecture.md action enum line covers every schema action', (t) => 
       + ` (documented: [${parsed.join(', ')}], schema: [${enumValues.join(', ')}])`,
   );
 });
+
+// --- doctor finding-code count guard (M73) -----------------------------------
+// docs/architecture.md §8.1 claims「当前共有 N 个 finding code」. That number
+// drifted twice before (M46/M62/M63) because nothing compared it with the
+// implementation. This guard extracts the real code inventory from
+// scripts/tower-doctor.mjs, cross-checks it against the closed whitelist in
+// test/doctor-json-schema.test.js, and then requires every「N 个 finding code」
+// claim in the docs to state exactly that number. docs/architecture.md owns the
+// claim, so it must keep stating the number explicitly (deleting the number is
+// also drift); docs/operations.md never carries the count and is only checked
+// for a mismatching claim should one ever appear there.
+
+/** Uppercase snake-case shape shared by every tower-doctor finding code. */
+const FINDING_CODE_SHAPE = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * Extract the set of finding codes scripts/tower-doctor.mjs can emit, straight
+ * from the implementation source. Recognizes both call shapes used today:
+ *   - literal first argument: fail('STATE_CORRUPT', …) / finding('ORPHAN_WORKTREE', …)
+ *   - identifier first argument resolved from the `'A' : 'B'` ternary branch
+ *     pairs of every `const <id> = …;` initializer — the doctor has two
+ *     distinct `const code =` declarations in different helper scopes, and the
+ *     emitted pair (STATE_MISSING / STATE_READ_FAILED) lives in a ternary next
+ *     to an `=== 'ENOENT'` comparison literal that is not a code.
+ * The `function finding(code, …)` definition is skipped via lookbehind, and a
+ * call site whose first argument matches neither shape fails loudly instead of
+ * being silently dropped (which could otherwise make the guard pass vacuously).
+ */
+function doctorFindingCodes() {
+  const source = readFileSync(path.join(root, 'scripts/tower-doctor.mjs'), 'utf8');
+  const codes = new Set();
+  const callSites = [...source.matchAll(/(?<!function )\b(?:finding|fail)\(/g)].length;
+  let captured = 0;
+  for (const call of source.matchAll(/(?<!function )\b(?:finding|fail)\(\s*('([^']*)'|[A-Za-z_$][\w$]*)/g)) {
+    captured += 1;
+    if (call[2] !== undefined) {
+      codes.add(call[2]);
+      continue;
+    }
+    const resolved = new Set();
+    for (const declaration of source.matchAll(new RegExp(`\\bconst ${call[1]} = ([^;]*);`, 'g'))) {
+      // Only ternary branch pairs (`? 'A' : 'B'`) name emitted codes; other
+      // quoted literals in the initializer are comparisons (e.g. `=== 'ENOENT'`).
+      for (const branch of declaration[1].matchAll(/\?\s*'([^']*)'\s*:\s*'([^']*)'/g)) {
+        for (const code of branch.slice(1)) {
+          if (FINDING_CODE_SHAPE.test(code)) resolved.add(code);
+        }
+      }
+    }
+    assert.ok(
+      resolved.size > 0,
+      `could not resolve the finding-code argument \`${call[1]}\` in scripts/tower-doctor.mjs; `
+        + 'the doctor switched to a new call shape — extend doctorFindingCodes() in test/docs-consistency.test.js',
+    );
+    for (const code of resolved) codes.add(code);
+  }
+  assert.ok(
+    captured === callSites,
+    `doctorFindingCodes() recognized the first argument of ${captured}/${callSites} finding()/fail() call sites `
+      + 'in scripts/tower-doctor.mjs — a call shape changed, extend the extractor in test/docs-consistency.test.js',
+  );
+  for (const code of codes) {
+    assert.ok(FINDING_CODE_SHAPE.test(code), `extracted a malformed doctor finding code: ${code}`);
+  }
+  assert.ok(
+    codes.size >= 20,
+    `extracted an implausibly small finding-code inventory (${codes.size}) from scripts/tower-doctor.mjs; the extractor or the doctor drifted`,
+  );
+  return codes;
+}
+
+/** Parse the KNOWN_FINDING_CODES whitelist out of the doctor contract test (no import: that would re-register its tests). */
+function whitelistedFindingCodes() {
+  const source = readFileSync(path.join(root, 'test/doctor-json-schema.test.js'), 'utf8');
+  const block = source.match(/const KNOWN_FINDING_CODES = new Set\(\[([\s\S]*?)\]\);/);
+  assert.ok(block, 'could not locate KNOWN_FINDING_CODES in test/doctor-json-schema.test.js (contract test drifted?)');
+  const codes = new Set([...block[1].matchAll(/'([^']*)'/g)].map((match) => match[1]));
+  assert.ok(
+    codes.size >= 20,
+    `parsed an implausibly small KNOWN_FINDING_CODES whitelist (${codes.size}) from test/doctor-json-schema.test.js`,
+  );
+  return codes;
+}
+
+/** Find every「N 个 finding code」count claim in a markdown source, with 1-based line numbers. */
+function findingCodeCountClaims(source) {
+  const claims = [];
+  source.split(/\r?\n/).forEach((line, index) => {
+    for (const match of line.matchAll(/(\d+)\s*个\s*finding\s*code/gi)) {
+      claims.push({ line: index + 1, count: Number(match[1]) });
+    }
+  });
+  return claims;
+}
+
+test('doctor finding-code whitelist matches the implementation inventory', () => {
+  const implemented = doctorFindingCodes();
+  const whitelisted = whitelistedFindingCodes();
+  const missingFromWhitelist = [...implemented].filter((code) => !whitelisted.has(code));
+  const staleInWhitelist = [...whitelisted].filter((code) => !implemented.has(code));
+  assert.ok(
+    missingFromWhitelist.length === 0 && staleInWhitelist.length === 0,
+    `test/doctor-json-schema.test.js KNOWN_FINDING_CODES no longer matches scripts/tower-doctor.mjs `
+      + `(implementation: ${implemented.size} codes, whitelist: ${whitelisted.size})\n`
+      + `  missing from whitelist: ${missingFromWhitelist.join(', ') || '(none)'}\n`
+      + `  no longer emitted: ${staleInWhitelist.join(', ') || '(none)'}`,
+  );
+});
+
+test('docs state the real tower-doctor finding-code count', () => {
+  const implemented = doctorFindingCodes();
+  const expected = implemented.size;
+  const problems = [];
+
+  for (const rel of ['docs/architecture.md', 'docs/operations.md']) {
+    const abs = path.join(root, rel);
+    if (!existsSync(abs)) continue; // 存在才扫
+    const claims = findingCodeCountClaims(readFileSync(abs, 'utf8'));
+    for (const claim of claims) {
+      if (claim.count !== expected) {
+        problems.push(`${rel}:${claim.line} claims ${claim.count} finding codes but the doctor emits ${expected}`);
+      }
+    }
+    if (rel === 'docs/architecture.md') {
+      // The architecture reference owns the count: removing the explicit
+      // number must fail loudly instead of letting the guard pass vacuously.
+      if (claims.length === 0) {
+        problems.push(
+          `docs/architecture.md no longer states a「${expected} 个 finding code」count claim; restore the explicit number (§8.1) so the guard stays meaningful`,
+        );
+      }
+    }
+  }
+
+  assert.ok(
+    problems.length === 0,
+    `doctor finding-code count drift (implementation: ${expected} codes in scripts/tower-doctor.mjs)\n  - `
+      + problems.join('\n  - '),
+  );
+});

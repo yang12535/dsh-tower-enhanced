@@ -286,14 +286,14 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 2. state.repoRoot 与实际仓库、base 分支及记录的 baseCommit 是否存在、漂移或分叉；
 3. 每 mission 的分支/baseCommit、worktree 的磁盘存在性、Git 注册、检出分支与 teardown 标记一致性，以及孤儿 worktree；
 4. merged mission 的 merge 记录及 mergeCommit 是否可达于 base；
-5. running 状态的 run 记录是否缺失或看似已经结束；
+5. running 状态的 run 记录是否缺失或看似已经结束，以及终态 mission 残留的活跃角色记录（`MISSION_TERMINAL_ACTIVE_ROLE`）；
 6. Git 元数据健康：POSIX 下的异属主扫描，以及现存 objects、refs、index 和 Tower state 目录的可写性。
 
 脚本只执行查询型 Git 命令与 `readFile/readdir/stat/lstat/access` 等读取，不改 state、不改 Git、不执行修复建议中的 `chown` / `chmod`。退出码默认为 `0`（无 finding）、`1`（有 warning 且无 error）、`2`（任一 error，或参数用法错误）；error 优先于 warning。可选 `--fail-on-warning` 提供严格守门：仅有 warning 的运行退出码由 `1` 升级为 `2`，clean 仍为 `0`、error 仍为 `2`，默认策略不变，适合发布检查 / CI 门禁在 warning 即失败（用法速查见 [operations.md](operations.md) 附录 C）。
 
 有效参数的 `--json` 诊断运行把**唯一一个 JSON 对象写入 stdout**，人类可读诊断不混入 stdout，stderr 为空。对象含 `repo / statePath / findings / summary`，state 结构可用时另含 `baseBranch / baseTip`；仅在显式给出 `--fail-on-warning` 时额外携带 `failOnWarning: true`，默认输出的键集与类型保持不变（向后兼容的可选增键）；早期失败无法解析的字段用 `null` 或省略可选 base 字段。`summary` 固定为 `checksPassed / warnings / errors / exitCode`；finding 至少有 `code / severity / message`，再按类别附 `mission / role / path / sample` 等上下文。用法错误以退出码 2 输出到 stderr，不属于上述有效诊断 JSON 形态。
 
-当前共有 **32 个 finding code**，分类如下（测试用白名单封闭集合，新增 code 必须同步契约测试）：
+当前共有 **33 个 finding code**，分类如下（测试用白名单封闭集合，新增 code 必须同步契约测试；[../test/docs-consistency.test.js](../test/docs-consistency.test.js) 会拿实现实测数量与本节数字对账）：
 
 | 分类 | codes |
 | --- | --- |
@@ -302,7 +302,7 @@ changes_requested / approved / rebase_blocked / merge_blocked / merged / abandon
 | mission / 依赖（5） | `MISSION_BASE_UNKNOWN`、`MISSION_BRANCH_MISSING`、`MISSION_DEP_UNKNOWN`、`MISSION_DUPLICATE`、`MISSION_FIELD_INVALID` |
 | worktree / teardown（8） | `ORPHAN_WORKTREE`、`TEARDOWN_INCOMPLETE`、`WORKTREE_BRANCH_MISMATCH`、`WORKTREE_DIR_MISSING`、`WORKTREE_LIST_FAILED`、`WORKTREE_SCAN_FAILED`、`WORKTREE_STILL_REGISTERED`、`WORKTREE_UNREGISTERED` |
 | merge（3） | `MERGE_COMMIT_NOT_IN_BASE`、`MERGE_COMMIT_UNKNOWN`、`MERGE_RECORD_MISSING` |
-| running（2） | `RUNNING_RECORD_FINISHED`、`RUNNING_RECORD_MISSING` |
+| running（3） | `MISSION_TERMINAL_ACTIVE_ROLE`、`RUNNING_RECORD_FINISHED`、`RUNNING_RECORD_MISSING` |
 | Git 元数据（2） | `GIT_METADATA_FOREIGN_OWNER`、`GIT_METADATA_NOT_WRITABLE` |
 
 异属主 finding 的 `sample` 最多 **10 条**，`count` 只表示本次实际扫描发现的数量。扫描默认最多执行 **5000 次 `lstat`**，达到预算即停止并置 `truncated:true`，所以结果不是完整仓库属主审计；`node_modules` 与 Tower worktrees 目录始终跳过，符号链接不跟随。无 `process.getuid()` 的平台跳过异属主扫描，可写性检查仍执行。
