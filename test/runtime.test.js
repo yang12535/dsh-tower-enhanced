@@ -1151,6 +1151,45 @@ test('a failed attachSpawn unregisters the run, disposes the activation, and fre
   assert.equal(lifecycle.disposes, 1, 'dispose must not double-dispose the rolled-back activation');
 });
 
+test('recover must not reap a run whose rollback is still recording its failure', async (t) => {
+  const repo = makeRepo(t);
+  const core = await initializedCore(repo);
+  await core.addMission({ id: 'M1', title: 'Rollback race', description: 'A concurrent recover must not reap the run this runtime is rolling back.' });
+  core.attachSpawn = async () => { throw new Error('attach recording failed'); };
+  // Park the rollback inside failSpawn before it commits: persisted state is
+  // still worker_running while the runtime owns the rollback, which is exactly
+  // the window a sibling recover call from the same Session can hit.
+  const realFailSpawn = core.failSpawn.bind(core);
+  const failEntered = deferred();
+  const finishFail = deferred();
+  core.failSpawn = (...args) => {
+    failEntered.resolve();
+    return finishFail.promise.then(() => realFailSpawn(...args));
+  };
+  const { runtime, run, controller } = startupHarness(repo, { core, park: false });
+  const a = controller('controller-A');
+  const spawnCall = run(a, { action: 'spawn', mission_id: 'M1', role: 'worker' });
+  try {
+    await failEntered.promise;
+    const recovered = await run(a, { action: 'recover' });
+    assert.deepEqual(recovered.recovered, [], 'a run this runtime is rolling back is not a zombie');
+    assert.equal((await core.mission('M1')).status, 'worker_running', 'recover must not settle the run out from under the rollback');
+    finishFail.resolve();
+    await assert.rejects(spawnCall, /attach recording failed/);
+    const mission = await core.mission('M1');
+    assert.equal(mission.status, 'worker_failed');
+    assert.match(mission.worker.error, /attach recording failed/, 'the rollback records its own failure, not a recovery');
+    assert.equal(runtime.active.size, 0, 'the exemption lifts once the failure is recorded');
+    // The rollback settled the run itself, so no orphan survives for a later
+    // recover from any Session to find.
+    assert.deepEqual((await run(controller('controller-B'), { action: 'recover' })).recovered, []);
+  } finally {
+    finishFail.resolve();
+    await spawnCall.catch(() => {});
+    await runtime.dispose();
+  }
+});
+
 /**
  * Minimal core double for the edit dispatch path: seeded into
  * `runtime.cores` so `coreAt` reuses it instead of constructing a real
