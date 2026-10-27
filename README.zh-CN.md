@@ -112,7 +112,7 @@ config:
     model: glm-5.3-flash
 ```
 
-同样的取值也可以按 spawn 传入：`tower({action:"spawn", mission_id:"M1", role:"worker", provider:"...", model:"...", reasoning_effort:"...", max_tokens:...})`。注意 `provider` 与 `model` 必须成对提供，`max_tokens` 必须是正整数。
+同样的取值也可以按 spawn 传入：`tower({action:"spawn", mission_id:"M1", role:"worker", provider:"...", model:"...", reasoning_effort:"...", max_tokens:...})`。注意 `provider` 与 `model` 必须成对提供，`max_tokens` 必须是正的安全整数。
 
 `allowedModels` 是可选的。存在时，每一组显式/默认的路由覆盖都必须解析为其中某个精确的 provider/model 对；不存在时，路由直接交给 LLM 适配器校验，没有额外的白名单。如果没有角色默认值，也没有按 spawn 的覆盖，子代理会继承控制器的路由。
 
