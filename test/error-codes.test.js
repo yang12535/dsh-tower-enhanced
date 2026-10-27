@@ -39,7 +39,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -126,9 +127,8 @@ const SCRIPT_PINNED_CODES = ['RELEASE_LOCKED', 'RELEASE_PLAN_STALE'];
  * concrete reason; the final guard fails if an entry goes stale.
  */
 const UNREACHABLE = new Map([
-  ['REPO_CHANGED', 'only fires when the repository containing the controller\'s fixed cwd changes identity between store construction and a later init/open call; no public API sequence can swap the containing repository of an existing path underneath the process'],
-  ['WORKER_START_BLOCKED', 'lib/core.js marks every non-active, non-terminal mission status worker-restartable (WORKER_RESTARTABLE covers pending, worker_completed, worker_failed, review_failed, changes_requested, approved, rebase_blocked, merge_blocked), and beginSpawn rejects active and terminal statuses earlier with AGENT_BUSY/MISSION_TERMINAL, so this guard can never fire through the public API'],
-  ['GIT_ANCESTRY_FAILED', 'isAncestor resolves runGit only for exit codes {0,1}; any other exit code rejects earlier as GIT_FAILED/GIT_ABORTED, so the throw site after resolution cannot be reached'],
+  ['WORKER_START_BLOCKED', 'beginSpawn rejects TERMINAL_STATUSES as MISSION_TERMINAL and ACTIVE_STATUSES as AGENT_BUSY before this guard, and WORKER_RESTARTABLE lists every remaining mission status core/store can assign (pending, worker_completed, worker_failed, review_failed, changes_requested, approved, rebase_blocked, merge_blocked), so the guard is unreachable defense'],
+  ['GIT_ANCESTRY_FAILED', 'isAncestor resolves runGit only for exit codes {0,1} and returns on both; runGit rejects every other exit code earlier as GIT_FAILED (or GIT_ABORTED when the signal is aborted), so the throw site after resolution is unreachable defense'],
 ]);
 
 // ---------------------------------------------------------------------------
@@ -395,6 +395,34 @@ test('init/open lifecycle pins TOWER_NOT_INITIALIZED, BASE_*, STATE_INVALID, and
   await expectCode('STATE_INVALID', 'status() with an unparseable state file', () => core.status());
   overwriteState(repo, { ...pristine, repoRoot: '/tmp/error-codes-foreign-repository' });
   await expectCode('REPO_MISMATCH', 'open() when the state belongs to another repository', () => new TowerCore({ cwd: repo }).open());
+});
+
+test('a repointed cwd symlink pins REPO_CHANGED', async (t) => {
+  const first = makeRepo(t);
+  const second = makeRepo(t);
+  // TowerCore freezes `cwd` at construction, but every init()/open() call
+  // re-resolves it through `git rev-parse --show-toplevel`. A symlink is the
+  // one way to make an unchanged `cwd` point at a different repository: the
+  // store is anchored to the first root, then the link is repointed at a
+  // second live repo, so the identity check must fire instead of silently
+  // operating on the wrong repository.
+  const holder = mkdtempSync(path.join(tmpdir(), 'dsh-tower-symlink-'));
+  const link = path.join(holder, 'current');
+  t.after(() => {
+    // Exact cleanup: drop the symlink itself, then the empty holder. Neither
+    // step recurses into either repository.
+    if (lstatSync(link, { throwIfNoEntry: false })?.isSymbolicLink() === true) unlinkSync(link);
+    rmSync(holder, { recursive: true, force: true });
+  });
+  symlinkSync(first, link, 'dir');
+  const core = new TowerCore({ cwd: link });
+  const initialized = await core.init();
+  assert.equal(realpathSync(link), realpathSync(first), 'the setup must resolve cwd through the symlink before init');
+  assert.equal(initialized.repoRoot, realpathSync(first), 'init() must anchor the store to the first repository');
+  unlinkSync(link);
+  symlinkSync(second, link, 'dir');
+  assert.equal(realpathSync(link), realpathSync(second), 'the setup must repoint cwd at the second repository');
+  await expectCode('REPO_CHANGED', 'open() after the cwd symlink was repointed at another repository', () => core.open());
 });
 
 // ---------------------------------------------------------------------------
