@@ -48,11 +48,17 @@ function frameClock() {
 
 // localStorage stand-in over an in-memory Map, optionally throwing on every
 // access to mimic private mode, a sandboxed iframe, or an exhausted quota.
+// Every getItem attempt is recorded in `reads` — including the ones that
+// throw — so tests can assert against real storage traffic (how many reads,
+// against which keys) rather than against function-call bookkeeping.
+// setItem stays unrecorded; writes are already observable via `store`.
 function fakeStorage({ throws = false } = {}) {
   const store = new Map();
+  const reads = [];
   return {
     store,
-    getItem(key) { if (throws) throw new Error('SecurityError: storage denied'); return store.has(key) ? store.get(key) : null; },
+    reads,
+    getItem(key) { reads.push(key); if (throws) throw new Error('SecurityError: storage denied'); return store.has(key) ? store.get(key) : null; },
     setItem(key, value) { if (throws) throw new Error('QuotaExceededError: quota exceeded'); store.set(key, String(value)); },
   };
 }
@@ -466,4 +472,68 @@ test('switching sessions resets the per-session record and shares the global UI 
   const solo = bareAt('solo');
   assert.deepEqual(pressedMap(solo, 'data-tower-view-button'), { missions: false, agents: true });
   assert.deepEqual(pressedMap(solo, 'data-tower-scope-button'), { session: true, workspace: false });
+});
+
+// The snapshot load: one loadPanelPrefs per sessionId shared by the six lazy
+// initializers and both [sessionId] effects. Counted as real getItem calls
+// against fakeStorage.reads — the pre-snapshot implementation performed 8
+// loadPanelPrefs calls (16 getItem) on a regular first mount, so these
+// assertions pin both the count and the exact keys.
+test('a first mount reads storage exactly twice: the global record then the session record', () => {
+  const storage = seed(fakeStorage(), {
+    global: { view: 'missions', scope: 'workspace', filter: 'attention', collapsed: ['worker'], routesCollapsed: true },
+    sessions: { root: { selected: 'w-failed', scrollTop: 123 } },
+  });
+  const h = attentionHarness({ storage });
+  const tree = h.render('root');
+  // the one snapshot really fed the first render: view, scope, and the fold
+  // restored with no default-then-overwrite flash
+  assert.deepEqual(pressedMap(tree, 'data-tower-view-button'), { missions: true, agents: false });
+  assert.equal(findAll(tree, has('data-tower-mission-view', true)).length, 1);
+  // exactly two reads — one per persisted record — in loadPanelPrefs order
+  assert.deepEqual(storage.reads, [GLOBAL_KEY, sessionKey('root')]);
+  // the same snapshot also carries scrollTop: the restore frame is scheduled
+  // without any further read and applies after the flush
+  assert.equal(h.frames.size(), 1);
+  h.frames.flush();
+  assert.equal(scrollerOf(tree).props.ref.current.scrollTop, 123);
+  assert.deepEqual(storage.reads, [GLOBAL_KEY, sessionKey('root')]);
+  // ordinary re-renders of the same session reuse the snapshot: no new read
+  h.render('root');
+  h.render('root');
+  assert.deepEqual(storage.reads, [GLOBAL_KEY, sessionKey('root')]);
+  // an interaction re-render neither: flipping the view writes, never reads
+  findAll(tree, has('data-tower-view-button', 'agents'))[0].props.onClick();
+  const after = h.render('root');
+  assert.deepEqual(pressedMap(after, 'data-tower-view-button'), { missions: false, agents: true });
+  assert.deepEqual(storage.reads, [GLOBAL_KEY, sessionKey('root')]);
+});
+
+test('switching sessions adds exactly one new global+session read pair', () => {
+  const storage = seed(fakeStorage(), {
+    global: { view: 'agents', scope: 'workspace' },
+    sessions: { root: { selected: 'r-failed' }, other: { selected: 'w-failed' } },
+  });
+  const h = attentionHarness({ storage });
+  const surface = 'sidebar.right.pane.tab';
+  const at = (sessionId) => h.render(sessionId, 'root', surface, 'panel');
+  at('root');
+  assert.deepEqual(storage.reads, [GLOBAL_KEY, sessionKey('root')]);
+  // the switch loads the other session's own record: two reads only, and the
+  // snapshot applied is really that session's (its own selection)
+  at('other');
+  assert.deepEqual(storage.reads, [GLOBAL_KEY, sessionKey('root'), GLOBAL_KEY, sessionKey('other')]);
+  let tree = at('other');
+  assert.equal(findAll(tree, has('data-tower-agent', 'W:worker'))[0].props['aria-pressed'], true);
+  assert.equal(findAll(tree, has('data-tower-agent', 'R:reviewer'))[0].props['aria-pressed'], false);
+  // settling on the new session re-renders without touching storage again
+  assert.deepEqual(storage.reads, [GLOBAL_KEY, sessionKey('root'), GLOBAL_KEY, sessionKey('other')]);
+  // switching back is again exactly one new global+session pair
+  at('root');
+  assert.deepEqual(storage.reads, [
+    GLOBAL_KEY, sessionKey('root'), GLOBAL_KEY, sessionKey('other'), GLOBAL_KEY, sessionKey('root'),
+  ]);
+  tree = at('root');
+  assert.equal(findAll(tree, has('data-tower-agent', 'R:reviewer'))[0].props['aria-pressed'], true);
+  assert.equal(findAll(tree, has('data-tower-agent', 'W:worker'))[0].props['aria-pressed'], false);
 });
