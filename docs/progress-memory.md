@@ -1,6 +1,6 @@
 # 进度记忆
 
-更新时间：2026-10-29 CST（Asia/Shanghai）。M85、M86 与 10-29 面板改版均已合入 main；这些后续提交尚未 push。
+更新时间：2026-10-29 CST（Asia/Shanghai）。M85、M86 与 10-29 面板改版均已合入 main，并已推送到 GitHub（合入网页改 README 的 `b7c6a17` 时用 merge，未改写本地提交号）。
 
 ## 当前主线
 
