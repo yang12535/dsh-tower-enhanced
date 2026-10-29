@@ -1,15 +1,25 @@
 # 进度记忆
 
-更新时间：2026-10-28 13:15 CST（Asia/Shanghai）。M85 与 M86 均已完成本地 Tower 流程并合入 main；这些后续提交尚未 push。
+更新时间：2026-10-29 CST（Asia/Shanghai）。M85、M86 与 10-29 面板改版均已合入 main；这些后续提交尚未 push。
 
 ## 当前主线
 
 - 仓库：`/home/yangtim/dsh-tower-enhanced`。
-- 最新功能 main：`a7516de202a161fc3228c299f1fd55160461474d`（M86 merge commit）；后续文档提交以 `git log` 为准。
+- 最新功能 main：`b515fb0`（10-29 面板改版，快进合入，未走 Tower mission 流程）；后续文档提交以 `git log` 为准。
 - M85 merge：`812b118cb7e496602e8e9e0644687e506cb126a2`； reviewed tip `834cde19e4ad6aaa418f3f596fc97708032bf0e9`。
 - M86 merge：`a7516de202a161fc3228c299f1fd55160461474d`； reviewed tip `1f6cad84633a1a8292d968c0371854c58653f4eb`。
 - M84 merge：`6f1457aa10b824e6dc8f1c218f4b258e9396f2f7`；M83 merge：`1ed79ce9ce9deccb16c3cd9811263271c729b458`。
-- 外援方针结论：转入维护、停止拓展。M85 是其要求的最后正确性修复；M86 是用户随后明确授权的一次小范围 UI 优化。此后只处理实际故障和必要的 DSH 兼容更新。
+- 外援方针结论：转入维护、停止拓展。M85 是其要求的最后正确性修复；M86 与 10-29 面板改版是用户随后明确授权的 UI 优化。此后只处理实际故障和必要的 DSH 兼容更新。
+
+## 10-29 面板改版已交付
+
+用户嫌旧面板难用（两层切换、一代理一张大卡、执行/审查拆两组、中英混排），在 Claude Code 会话里直接改（分支 `ui/mission-list-redesign`：`b4d9caa` + `b515fb0`，用户看过真实界面后快进合入 main）：
+
+1. Missions/Agents 双视图合并为任务列表：状态芯片（全部/进行中/待处理/已合并/已放弃，空的隐藏）兼作筛选；进行中、待处理置顶，待处理行显示下一步；展开看依赖、可合并阶段（approved/merge_blocked）的门禁摘要、执行/审查两行（模型、耗时、子会话 token、续接、对话链接）、合并提交与详情。「只看本会话」替代本会话/工作区切换；子代理会话只看自己的记录并默认展开；中文去掉中英混排。
+2. 路由用量表改为模型用量排行（用户指定布局）：左=该 provider/model 的 Tower 会话次数，中=按 token 排行的条形，右=token 用量；token 取宿主 `state.byId[childId].projectionValues.tokenUsage` 四桶之和（与宿主子代理列表同源），未加载的会话单独计数，全未加载时按次数排行。全部或已合并/已放弃筛选时排在终态列表之前。投影里的 `routes` 与 core summary 的一致性守卫保留。
+3. 会话头部 Tower 按钮不再弹浮层，改用 `ctx.sidebarRight.openTab("tower")` 打开或切到右侧栏标签（宿主会展开收起的右侧栏、对页面标签去重；无会话在屏时抛错，按钮改为提示从起始页进入）。
+4. 面板偏好改用 `dsh-tower:prefs:v2`；v1 记录不再读取。
+5. 验证：`pnpm run check` 通过、全量 542/542；用真实 `.dsh-tower/state.json`（85 个任务）在 Chrome 无头渲染宽/窄栏与中英文，无报错、无横向溢出；安装副本 `lib/client.js` 已与 main 一致，刷新 GUI 即生效（未重启 Host）。改版前的一次全量跑出现过 2 个失败，未保存输出，之后连续多轮均未复现。
 
 ## M85 已交付
 
