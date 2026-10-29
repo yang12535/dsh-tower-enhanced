@@ -26,7 +26,7 @@ const nextOf = (card) => card && findAll(card, (node) => 'data-mission-next' in 
 function harness(tower = sampleTowerState(), { language = 'zh', now } = {}) {
   let definition, hookIndex, activeHooks;
   const clock = { now };
-  const hooks = new Map(), slots = new Map(), opened = [], catalog = new Map(), dictionaries = {};
+  const hooks = new Map(), slots = new Map(), opened = [], tabs = [], catalog = new Map(), dictionaries = {};
   const rows = {
     root: { title: 'Controller A' },
     'worker-child': { parentId: 'root', projectionValues: { subagent: { label: 'tower:M1:worker' } } },
@@ -60,7 +60,10 @@ function harness(tower = sampleTowerState(), { language = 'zh', now } = {}) {
   const services = {
     effect: (fn) => fn(),
     sessions: { subagentAddress: (id) => catalog.get(id), list: { getSnapshot: () => ({ byId: rows }) } },
-    sidebarRight: { openResource: (address, options) => opened.push({ address, options }) },
+    sidebarRight: {
+      openResource: (address, options) => opened.push({ address, options }),
+      openTab: (kind, options) => { if (services.sidebarRight.refuse) throw new Error('sidebarRight: no session surface is mounted'); tabs.push({ kind, options }); },
+    },
     locale: {
       register: (ns, values) => { dictionaries[ns] = values; },
       bind: (ns) => (key, vars = {}) => ((dictionaries[ns][language] ?? dictionaries[ns].zh)[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => vars[name]),
@@ -96,20 +99,40 @@ function harness(tower = sampleTowerState(), { language = 'zh', now } = {}) {
     };
     return expand(element(slot.component, props), `${surface}:${sessionId}`);
   }
-  return { render, opened, rows, catalog, projections, slots, services, module: exported, clock };
+  return { render, opened, tabs, rows, catalog, projections, slots, services, module: exported, clock };
 }
 
-test('reviewer chat inherits task context without sibling worker in either surface', () => {
+test('reviewer chat inherits task context without sibling worker', () => {
   const h = harness();
-  let tree = h.render('review-child', 'root');
+  const tree = h.render('review-child', 'root');
   assert.deepEqual(agents(tree), ['M1:reviewer']);
   assert.match(textOf(tree), /当前子代理的记录/);
-  assert.doesNotMatch(textOf(tree), /deepseek-flash/);
-  tree = h.render('review-child', 'root', 'conversation.session.header.actions');
-  findAll(tree, has('className', 'Tw_trigger'))[0].props.onClick();
-  tree = h.render('review-child', 'root', 'conversation.session.header.actions');
-  assert.deepEqual(agents(tree), ['M1:reviewer']);
   assert.doesNotMatch(textOf(tree), /尚未派生|deepseek-flash/);
+});
+
+test('the header button opens the Sidebar Tower tab instead of floating a copy of the panel', () => {
+  const h = harness();
+  const header = () => h.render('root', undefined, 'conversation.session.header.actions');
+  let tree = header();
+  const button = findAll(tree, has('className', 'Tw_trigger'))[0];
+  assert.equal(textOf(button).trim(), 'Tower');
+  assert.equal(findAll(tree, (node) => node.props?.['data-tower-panel'] || node.props?.['data-tower-workspace']).length, 0);
+  assert.equal(button.props['aria-expanded'], undefined);
+  button.props.onClick();
+  assert.deepEqual(h.tabs.map((entry) => entry.kind), ['tower']);
+  tree = header();
+  // still only the button: the panel lives in the Sidebar tab
+  assert.equal(findAll(tree, (node) => node.props?.['data-tower-workspace']).length, 0);
+  assert.equal(findAll(tree, has('className', 'Tw_trigger'))[0].props['data-open-failed'], false);
+  // with no Session on screen the Sidebar refuses; the button says where to go
+  h.services.sidebarRight.refuse = true;
+  findAll(tree, has('className', 'Tw_trigger'))[0].props.onClick();
+  const refused = findAll(header(), has('className', 'Tw_trigger'))[0];
+  assert.equal(refused.props['data-open-failed'], true);
+  assert.match(refused.props.title, /右侧栏现在打不开/);
+  assert.deepEqual(h.tabs.map((entry) => entry.kind), ['tower']);
+  // the tab type the button opens is the one this plugin registers
+  assert.equal(h.services.tabDefinition.kind, 'tower');
 });
 
 test('newest workspace snapshot wins; unrelated and null projections stay separate', () => {
@@ -783,6 +806,20 @@ test('the all filter leads with live and open work; history folds below the usag
   // live work is never folded away
   assert.deepEqual(rowIds(sectionOf(tree, 'running')), ['RUN']);
   assert.equal(findAll(sectionOf(tree, 'running'), withProp('data-history-toggle')).length, 0);
+});
+
+test('a terminal filter keeps the usage ranking ahead of its long list; live filters keep it last', () => {
+  const h = harness(bucketTower());
+  const order = (tree) => [...findAll(tree, has('data-tower-workspace', true))[0].props.children.flat(Infinity)
+    .filter((node) => node?.props?.['data-tower-section'] || node?.props?.['data-tower-usage'])
+    .map((node) => node.props['data-tower-section'] ?? 'usage')];
+  for (const [filter, expected] of [
+    ['merged', ['usage', 'merged']], ['abandoned', ['usage', 'abandoned']],
+    ['running', ['running', 'usage']], ['open', ['open', 'usage']],
+  ]) {
+    filterOf(h.render(), filter).props.onClick();
+    assert.deepEqual(order(h.render()), expected, filter);
+  }
 });
 
 test('history alone keeps its foldable head under the usage ranking', () => {

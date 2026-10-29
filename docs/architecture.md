@@ -24,7 +24,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 | [../lib/store.js](../lib/store.js) | 原子持久化：`state.json` 读写、串行更新队列、schema 校验、`.git/info/exclude` 维护 | `TowerStore`：`read` / `write` / `update` / `ensureLayout`；`validateState`；`ensureLocalExclude` |
 | [../lib/git.js](../lib/git.js) | Git 操作封装：无 shell 的 `execFile` 调用、rev-parse / status / merge-base / diff 等原语 | `runGit`、`gitOut`、`repoRoot`、`head`、`currentBranch`、`status`、`assertClean`、`isAncestor`、`changedFiles`、`rebaseInProgress`、`localExcludeFile` |
 | [../lib/projection.js](../lib/projection.js) | 把控制器发布的状态变成 session projection 事件（zod 校验） | `TOWER_RECORD_TYPE`、`towerProjectionDefinition`、`towerStateSchema` |
-| [../lib/client.js](../lib/client.js) | Web UI：会话头 popover + 右侧 Sidebar Tower 标签页，missions / agents 两个视图 | `apply`（client）、`missionNextStep`、`missionDependencyState`（后两者供测试） |
+| [../lib/client.js](../lib/client.js) | Web UI：右侧 Sidebar Tower 标签页（任务列表 + 模型用量排行）与打开它的会话头按钮 | `apply`（client）、`missionNextStep`、`missionDependencyState`（后两者供测试） |
 | [../lib/errors.js](../lib/errors.js) | 统一错误类型 | `TowerError`、`assertTower`、`errorMessage`、`errorDetails` |
 | [../scripts/tower-doctor.mjs](../scripts/tower-doctor.mjs) | 独立只读诊断 CLI：state 结构、Git/Worktree 事实与元数据健康对账（§8.1） | `collectFindings`、`runDoctor`、`validateStateStructure` |
 | [../scripts/release.mjs](../scripts/release.mjs) | 独立本地发布 CLI：plan/apply 分离、双层跨进程锁、原子写与回滚（§8.2） | `computePlan`、`runRelease`、`applyPlan`、`atomicWrite` |
@@ -79,7 +79,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 
 - 控制器侧：`TowerRuntime.publish` 把 `core.status()` 的快照作为 `plugin:tower/state` 记录追加进控制器 Session（`appendPluginRecord`）并 `sessions.flush`。
 - projection 侧：`towerProjectionDefinition`（key 为 `tower`）用 zod schema 校验记录，坏记录变成 `failure` 字段而不是抛错。
-- UI 侧（[../lib/client.js](../lib/client.js)）：会话头 popover 与右侧 Sidebar 标签页共享 `TowerWorkspace`。它汇总所有 Session 的 tower projection，按 `repoRoot` 聚合并取 `updatedAt` 最新的一份；只有一个任务列表（`MissionRow`）：`missionBucket` 把任务分成 running / open / merged / abandoned，状态芯片兼作过滤；open 行显示由 `missionNextStep` 推导的「下一步/受阻」提示，展开后是依赖芯片、可合并阶段的门禁摘要、worker/reviewer 两行（`RoleLine`，经 `subagentchat` 资源打开子代理会话）、mergeCommit 与详情。`UsageSection` 用 `modelUsage` 按 provider/model 汇总真实子会话的次数与宿主 `tokenUsage` 投影的 token 总量并排行。子代理会话里只显示它自己的记录。UI 是只读投影，不是实时镜像。
+- UI 侧（[../lib/client.js](../lib/client.js)）：`TowerWorkspace` 只渲染在右侧 Sidebar 标签页；会话头的 `TowerAction` 只是一个按钮，经 `ctx.sidebarRight.openTab("tower")` 打开或切到该标签页（无会话在屏时宿主会抛错，按钮改为提示从起始页进入）。它汇总所有 Session 的 tower projection，按 `repoRoot` 聚合并取 `updatedAt` 最新的一份；只有一个任务列表（`MissionRow`）：`missionBucket` 把任务分成 running / open / merged / abandoned，状态芯片兼作过滤；open 行显示由 `missionNextStep` 推导的「下一步/受阻」提示，展开后是依赖芯片、可合并阶段的门禁摘要、worker/reviewer 两行（`RoleLine`，经 `subagentchat` 资源打开子代理会话）、mergeCommit 与详情。`UsageSection` 用 `modelUsage` 按 provider/model 汇总真实子会话的次数与宿主 `tokenUsage` 投影的 token 总量并排行。子代理会话里只显示它自己的记录。UI 是只读投影，不是实时镜像。
 
 ### 2.7 只读动作契约
 
