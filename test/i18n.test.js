@@ -24,22 +24,10 @@ const IDENTICAL_VALUE_ALLOWED = new Map([
   // "Tower" is the product name; both UIs render it unchanged.
   ['trigger', 'product proper noun'],
   ['guideTitle', 'product proper noun'],
-  // "Missions"/"Review" are Tower workflow terms the zh UI keeps in English.
-  ['missions', 'Tower workflow term kept in English in the zh UI'],
-  ['verdict', 'Tower workflow term kept in English in the zh UI'],
-  ['detail.review', 'Tower workflow term kept in English in the zh UI'],
-  // "mergeCommit" is a Git/technical identifier, not natural-language copy.
-  ['mergeCommit', 'git commit field identifier'],
-  ['detail.mergeCommit', 'git commit field identifier'],
-  // "Worker"/"Reviewer" are Tower role names.
-  ['role.worker', 'Tower role name'],
-  ['role.reviewer', 'Tower role name'],
-  // "Agents" is a technical label the zh UI keeps in English.
-  ['view.agents', 'technical label kept in English in the zh UI'],
 ]);
 
 /** Minimum plausible dictionary size; guards the regex parse against silently matching nothing. */
-const MIN_KEYS = 100;
+const MIN_KEYS = 80;
 
 /** Decode a double-quoted JS string literal body (handles \" \\ \n \t … escapes via JSON rules). */
 function decodeStringLiteral(raw) {

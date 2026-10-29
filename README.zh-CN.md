@@ -12,9 +12,9 @@
 - Tower 归属跟随工作区（与 Kimi Code 相同）：任何 Session 都可以接管某个仓库的 Tower；只有当另一个 Session 正持有它时（一次调用进行中，或它启动的 worker/reviewer 仍在运行），第二个 Session 才会被拒绝。没有根/叶 Session 规则。
 - 通过 DSH 进程内 `spawn` provider 运行后台 worker 与结构化的独立 review。
 - 每次 spawn 可选指定 `provider + model + reasoning_effort + max_tokens`；可配置按角色的默认路由和精确路由白名单。
-- 会话头部弹层与右侧边栏 **Tower** 标签页共用同一套 UI。**本会话** 只显示当前控制器创建的真实子会话。在 worker/reviewer 会话中只显示该 agent 自己的记录：reviewer 不会因为与某个 worker 同属一个任务而获得该 worker 的记录。**工作区** 显式列出所有已记录的 agent，并标明其来源控制器。
-- 每个真实子会话只出现一次，按其记录的角色（`Work` 或 `Review`）分组。缺失的子会话不会产生 agent 行或角色占位符。只有 review 的视图没有 Work 分组，反之亦然。尚未创建子会话的工作区任务会与 agent 分开列出。
-- 卡片显示任务、角色、结果、耗时，以及启动时记录的 provider/model/reasoning effort，绝不替代主会话的模型选择器。点击卡片会打开其原生 `subagentchat` 会话记录；**任务与结果** 可展开记录的输出、review 检查项、分支与提交信息。失败、被中断、过期（stale）与 changes-requested 的结果和正常完成始终保持可区分。筛选器可以选择全部、运行中或需要关注的 agent。
+- 会话头部弹层与右侧边栏 **Tower** 标签页共用同一套 UI：一个任务一行的列表。顶部的状态芯片（全部 / 进行中 / 待处理 / 已合并 / 已放弃，空的类别自动隐藏）同时是筛选器；进行中与待处理的任务排在最前，下面是**模型用量**排行，最后是可折叠的**历史**。待处理的行直接显示下一步。默认列出整个工作区；勾选 **只看本会话** 只保留含有当前控制器子会话的任务。在 worker/reviewer 会话中只显示该 agent 自己的记录并默认展开：reviewer 不会因为与某个 worker 同属一个任务而获得该 worker 的记录。
+- 展开一行可看到依赖、可合并阶段的门禁摘要、执行与审查两行（状态、启动时记录的 provider/model/reasoning effort、耗时、宿主列出时的子会话 token 用量、续接标记、**对话** 链接）、合并提交，以及 **详情**（任务说明、分支、提交、续接来源、记录的输出与 review 检查项）。显示的模型绝不替代主会话的模型选择器。失败、被中断、过期（stale）与 changes-requested 的结果和正常完成始终保持可区分。缺失的子会话不会产生对话链接或用量。
+- **模型用量** 按 provider/model 汇总真实子会话：左边是该模型跑过的 Tower 会话次数，中间是按 token 排行的条形，右边是 token 用量（取自宿主为每个子会话列出的 `tokenUsage`；全部未加载时条形改按次数排行，并注明未加载的会话数）。
 - 聊天链接与会话成员关系依次使用宿主的子会话目录、列出的谱系、spawn 时记录的控制器，绝不会从面板当前 Session 猜测未知归属。视图使用同一仓库最新可用的投影；这些是已记录的 Tower 激活，不是子会话内部后续每次模型变更的实时流。
 - `edit` 可按与 `add` 相同的校验规则修正 pending 任务的标题、描述、scope 与依赖。`summary` 提供只读的紧凑概览，包含全局计数与每个任务一行的条目；可选 `mission_id` 只收窄条目，不改变全局计数。
 - reviewer 启动或运行失败会进入显式且可重试的 `review_failed` 状态：可以重新 spawn reviewer，也可以直接另派 worker 返工。每个落定的 worker/reviewer 都会生成结果通知并尝试投递给控制器（首行结果概要、随后下一步操作——run 完全无法落账时 Next 之前另有一行 run 诊断——物理末行报告实际 `stopReason`，缺失记 `unknown`；失败/被中断/过期的结局在同一行附带截断到 500 字符的原因），即使状态记录或投影发布失败也仍会尝试投递；投递本身失败仅记 error 日志，不做重试。
@@ -35,7 +35,7 @@
 dsh plugin --profile web add file:/absolute/path/to/dsh-tower-enhanced
 ```
 
-也可以在 DSH Web/Desktop UI 的 **Plugins** 中安装本地目录。根据宿主的 HMR 状态，激活可能需要重启或开启新会话。组合包包含 Web 客户端；安装或升级后请刷新现有 GUI。在已运行过控制器的会话中，打开会话头部的 **Tower** 按钮或右侧边栏起始页的 **Tower** 入口。两个视图均为只读，只有在控制器发布首个状态之后才显示模型路由。点击某个 agent 可在侧边栏加载其会话；`全部展开` / `全部收起` 用于管理角色分组。切换到 **工作区** 可以查看更早控制器创建的 agent。
+也可以在 DSH Web/Desktop UI 的 **Plugins** 中安装本地目录。根据宿主的 HMR 状态，激活可能需要重启或开启新会话。组合包包含 Web 客户端；安装或升级后请刷新现有 GUI。在已运行过控制器的会话中，打开会话头部的 **Tower** 按钮或右侧边栏起始页的 **Tower** 入口。两个视图均为只读，只有在控制器发布首个状态之后才显示模型路由。点击一行展开，用 **对话** 在侧边栏加载对应子会话；**只看本会话** 收窄到当前控制器创建的子会话，取消勾选即可查看更早控制器创建的任务。
 
 `file:` 安装可能生成源码快照，而不是指向仓库的实时链接。源码合并不代表已安装的插件同步更新。升级验收前，应先结束活跃任务，通过宿主的插件流程更新安装包，并比对安装副本的 `lib/core.js`、`lib/runtime.js`、`lib/store.js` 与目标源码；然后重启或重载宿主、刷新 GUI，在临时仓库实测变更行为。仅重启无法更新磁盘上过期的安装副本。
 
@@ -135,7 +135,7 @@ config:
 
 - 失败一定会产生通知，投递是尽力而为、不构成端到端保证：每个结束的 worker/reviewer 都会生成一条通知并尝试 steer 给控制器 Session，常规形态是首行 `Tower <role> for <mission> <outcome>: mission status <status>`、随后是下一步操作行；run 完全无法落账时，Next 之前另有一行 `run <runId> could not be recorded in Tower state` 诊断。无论哪种形态，物理末行固定是 `stopReason: <实际值>`；`failed`（失败）/`interrupted`（被中断）/`stale`（过期）结局在同一行追加 `; reason: <有界原因>`（来自记录的 error 或 diagnostic，最多 500 字符）。stopReason 缺失时末行报告 `unknown`；stopReason 与 reason 内部的换行和连续空白都会折叠成一个空格，末行始终是一行。若模型本身已完成、只是 state 落账失败，末行 stopReason 仍保留 `completed`、把落账错误放进 reason，不会把完成伪写成 error——即使状态记录或投影发布失败，这次尝试也仍会进行（最坏情况下退化为一条包含 role、mission、run 与错误文本的兜底通知）。steer 本身也可能失败，届时仅记 error 日志、没有持久重试；未收到通知时用 `tower action=status` 与日志兜底核对。
 - review 失败是显式状态：reviewer 出错、没有返回结构化结论、或根本没有启动成功时，任务进入 `review_failed`（记录 `error`、`stopReason`、`completedAt`，并写入 `spawn-failed` 事件），而不会再退回难以区分的 `worker_completed`。可以从中重新 spawn reviewer，或直接另派 worker 返工；在干净的 review 批准之前，合并门禁会给出 `NOT_APPROVED`。
-- 面板把审查失败与运行中、审查通过区分开，并显示重试建议；过期审查证据优先于旧结论。agent 卡片和任务角色行以纯文本显示错误，最多 500 个 Unicode 码点（含省略号），展开结果仍保留记录的原始输出。没有创建子会话的启动失败会显示在任务视图中，不会虚构 agent，也不会一直显示“正在创建子代理会话”。
+- 面板把审查失败与运行中、审查通过区分开，并显示重试建议；过期审查证据优先于旧结论。任务的角色行以纯文本显示错误，最多 500 个 Unicode 码点（含省略号），详情仍保留记录的原始输出。没有创建子会话的启动失败会显示在任务行中，不会虚构对话链接，也不会一直显示“正在创建会话”。
 - 宿主进程重启后，运行时会从 agent 的当前工作目录定位 Git 仓库根，包括会话曾切换目录或停在仓库子目录的情况。对持久化的 `worker_running`/`review_running` 激活，向所属控制器主动 steer 一次僵尸告警（列出 mission/role/启动时间），提示执行 `tower action=recover`。仅在工作目录服务不可用时，才回退到会话创建时的目录。
 - `node scripts/tower-doctor.mjs --repo <路径>` 执行只读的状态与 Git 诊断。合法的 `review_failed` 任务不属于状态损坏；它的分支与工作树仍然必须存在，并继续接受检查。
 - `recover` 是显式的，绝不接管旧进程。确认上一个控制器停止后，它把持久化的运行中激活标记为 interrupted（worker 运行变为 `worker_failed`，reviewer 运行变为 `review_failed`），让新代理可以启动。

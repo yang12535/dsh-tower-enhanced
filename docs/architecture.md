@@ -79,7 +79,7 @@ Tower-lite 是一个单控制器的 Git mission 编排器：
 
 - 控制器侧：`TowerRuntime.publish` 把 `core.status()` 的快照作为 `plugin:tower/state` 记录追加进控制器 Session（`appendPluginRecord`）并 `sessions.flush`。
 - projection 侧：`towerProjectionDefinition`（key 为 `tower`）用 zod schema 校验记录，坏记录变成 `failure` 字段而不是抛错。
-- UI 侧（[../lib/client.js](../lib/client.js)）：会话头 popover 与右侧 Sidebar 标签页共享 `TowerWorkspace`。它汇总所有 Session 的 tower projection，按 `repoRoot` 聚合并取 `updatedAt` 最新的一份；提供 missions 视图（`MissionCard`：阶段、依赖芯片、worker/reviewer 行、mergeCommit、由 `missionNextStep` 推导的「下一步/受阻」提示）与 agents 视图（按角色分组、all/running/attention 过滤、点击卡片经 `subagentchat` 资源打开子代理会话）。UI 是只读投影，不是实时镜像。
+- UI 侧（[../lib/client.js](../lib/client.js)）：会话头 popover 与右侧 Sidebar 标签页共享 `TowerWorkspace`。它汇总所有 Session 的 tower projection，按 `repoRoot` 聚合并取 `updatedAt` 最新的一份；只有一个任务列表（`MissionRow`）：`missionBucket` 把任务分成 running / open / merged / abandoned，状态芯片兼作过滤；open 行显示由 `missionNextStep` 推导的「下一步/受阻」提示，展开后是依赖芯片、可合并阶段的门禁摘要、worker/reviewer 两行（`RoleLine`，经 `subagentchat` 资源打开子代理会话）、mergeCommit 与详情。`UsageSection` 用 `modelUsage` 按 provider/model 汇总真实子会话的次数与宿主 `tokenUsage` 投影的 token 总量并排行。子代理会话里只显示它自己的记录。UI 是只读投影，不是实时镜像。
 
 ### 2.7 只读动作契约
 

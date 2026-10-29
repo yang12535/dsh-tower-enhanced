@@ -5,9 +5,10 @@ import test from 'node:test';
 import { sampleTowerState } from './projection.test.js';
 import { towerProjectionDefinition, TOWER_RECORD_TYPE, deriveMissionGateBlocks } from '../lib/projection.js';
 
-// Mission-card gate summary: the merge-commit short SHA and the gate block
+// Mission-row gate summary: the merge-commit short SHA and the gate block
 // codes a controller needs to judge "can this merge?" without running
-// `tower gate`. Covers the projection's read-only derivation (no git) and
+// `tower gate`. The summary only appears where the merge is the next step
+// (approved or merge_blocked); earlier stages would just repeat their status. Covers the projection's read-only derivation (no git) and
 // the client rendering fed by it.
 
 function element(type, props = {}, key) { return { type, key, props }; }
@@ -105,13 +106,19 @@ function harness(tower = sampleTowerState(), { language = 'zh', now } = {}) {
   return { render, opened, rows, catalog, projections, slots, services, module: exported, clock };
 }
 
+// Expand every mission row, one click per render (each toggle closes over
+// the expanded set of the render it came from).
 function missionsView(harnessInstance) {
   let tree = harnessInstance.render();
-  findAll(tree, has('data-tower-view-button', 'missions'))[0].props.onClick();
-  return harnessInstance.render();
+  for (;;) {
+    const closed = findAll(tree, (node) => node.props?.['data-mission-toggle'] && node.props['aria-expanded'] === false)[0];
+    if (!closed) return tree;
+    closed.props.onClick();
+    tree = harnessInstance.render();
+  }
 }
 
-// A mission carrying only the fields the card and the derivation read.
+// A mission carrying only the fields the row and the derivation read.
 // `gateBlocks` stands in for what the projection wire view attaches.
 function gateMission(over = {}) {
   return {
@@ -272,6 +279,12 @@ test('gate summary renders 0/1/3/5 blocks with +N overflow and stays absent when
 
   // 0 blocks but not approved → nothing to say, so no summary row
   assert.equal(gate(render([gateMission({ status: 'worker_running', gateBlocks: [] })]), 'M1'), undefined);
+  // stages before the merge never show their blocks: the status says it
+  assert.equal(gate(render([gateMission({ status: 'pending', gateBlocks: ['NOT_APPROVED'] })]), 'M1'), undefined);
+  // a blocked merge still spells its codes out
+  const blocked = gate(render([gateMission({ status: 'merge_blocked', gateBlocks: ['WORKTREE_REMOVED'] })]), 'M1');
+  assert.deepEqual(chips(blocked).map((chip) => chip.props['data-block-code']), ['WORKTREE_REMOVED']);
+  assert.equal(blocked.props['data-ready'], false);
   // an older projection without gateBlocks degrades to no summary instead of guessing
   assert.equal(gate(render([gateMission({ gateBlocks: undefined })]), 'M1'), undefined);
 });
@@ -293,6 +306,7 @@ test('mission cards consume the projection wire view end to end', () => {
   const state = towerOf([
     gateMission({ id: 'READY', status: 'approved' }), // derives []
     gateMission({ id: 'WAIT', status: 'pending', review: undefined }), // derives two blocks
+    gateMission({ id: 'STUCK', status: 'merge_blocked' }), // derives [] but is not ready
     gateMission({
       id: 'DONE', status: 'merged',
       merge: { mergedAt: '2026-01-01T00:01:00.000Z', commit: sha, reviewedCommit: 'reviewed-sha', baseCommit: 'base-sha' },
@@ -307,8 +321,12 @@ test('mission cards consume the projection wire view end to end', () => {
   const codes = (id) => findAll(gate(id), withProp('data-block-code')).map((node) => node.props['data-block-code']);
   assert.deepEqual(codes('READY'), []);
   assert.equal(gate('READY').props['data-ready'], true);
-  assert.deepEqual(codes('WAIT'), ['NOT_APPROVED', 'NO_CLEAN_REVIEW']);
-  assert.equal(gate('WAIT').props['data-ready'], false);
+  // the projection still derives WAIT's blocks; the row leaves them to its status
+  const wait = towerProjectionDefinition.wire.view(applied).missions.find((mission) => mission.id === 'WAIT');
+  assert.deepEqual(wait.gateBlocks, ['NOT_APPROVED', 'NO_CLEAN_REVIEW']);
+  assert.deepEqual(findAll(cardOf(tree, 'WAIT'), withProp('data-gate-blocks')), []);
+  assert.deepEqual(codes('STUCK'), []);
+  assert.equal(gate('STUCK').props['data-ready'], false);
   // merged: no gate row at all — the short merge commit is the confirmation
   assert.equal(gate('DONE'), undefined);
   assert.equal(textOf(findAll(cardOf(tree, 'DONE'), has('data-merge-short', sha.slice(0, 7)))[0]), '1234567');
@@ -319,7 +337,7 @@ test('ready badge is explicitly state-scoped and the gate hint covers remaining 
     [
       'zh',
       '状态就绪',
-      '仅覆盖状态检查；base 脏、基线漂移、超出 scope、base 变更导致审查过期等 git 检查仍由 tower gate 判定',
+      '只含状态检查；工作区不干净、基线漂移、超出范围、基线变化导致审查过期等 git 检查仍以 tower gate 为准',
     ],
     [
       'en',

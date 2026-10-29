@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Tower panel is one mission list instead of separate Missions and Agents views: status chips (all / running / open / merged / abandoned) filter it, running and open missions lead, open rows state their next step, and each row expands to its dependencies, merge-stage gate summary, worker and reviewer lines with chat links, merge commit, and details. **This session only** replaces the This session / Workspace switch; Chinese copy no longer mixes in English role names.
+- The route usage table is replaced by a **Model usage** ranking per provider/model: Tower session runs on the left, a token-ranked bar in the middle, and tokens on the right, read from each child Session's host `tokenUsage` projection. Role lines show the same per-session tokens.
+- Panel preferences moved to the `dsh-tower:prefs:v2` namespace (session-only scope, filter, history and usage folds globally; expanded rows, selection, and scroll per session); v1 records are ignored.
+
 ### Added
 
 - Cross-process `release --apply` serialization in `scripts/release.mjs`, using paired locks in the Git directory, fail-fast `RELEASE_LOCKED` contention errors, and guarded stale-lock recovery; concurrent and repeated apply behavior is covered by `test/release-concurrency.test.js`.
